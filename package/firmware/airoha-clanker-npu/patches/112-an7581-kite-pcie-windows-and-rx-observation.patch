@@ -1,0 +1,247 @@
+Subject: Fix AN7581 Kite inbound windows and expose RX ring state
+
+--- /dev/null
++++ b/kite-pcie.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef KITE_PCIE_H
++#define KITE_PCIE_H
++
++/* AN7581 vendor firmware 2.1.1, RX window setup at binary offset 0x2c0e:
++ * selector 0 -> 1fc08030; selector 1 -> 1fc28030. The old SCU 1fa90038
++ * belongs to older platforms, not to either AN7581 PCIe MAC. */
++#if defined(AN7581)
++#define KITE_WIN0_BASE 0x1fc28030u
++#define KITE_WIN1_BASE 0x1fc08030u
++#else
++#define KITE_WIN0_BASE PCIE0_WIN_BASE
++#if defined(AN7552)
++#define KITE_WIN1_BASE PCIE1_WIN_BASE
++#else
++#define KITE_WIN1_BASE (PCIE0_MAC_BASE + 0x8030)
++#endif
++#endif
++#endif
+--- a/npu_wifi.c
++++ b/npu_wifi.c
+@@ -66,7 +66,7 @@
+ 	u32 page = msg[0] & 15, i;
+ 	u32 *d = msg + 2;
+ 
+-	if (cnt != 256 || page > 1)
++	if (cnt != 256 || page > 2)
+ 		return 0;
+ 	for (i = 0; i < 62; i++)
+ 		d[i] = 0;
+@@ -96,7 +96,7 @@
+ 			out[4] = h->mcause;
+ 			out[5] = h->mepc;
+ 		}
+-	} else {
++	} else if (page == 1) {
+ 		/* Always-on, single-writer counters; wrap modulo 2^32. */
+ 		for (i = 0; i < 16; i++)
+ 			d[4 + i] = ndbg->cnt[NC_KITE_RX0 + i];
+@@ -113,6 +113,8 @@
+ 			d[43 + i] = ndbg->cnt[NC_KITE_META_RAW0 + i];
+ 		kite_ctl_reorder_snapshot(d + 59);
+ 		d[61] = 0x4b530001; /* KS telemetry ABI 1 */
++	} else {
++		kite_wifi_ring_snapshot(d);
+ 	}
+ 	return 1;
+ }
+--- a/npu_wifi.h
++++ b/npu_wifi.h
+@@ -365,4 +365,8 @@
+ 
+ #endif /* WIFI_EAGLE */
+ 
++#if defined(AN7581) && defined(MT7916)
++void kite_wifi_ring_snapshot(u32 *d);
++#endif
++
+ #endif /* NPU_WIFI_H */
+--- a/npu_wifi_init.c
++++ b/npu_wifi_init.c
+@@ -253,14 +253,7 @@
+ #define KITE_DESC_BAND_OFF	0x6020
+ #endif
+ 
+-/* the window beside PCIE0_WIN: MAC space on AN758x, SCU on AN7552 */
+-#ifdef AN7552
+-#define KITE_WIN1_BASE		PCIE1_WIN_BASE
+-#define KITE_WIN1_END		PCIE1_WIN_END
+-#else
+-#define KITE_WIN1_BASE		(PCIE0_MAC_BASE + 0x8030)
+-#define KITE_WIN1_END		(PCIE0_MAC_BASE + 0x8034)
+-#endif
++#include "kite-pcie.h"
+ 
+ /* WiFi PCIe BAR descriptor offset: type 1=base, type 2=base+band offset */
+ static u32 wifi_pcie_desc_offset(u32 base, u32 type)
+@@ -274,6 +267,70 @@
+ 	}
+ 	return base;
+ }
++
++/* Legacy mailbox port numbers are not Linux PCIe controller numbers.
++ * AN7581 port 0 is MAC1 (1fc20000), port 1 is MAC0 (1fc00000).
++ * Keep the vendor selector semantics and select the board topology in DT. */
++static int wifi_pcie_window_config(u32 band)
++{
++	u32 base = wifi_pcie_desc_base & 0x1fffffff;
++	u32 start, end, reg;
++
++	if (band > 1 || wifi_pcie_port_type > 3)
++		return 0;
++	if (wifi_pcie_port_type < 2) {
++		start = base;
++		end = base + 2 * KITE_DESC_BAND_OFF;
++		reg = wifi_pcie_port_type ? KITE_WIN0_BASE : KITE_WIN1_BASE;
++	} else {
++		start = base + (band ? 0 : KITE_DESC_BAND_OFF);
++		end = start + KITE_DESC_BAND_OFF;
++		reg = (band == (wifi_pcie_port_type == 2)) ?
++			KITE_WIN0_BASE : KITE_WIN1_BASE;
++	}
++	REG32(reg) = start;
++	REG32(reg + 4) = end;
++	__asm__ volatile("fence iorw,iorw" ::: "memory");
++	return REG32(reg) == start && REG32(reg + 4) == end;
++}
++
++#if defined(AN7581) && defined(MT7916)
++/* GET32 page 2. Read-only; no payload or keys. Each field is observational,
++ * not an atomic snapshot of the DMA engine and three firmware workers. */
++void kite_wifi_ring_snapshot(u32 *d)
++{
++	u32 band, i;
++
++	d[4] = wifi_pcie_port_type;
++	d[5] = KITE_WIN0_BASE;
++	d[6] = REG32(KITE_WIN0_BASE);
++	d[7] = REG32(KITE_WIN0_BASE + 4);
++	d[8] = KITE_WIN1_BASE;
++	d[9] = REG32(KITE_WIN1_BASE);
++	d[10] = REG32(KITE_WIN1_BASE + 4);
++	for (band = 0; band < 2; band++) {
++		u32 *out = d + 12 + band * 20;
++		u32 reg = band ? pcie_base_5g : pcie_base_2g;
++		u32 ring = band ? rxd_base_5g : rxd_base_2g;
++		u32 idx = band ? rxd_5g_cpu_idx : rxd_2g_cpu_idx;
++		u32 ready = band ? rxd_5g_init_done : rxd_2g_init_done;
++
++		out[0] = reg;
++		out[1] = ring & 0x1fffffff;
++		out[6] = idx;
++		out[12] = ready;
++		/* Only the validated, initialized rings are safe to dereference. */
++		if (!ready || !reg || !ring || idx >= 1536)
++			continue;
++		for (i = 0; i < 4; i++) {
++			out[2 + i] = REG32(reg + i * 4);
++			out[7 + i] = REG32(ring + idx * 16 + i * 4);
++		}
++		out[11] = REG32((reg & ~0xfffu) + 0x208); /* WFDMA GLO_CFG */
++	}
++	d[61] = 0x4b520001; /* KR ring telemetry ABI 1 */
++}
++#endif
+ 
+ /* WiFi get DBDC mode from driver model */
+ static u8 wifi_get_dbdc_mode(u8 model)
+@@ -366,8 +423,6 @@
+ int __attribute__((noinline)) wifi_npu_init(u32 band)
+ {
+ #ifdef WIFI_KITE
+-	u32 desc_type1, desc_type2;
+-	u32 bar_5g, bar_2g;
+ 	static u8 pipeline_ready __attribute__((unused));
+ 
+ 	if (!kite_prepare_sram(band))
+@@ -378,47 +433,11 @@
+ 	wifi_band_cap = wifi_get_band_cap(wifi_driver_model);
+ 	wifi_dbdc_mode = wifi_get_dbdc_mode(wifi_driver_model);
+ 
+-	desc_type2 = wifi_pcie_desc_offset(wifi_pcie_desc_base, 2);
+-	desc_type1 = wifi_pcie_desc_offset(wifi_pcie_desc_base, 1);
+-	bar_5g = desc_type2 + KITE_DESC_BAND_OFF;
+-	bar_2g = desc_type1 + KITE_DESC_BAND_OFF;
+-
+-	switch (wifi_pcie_port_type) {
+-	case 1:
+-		REG32(PCIE0_WIN_BASE) = desc_type1 & 0x1FFFFFFF;
+-		REG32(PCIE0_WIN_END) = bar_5g & 0x1FFFFFFF;
+-		break;
+-	case 0:
+-		REG32(KITE_WIN1_BASE) = desc_type1 & 0x1FFFFFFF;
+-		REG32(KITE_WIN1_END) = bar_5g & 0x1FFFFFFF;
+-		if (band != 0)
+-			goto alloc_5g;
+-		goto alloc_2g;
+-	case 2:
+-		if (band != 0) {
+-			REG32(PCIE0_WIN_BASE) = desc_type1 & 0x1FFFFFFF;
+-			REG32(PCIE0_WIN_END) = bar_2g & 0x1FFFFFFF;
+-			goto alloc_5g;
+-		}
+-		REG32(KITE_WIN1_BASE) = desc_type2 & 0x1FFFFFFF;
+-		REG32(KITE_WIN1_END) = bar_5g & 0x1FFFFFFF;
+-		goto alloc_2g;
+-	case 3:
+-		if (band == 0) {
+-			REG32(PCIE0_WIN_BASE) = desc_type2 & 0x1FFFFFFF;
+-			REG32(PCIE0_WIN_END) = bar_5g & 0x1FFFFFFF;
+-			goto alloc_2g;
+-		}
+-		REG32(KITE_WIN1_BASE) = desc_type1 & 0x1FFFFFFF;
+-		REG32(KITE_WIN1_END) = bar_2g & 0x1FFFFFFF;
+-		goto alloc_5g;
+-	default:
+-		break;
+-	}
++	if (!wifi_pcie_window_config(band))
++		return 0;
+ 	if (band != 0)
+ 		goto alloc_5g;
+ 
+-alloc_2g:
+ 	ba_table_a = sram_buf_alloc(8);
+ 	rxd_2g_bufid_base = sram_buf_alloc(6);
+ 	rxd_base_2g = wifi_pcie_desc_offset(wifi_pcie_desc_base, 2);
+--- a/npu_wifi_rx.c
++++ b/npu_wifi_rx.c
+@@ -725,7 +725,8 @@
+ 
+ 	/* give the chip the consumed descriptors every 128 frames */
+ 	if ((s8)++rxd_2g_kick < 0) {
+-		*(u32 *)(pcie_base_2g + 8) = done;
++		__asm__ volatile("fence iorw,iorw" ::: "memory");
++		*(volatile u32 *)(pcie_base_2g + 8) = done;
+ 		rxd_2g_kick = 0;
+ 	}
+ 
+@@ -773,7 +774,8 @@
+ 
+ 	if (n != 1 || len >= 0x4000) {
+ 		next = kite_rx_multi(1, rxd_5g_cpu_idx, len, n);
+-		*(u32 *)(pcie_base_5g + 8) = next ? next - 1 :
++		__asm__ volatile("fence iorw,iorw" ::: "memory");
++		*(volatile u32 *)(pcie_base_5g + 8) = next ? next - 1 :
+ 					     KITE_RX_RING_LAST;
+ 		return;
+ 	}
+@@ -797,8 +799,10 @@
+ 	}
+ 
+ 	/* give the chip the consumed descriptors every 128 frames */
+-	if (next != 0 && ((next - 1) & 127) == 0)
+-		*(u32 *)(pcie_base_5g + 8) = next - 1;
++	if (next != 0 && ((next - 1) & 127) == 0) {
++		__asm__ volatile("fence iorw,iorw" ::: "memory");
++		*(volatile u32 *)(pcie_base_5g + 8) = next - 1;
++	}
+ 
+ 	if (old == -1)
+ 		return;

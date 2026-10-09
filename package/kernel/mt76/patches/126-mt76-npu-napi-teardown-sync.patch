@@ -1,0 +1,46 @@
+--- a/mt76.h	2026-09-30 08:15:26.514636911 +0800
++++ b/mt76.h	2026-09-30 08:15:26.514790966 +0800
+@@ -963,6 +963,7 @@
+ 	/* Set when a Kite stop lost completion proof; NPU pages/descriptors
+ 	 * remain quarantined until device removal or a hardware reset. */
+ 	bool npu_quarantine;
++	bool npu_napi_enabled[2];
+ 
+ 	struct mt76_mcu mcu;
+ 
+--- a/npu.c	2026-09-30 08:15:26.514955215 +0800
++++ b/npu.c	2026-09-30 08:15:26.515025938 +0800
+@@ -366,6 +366,7 @@
+ 	netif_napi_add(dev->napi_dev, &dev->napi[qid], mt76_npu_rx_poll);
+ 	mt76_npu_fill_rx_queue(dev, q);
+ 	napi_enable(&dev->napi[qid]);
++	dev->npu_napi_enabled[index] = true;
+ out:
+ 	mutex_unlock(&dev->mutex);
+ 
+@@ -580,8 +581,25 @@
+ {
+ 	struct airoha_ppe_dev *ppe_dev;
+ 	struct airoha_npu *npu;
++	int i;
+ 
+ 	mutex_lock(&dev->mutex);
++	npu = rcu_access_pointer(dev->mmio.npu);
++
++	/* Stop Linux pollers and wait for any handler already in flight before
++	 * dropping the NPU pointer or reclaiming queue pages. Firmware IRQ
++	 * masking alone does not synchronize a shared Linux IRQ. */
++	for (i = 0; i < 2; i++) {
++		if (dev->npu_napi_enabled[i])
++			napi_disable(&dev->napi[MT_RXQ_NPU0 + i]);
++		dev->npu_napi_enabled[i] = false;
++	}
++	mt76_npu_disable_irqs(dev);
++	if (npu) {
++		for (i = 0; i < 2 && i < ARRAY_SIZE(npu->irqs); i++)
++			if (npu->irqs[i] >= 0)
++				synchronize_irq(npu->irqs[i]);
++	}
+ 
+ 	npu = rcu_replace_pointer(dev->mmio.npu, NULL,
+ 				  lockdep_is_held(&dev->mutex));

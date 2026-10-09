@@ -1,0 +1,87 @@
+Subject: airoha: keep routed Kite admission observable and reject blocked egress
+
+Expose enough host-side admission state to distinguish a missing path from a
+PPE learning miss. A station's PS/TWT/QoS TX block is an egress restriction;
+its authenticated RX owner remains eligible for Wi-Fi-to-WAN policies. A
+blocked Wi-Fi egress is rejected before publication so it continues through
+mac80211 without leaving an apparently live Kite policy.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -753,6 +753,9 @@
+ 	atomic64_t kite_scanned, kite_learned, kite_revoked;
+ 	/* Rule admission and hardware learning are separate evidence. */
+ 	atomic64_t kite_policy_accept, kite_policy_reject, kite_l4_learned, kite_l2_learned;
++	atomic64_t kite_prepare_attempts, kite_prepare_ok, kite_prepare_reject;
++	atomic64_t kite_path_out_npu, kite_path_in_npu, kite_egress_blocked;
++	int kite_prepare_errno;
+ };
+ 
+ struct airoha_eth_soc_data {
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -156,12 +156,21 @@
+ 	int ret = 0;
+ 
+ 	lockdep_assert_held(&flow_offload_mutex);
++	atomic64_inc(&ppe->kite_prepare_attempts);
+ 	if (!odev)
+ 		return -EINVAL;
+ 	airoha_kite_path(odev, eth->h_dest, &out);
+ 	if (out.type == DEV_PATH_AIROHA_NPU) {
++		atomic64_inc(&ppe->kite_path_out_npu);
++		/* PS/TWT/QoS blocks egress only. Keep the endpoint visible so an
++		 * ingress Wi-Fi policy can still be admitted, but force this
++		 * downlink rule back to mac80211 while TX is blocked. */
+ 		if (!airoha_kite_endpoint(ppe, &out))
+ 			return -EAGAIN;
++		if (READ_ONCE(s->sta[out.airoha_npu.wcid].tx_blocked)) {
++			atomic64_inc(&ppe->kite_egress_blocked);
++			return -EAGAIN;
++		}
+ 		e->kite_out_wcid = out.airoha_npu.wcid;
+ 		e->kite_out_gen = out.airoha_npu.generation;
+ 		e->kite_out_key = out.airoha_npu.key_generation;
+@@ -184,6 +193,7 @@
+ 	airoha_kite_path(idev, mac.key->src, &in);
+ 	if (in.type != DEV_PATH_AIROHA_NPU)
+ 		goto put;
++	atomic64_inc(&ppe->kite_path_in_npu);
+ 	if (!airoha_kite_endpoint(ppe, &in)) {
+ 		ret = -EAGAIN;
+ 		goto put;
+@@ -319,10 +329,14 @@
+ 	e->kite_in_key = k->key_generation;
+ 	e->kite_policy = i;
+ put:
+-	if (ret)
++	if (ret) {
+ 		atomic64_inc(&ppe->kite_policy_reject);
+-	else
++		atomic64_inc(&ppe->kite_prepare_reject);
++		WRITE_ONCE(ppe->kite_prepare_errno, ret);
++	} else {
+ 		atomic64_inc(&ppe->kite_policy_accept);
++		atomic64_inc(&ppe->kite_prepare_ok);
++	}
+ 	dev_put(idev);
+ 	return ret;
+ }
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -221,6 +221,15 @@
+ 		atomic64_read(&ppe->kite_policy_reject),
+ 		atomic64_read(&ppe->kite_l4_learned),
+ 		atomic64_read(&ppe->kite_l2_learned));
++	seq_printf(m, "kite_prepare_attempts=%lld kite_prepare_ok=%lld kite_prepare_reject=%lld prepare_errno=%d\n",
++		atomic64_read(&ppe->kite_prepare_attempts),
++		atomic64_read(&ppe->kite_prepare_ok),
++		atomic64_read(&ppe->kite_prepare_reject),
++		READ_ONCE(ppe->kite_prepare_errno));
++	seq_printf(m, "kite_path_out_npu=%lld kite_path_in_npu=%lld kite_egress_blocked=%lld\n",
++		atomic64_read(&ppe->kite_path_out_npu),
++		atomic64_read(&ppe->kite_path_in_npu),
++		atomic64_read(&ppe->kite_egress_blocked));
+ 	mutex_unlock(&flow_offload_mutex);
+ 	seq_printf(m, "setup_attempts=%lld\n", atomic64_read(&ppe->setup_attempts));
+ 	seq_printf(m, "setup_ok=%lld\n", atomic64_read(&ppe->setup_ok));

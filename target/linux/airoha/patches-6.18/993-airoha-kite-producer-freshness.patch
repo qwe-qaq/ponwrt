@@ -1,0 +1,48 @@
+From: ponwrt maintainers
+Subject: [PATCH] r74: Require r74 cross-hart cost publication and expose producer freshness.
+
+Native incremental patch on release73. Datapath ABI12 and DMA ownership unchanged.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -602,7 +602,7 @@
+ 	bool path_valid;
+ 	u32 cost[2][CLANKER_DIAG_WORDS];
+ 	int cost_error[2];
+-	unsigned long cost_updated[2];
++	unsigned long cost_updated[2], cost_advanced[2];
+ 	bool cost_valid[2];
+ 	u32 control[CLANKER_CTL_WORDS];
+ 	unsigned long control_updated;
+@@ -868,10 +868,11 @@
+  mutex_lock(&d->lock);
+  for (b = 0; b < 2; b++) {
+   const u32 *v = d->cost[b] + 4;
+-  n += sysfs_emit_at(buf, n, "cost_band%u available=%u last_error=%d age_ms=%u valid=%u seq=%u session=%u epoch=%u mhz=%u shift=%u revision=%u\n",
++  n += sysfs_emit_at(buf, n, "cost_band%u available=%u last_error=%d age_ms=%u valid=%u seq=%u session=%u epoch=%u mhz=%u shift=%u revision=%u producer_age_ms=%u producer_tick=%u\n",
+    b, d->cost_valid[b], d->cost_error[b],
+    d->cost_valid[b] ? jiffies_to_msecs(jiffies - d->cost_updated[b]) : 0,
+-   v[0], v[1], v[2], v[3], v[4], v[5], v[7]);
++   v[0], v[1], v[2], v[3], v[4], v[5], v[7],
++   d->cost_valid[b] ? jiffies_to_msecs(jiffies - d->cost_advanced[b]) : 0, v[56]);
+   if (!d->cost_valid[b] || !v[0]) continue;
+   for (i = 0; i < ARRAY_SIZE(names); i++)
+    n += sysfs_emit_at(buf, n, "cost%u_%u name=%s samples=%u cycles=%u units=%u max_cycles=%u\n",
+@@ -1001,12 +1002,16 @@
+ 				(enum airoha_npu_wlan_get_cmd)32, path, sizeof(path), GFP_KERNEL);
+ 			if (!cost_error && (path[0] != CLANKER_DIAG_MAGIC ||
+ 			    path[1] != 5+i || path[61] != 0x4b430001 ||
+-			    (path[4] && (path[10] != i || path[11] != 73))))
++			    (path[4] && (path[10] != i || path[11] != 74))))
+ 				cost_error = -EPROTO;
+ 		}
+ 		mutex_lock(&d->lock);
+ 		d->cost_error[i] = cost_error;
+ 		if (!cost_error) {
++			if (!d->cost_valid[i] || (path[4] &&
++			    (path[5] != d->cost[i][5] || path[6] != d->cost[i][6] ||
++			     path[7] != d->cost[i][7])))
++				d->cost_advanced[i] = jiffies;
+ 			memcpy(d->cost[i], path, sizeof(path));
+ 			d->cost_updated[i] = jiffies;
+ 			d->cost_valid[i] = true;

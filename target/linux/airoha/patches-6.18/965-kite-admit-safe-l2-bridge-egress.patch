@@ -1,0 +1,148 @@
+Subject: net: airoha: admit only exact L2 bridge flows to Kite Wi-Fi egress
+
+The AN7581 L2B FOE can match an exact source/destination MAC pair and
+forward it to a verified CDM4/MT7916 endpoint. It cannot carry the nft
+bridge L4 tuple, ingress isolation domain, DSCP or TTL semantics. Keep the
+general bridge rule on the host path, but make the safe L2-only subset
+usable. The driver performs the final check; the flow-table path must not
+disable every bridge rule before the driver sees it.
+
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -142,6 +142,125 @@
+ 	return ret;
+ }
+ 
++static bool airoha_kite_mask_zero(const void *mask, size_t len)
++{
++	const u8 *p = mask;
++	size_t i;
++
++	for (i = 0; i < len; i++)
++		if (p[i])
++			return false;
++	return true;
++}
++
++static bool airoha_kite_mask_full(const void *mask, size_t len)
++{
++	const u8 *p = mask;
++	size_t i;
++
++	for (i = 0; i < len; i++)
++		if (p[i] != 0xff)
++			return false;
++	return true;
++}
++
++/* Native L2B is deliberately a narrow contract. Requiring zero masks for
++ * every L3/L4 key prevents an nft bridge TCP/UDP rule from being widened
++ * into an unrestricted MAC forward. */
++static bool airoha_kite_bridge_l2_rule(const struct flow_rule *rule)
++{
++	const struct flow_action_entry *act;
++	struct flow_match_control control;
++	struct flow_match_eth_addrs eth;
++	int i;
++	bool bridge = false, redirect = false;
++
++	if (!(rule->match.dissector->used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_ETH_ADDRS)) ||
++	    !(rule->match.dissector->used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL)) ||
++	    !(rule->match.dissector->used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_BASIC)))
++		return false;
++
++	flow_action_for_each(i, act, &rule->action) {
++		switch (act->id) {
++		case FLOW_ACTION_BRIDGE:
++			bridge = true;
++			break;
++		case FLOW_ACTION_REDIRECT:
++			redirect = true;
++			break;
++		default:
++			return false;
++		}
++	}
++	if (!bridge || !redirect)
++		return false;
++
++	flow_rule_match_control(rule, &control);
++	if (control.key->addr_type ||
++	    control.mask->addr_type != U16_MAX || control.mask->flags)
++		return false;
++	flow_rule_match_eth_addrs(rule, &eth);
++	if (!airoha_kite_mask_full(eth.mask->src, ETH_ALEN) ||
++	    !airoha_kite_mask_full(eth.mask->dst, ETH_ALEN) ||
++	    !is_valid_ether_addr(eth.key->src) ||
++	    !is_valid_ether_addr(eth.key->dst))
++		return false;
++
++	/* BASIC is present in nf_flow_rule_match() even for bridge flows. An
++	 * all-zero mask means no protocol/ethertype policy was requested. */
++	{
++		struct flow_match_basic basic;
++		flow_rule_match_basic(rule, &basic);
++		if (basic.mask->n_proto || basic.mask->ip_proto)
++			return false;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META)) {
++		struct flow_match_meta meta;
++		flow_rule_match_meta(rule, &meta);
++		/* An ingress ifindex is an isolation-domain requirement. */
++		if (meta.mask->ingress_ifindex)
++			return false;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IP)) {
++		struct flow_match_ip ip;
++		flow_rule_match_ip(rule, &ip);
++		if (!airoha_kite_mask_zero(ip.mask, sizeof(*ip.mask)))
++			return false;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS)) {
++		struct flow_match_ipv4_addrs a;
++		flow_rule_match_ipv4_addrs(rule, &a);
++		if (!airoha_kite_mask_zero(a.mask, sizeof(*a.mask)))
++			return false;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV6_ADDRS)) {
++		struct flow_match_ipv6_addrs a;
++		flow_rule_match_ipv6_addrs(rule, &a);
++		if (!airoha_kite_mask_zero(a.mask, sizeof(*a.mask)))
++			return false;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS)) {
++		struct flow_match_ports ports;
++		flow_rule_match_ports(rule, &ports);
++		if (!airoha_kite_mask_zero(ports.mask, sizeof(*ports.mask)))
++			return false;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN)) {
++		struct flow_match_vlan vlan;
++		flow_rule_match_vlan(rule, &vlan);
++		if (!airoha_kite_mask_zero(vlan.mask, sizeof(*vlan.mask)))
++			return false;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_TCP)) {
++		struct flow_match_tcp tcp;
++		flow_rule_match_tcp(rule, &tcp);
++		if (!airoha_kite_mask_zero(tcp.mask, sizeof(*tcp.mask)))
++			return false;
++	}
++
++	return true;
++}
++
+ static int airoha_kite_flow_prepare(struct airoha_ppe *ppe,
+ 	struct airoha_flow_table_entry *e, struct flow_rule *rule,
+ 	struct net_device *odev, const struct ethhdr *eth)
+@@ -176,6 +295,10 @@
+ 		e->kite_out_key = out.airoha_npu.key_generation;
+ 		e->kite_session = out.airoha_npu.session;
+ 	}
++	/* L2B already carries the exact MAC pair and the verified output route
++	 * in the PPE descriptor. It has no NPU ingress policy to publish. */
++	if (airoha_kite_bridge_l2_rule(rule))
++		return 0;
+ 	flow_rule_match_meta(rule, &meta);
+ 	if (meta.mask->ingress_ifindex != U32_MAX)
+ 		return -EOPNOTSUPP;

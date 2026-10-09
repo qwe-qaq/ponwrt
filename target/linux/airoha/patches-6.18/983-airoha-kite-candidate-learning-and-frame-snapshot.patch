@@ -1,0 +1,123 @@
+Subject: [PATCH] r65 kernel bounded observation and downlink processing cost
+
+Revalidate native authority; preserve stopped unchanged soft rules, not old
+FOEs. Keep single hart, exact policy, PN and DMA/WA ownership contracts.
+
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -1037,6 +1037,37 @@
+ 	return ppe->kite_ops->resume(ppe->kite_priv);
+ }
+ 
++/* flow_offload_mutex holds rule identities; ppe_lock serializes real FOE
++ * observation. Egress-only flows learn through the native skb path, never
++ * this ingress worker. A live L4 BIND needs no full-table search. */
++static bool airoha_kite_learn_needed(struct airoha_ppe *ppe)
++{
++ struct airoha_flow_table_entry *e;
++ bool needed = false;
++
++ spin_lock_bh(&ppe_lock);
++ list_for_each_entry(e, &ppe->kite_flows, kite_node) {
++  struct airoha_foe_entry *hw;
++
++  if (!e->kite_in_wcid || e->kite_suspended || !airoha_kite_flow_live(ppe, e))
++   continue;
++  /* An ingress L2 parent can acquire new subflows. Do not infer their
++   * absence from its representative slot. */
++  if (e->type != FLOW_TYPE_L4 || e->hash == 0xffff) {
++   needed = true;
++   break;
++  }
++  hw = airoha_ppe_foe_get_entry_locked(ppe, e->hash);
++  if (!hw || FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hw->ib1) !=
++             AIROHA_FOE_STATE_BIND || !airoha_ppe_foe_compare_entry(e, hw)) {
++   needed = true;
++   break;
++  }
++ }
++ spin_unlock_bh(&ppe_lock);
++ return needed;
++}
++
+ static void airoha_kite_learn_work(struct work_struct *work)
+ {
+ 	struct airoha_ppe *ppe = container_of(to_delayed_work(work),
+@@ -1046,7 +1077,8 @@
+ 
+ 	mutex_lock(&flow_offload_mutex);
+ 	if (!ppe->kite_dp || kdp_failed(ppe->kite_dp) ||
+-	    READ_ONCE(ppe->kite_dp->gate) || list_empty(&ppe->kite_flows)) {
++	    READ_ONCE(ppe->kite_dp->gate) || list_empty(&ppe->kite_flows) ||
++     !airoha_kite_learn_needed(ppe)) {
+   atomic_set(&ppe->kite_scan_budget, 0);
+   atomic64_inc(&ppe->kite_scan_stopped);
+   goto out;
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -346,9 +346,65 @@
+ }
+ DEFINE_SHOW_ATTRIBUTE(airoha_ppe_debugfs_config);
+ 
++/* LuCI previously opened /dev/mem 43 times for these same counters.
++ * Bounded driver read, no FOE walk or write; not an atomic hardware latch. */
++static int airoha_ppe_debugfs_frame_show(struct seq_file *m, void *private)
++{
++ struct airoha_ppe *ppe = m->private;
++ struct airoha_eth *eth = ppe->eth;
++ unsigned int i;
++ u32 psb;
++
++ if (!airoha_is_7581(eth)) {
++  seq_puts(m, "{\"frame_available\":false}\n");
++  return 0;
++ }
++ seq_puts(m, "{\"frame_available\":true,\"pse_ports\":[");
++ for (i = 0; i < 10; i++) {
++  u32 q = airoha_fe_rr(eth, 0x150 + i * 4);
++  seq_printf(m, "%s{\"port\":%u,\"iq\":%u,\"oq\":%u,\"drops\":%u}",
++             i ? "," : "", i, q >> 16, q & 0xffff,
++             airoha_fe_rr(eth, 0x120 + i * 4));
++ }
++ psb = airoha_fe_rr(eth, 0x104);
++ seq_printf(m, "],\"pse_used\":%u,\"pse_free\":%u", psb >> 16, psb & 0x7fff);
++ seq_printf(m, ",\"gdm1\":{\"tx\":%u,\"tx_drop\":%u,\"rx\":%u,\"rx_drop\":%u}",
++             airoha_fe_rr(eth, 0x604),
++             airoha_fe_rr(eth, 0x608),
++             airoha_fe_rr(eth, 0x648),
++             airoha_fe_rr(eth, 0x64c));
++ seq_printf(m, ",\"gdm2\":{\"tx\":%u,\"tx_drop\":%u,\"rx\":%u,\"rx_drop\":%u}",
++             airoha_fe_rr(eth, 0x1604),
++             airoha_fe_rr(eth, 0x1608),
++             airoha_fe_rr(eth, 0x1648),
++             airoha_fe_rr(eth, 0x164c));
++ seq_printf(m, ",\"gdm4\":{\"tx\":%u,\"tx_drop\":%u,\"rx\":%u,\"rx_drop\":%u}",
++             airoha_fe_rr(eth, 0x2604),
++             airoha_fe_rr(eth, 0x2608),
++             airoha_fe_rr(eth, 0x2648),
++             airoha_fe_rr(eth, 0x264c));
++ seq_printf(m, ",\"cdm1\":{\"tx\":%u,\"rx_cpu\":%u,\"rx_hwf\":%u,\"rx_cpu_drop\":%u,\"rx_hwf_drop\":%u}",
++             airoha_fe_rr(eth, 0x580),
++             airoha_fe_rr(eth, 0x590),
++             airoha_fe_rr(eth, 0x594),
++             airoha_fe_rr(eth, 0x5a0),
++             airoha_fe_rr(eth, 0x5a4));
++ seq_printf(m, ",\"cdm2\":{\"tx\":%u,\"rx_cpu\":%u,\"rx_hwf\":%u,\"rx_cpu_drop\":%u,\"rx_hwf_drop\":%u}",
++             airoha_fe_rr(eth, 0x1580),
++             airoha_fe_rr(eth, 0x1590),
++             airoha_fe_rr(eth, 0x1594),
++             airoha_fe_rr(eth, 0x15a0),
++             airoha_fe_rr(eth, 0x15a4));
++ seq_puts(m, "}\n");
++ return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(airoha_ppe_debugfs_frame);
++
+ int airoha_ppe_debugfs_init(struct airoha_ppe *ppe)
+ {
+ 	ppe->debugfs_dir = debugfs_create_dir("ppe", NULL);
++ debugfs_create_file("frame_status", 0444, ppe->debugfs_dir, ppe,
++                     &airoha_ppe_debugfs_frame_fops);
+ 	debugfs_create_file("status", 0444, ppe->debugfs_dir, ppe,
+ 			    &airoha_ppe_debugfs_status_fops);
+ 	debugfs_create_file("config", 0444, ppe->debugfs_dir, ppe,

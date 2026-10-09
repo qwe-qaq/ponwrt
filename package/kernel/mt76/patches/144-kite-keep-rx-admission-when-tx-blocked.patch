@@ -1,0 +1,21 @@
+Subject: mt7915: keep Kite RX endpoint visible while egress is blocked
+
+A station in power-save/TWT/QoS blocked state still owns the authenticated
+Wi-Fi RX path. Hiding the endpoint from netdevice path discovery disables
+both directions and prevents Wi-Fi-to-WAN ingress policies from being
+installed. The PPE admission code already rejects a blocked egress endpoint;
+allow path discovery to expose the RX owner and retain software fallback for
+downlink.
+
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -1990,8 +1990,7 @@
+ 		    !test_bit(MT_WCID_FLAG_4ADDR, &ns->wcid.flags) &&
+ 		    READ_ONCE(dp->enabled) && !READ_ONCE(dp->gate) &&
+ 		    !kdp_failed(dp) && READ_ONCE(dp->sta[wi].enabled) &&
+-		    READ_ONCE(dp->sta[wi].authorized) &&
+-		    !READ_ONCE(dp->sta[wi].tx_blocked)) {
++		    READ_ONCE(dp->sta[wi].authorized)) {
+ 			path->type = DEV_PATH_AIROHA_NPU;
+ 			path->dev = ctx->dev;
+ 			path->airoha_npu.session = READ_ONCE(dp->session);

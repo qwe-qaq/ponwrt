@@ -1,0 +1,348 @@
+From: ponwrt maintainers
+Subject: Reduce measured parser/hash and shared diagnostic traffic; retain live policy and ownership checks.
+
+--- a/kite-datapath-fw.h
++++ b/kite-datapath-fw.h
+@@ -21,6 +21,7 @@
+ void kite_dp_tx_end(void);
+ void kite_dp_tx_flush(unsigned int band);
+ void kite_dp_tx_published(unsigned int band);
++void kite_dp_observe_transport(unsigned int band, unsigned int event);
+ void kite_dp_observe_index(unsigned int band, unsigned int read);
+ void kite_dp_observe_loop_begin(void);
+ void kite_dp_observe_loop_end(void);
+--- a/kite-fast.inc
++++ b/kite-fast.inc
+@@ -10,6 +10,9 @@
+  u32 src, dst, ports, protocol, vlan, cap_ds, cap_mask, exact_ds, exact_mask;
+  u8 smac[6], dmac[6];
+ };
++/* Cache only the pure L2 hash. No presence/absence or policy decision is
++ * cached: a new capture/guard publication remains visible on the next scan. */
++struct dp_l2_hash { u32 valid, wcid, vlan, bucket, mac[3]; };
+ struct dp_sta_cache {
+  u32 valid, wcid;
+  struct kdp_sta value;
+@@ -20,6 +23,7 @@
+  struct dp_policy_hint hint[2][DP_HINT_SETS][DP_HINT_WAYS];
+  u8 next[2][DP_HINT_SETS];
+  struct dp_sta_cache sta[2][4];
++ struct dp_l2_hash l2[2][4];
+ } dp_private __attribute__((section(".kite_private"), aligned(64)));
+ _Static_assert(sizeof(dp_private) <= 8192, "private cache budget");
+ #define dp_parse dp_private.parse
+@@ -135,9 +139,8 @@
+       ((p->dsfield ^ h->exact_ds) & h->exact_mask) ||
+       p->src[0] != h->src || p->dst[0] != h->dst || p->ports != h->ports ||
+       p->protocol != h->protocol) continue;
+-  for (i = 0; i < 6; i++)
+-   if (p->smac[i] != h->smac[i] || p->dmac[i] != h->dmac[i]) break;
+-  if (i != 6) continue;
++  const kdp_word *pm = (const void *)p->smac, *hm = (const void *)h->smac;
++  if (pm[0] != hm[0] || pm[1] != hm[1] || pm[2] != hm[2]) continue;
+   /* The accepted fast parser zeros all remaining IPv4 address words. */
+   for (i = 1; i < 4; i++) if (p->src[i] || p->dst[i]) break;
+   if (i != 4) continue;
+@@ -149,3 +152,68 @@
+  }
+  return 0;
+ }
++
++/* These words are private, naturally aligned copies on little-endian RV32.
++ * Exactly 48 bytes are fetched, only for len >= 48, after TDMA ownership. */
++static void dp_header_copy(u32 *h, const volatile kdp_word *p)
++{
++ h[0]=p[0]; h[1]=p[1]; h[2]=p[2]; h[3]=p[3];
++ h[4]=p[4]; h[5]=p[5]; h[6]=p[6]; h[7]=p[7];
++ h[8]=p[8]; h[9]=p[9]; h[10]=p[10]; h[11]=p[11];
++}
++static u32 dp_swap32(u32 x)
++{
++ return (x >> 24) | ((x >> 8) & 0xff00) |
++        ((x << 8) & 0xff0000) | (x << 24);
++}
++static int dp_parse_ipv4_words(const u32 *h, u32 len, struct kdp_packet *p)
++{
++ u32 end, proto, frag, v, hdrlen;
++ kdp_word *mac = (void *)p->smac;
++ if (len < 48 || len > 1514 || (h[0] & 1) || (h[1] & 0x10000) ||
++     h[3] != 0x00450008u) return 0;
++ frag = ((h[5] & 255) << 8) | ((h[5] >> 8) & 255);
++ if (frag & 0xbfff) return 0;
++ end = 14 + ((h[4] & 255) << 8) + ((h[4] >> 8) & 255);
++ proto = h[5] >> 24;
++ if (end > len || end < 42) return 0;
++ if (proto == 6) {
++  hdrlen = ((h[11] >> 20) & 15) * 4;
++  if (end < 54 || (h[11] & 0x07000000) || hdrlen < 20 || hdrlen > end - 34)
++   return 0;
++ } else if (proto != 17 ||
++            (((h[9] >> 16) & 255) << 8 | (h[9] >> 24)) != end - 34)
++  return 0;
++ p->src[0] = dp_swap32((h[6] >> 16) | (h[7] << 16));
++ p->dst[0] = dp_swap32((h[7] >> 16) | (h[8] << 16));
++ p->src[1]=p->src[2]=p->src[3]=0;
++ p->dst[1]=p->dst[2]=p->dst[3]=0;
++ p->ports = dp_swap32((h[8] >> 16) | (h[9] << 16));
++ p->protocol=proto; p->type=KDP_FLOW_IPV4; p->vlan=KDP_SLOT_NONE; p->dsfield=0;
++ /* smac[6] immediately followed by dmac[6], aligned at offset 52. */
++ v=h[2] >> 16;
++ mac[0]=(h[1] >> 16) | (h[2] << 16);
++ mac[1]=v | (h[0] << 16);
++ mac[2]=(h[0] >> 16) | (h[1] << 16);
++ return 1;
++}
++_Static_assert(__builtin_offsetof(struct kdp_packet, smac) % 4 == 0 &&
++ __builtin_offsetof(struct kdp_packet, dmac) == __builtin_offsetof(struct kdp_packet, smac) + 6,
++ "packet MAC word layout");
++static u32 dp_l2_bucket(const struct kdp_packet *p, u32 wcid, u32 band)
++{
++ struct dp_l2_hash *c = &dp_private.l2[band][wcid & 3];
++ const kdp_word *mac = (const void *)p->smac;
++ if (c->valid && c->wcid == wcid && c->vlan == p->vlan &&
++     c->mac[0] == mac[0] && c->mac[1] == mac[1] && c->mac[2] == mac[2])
++  return c->bucket;
++ c->wcid=wcid; c->vlan=p->vlan;
++ c->mac[0]=mac[0]; c->mac[1]=mac[1]; c->mac[2]=mac[2];
++ c->bucket=kdp_flow_bucket(p->smac,p->dmac,p->vlan,wcid);
++ c->valid=1;
++ return c->bucket;
++}
++
++_Static_assert(__builtin_offsetof(struct dp_policy_hint, smac) % 4 == 0 &&
++ __builtin_offsetof(struct dp_policy_hint, dmac) == __builtin_offsetof(struct dp_policy_hint, smac) + 6,
++ "hint MAC word layout");
+--- a/kite-observe.inc
++++ b/kite-observe.inc
+@@ -4,6 +4,16 @@
+  * Profiling never changes admission, tokens, ring budgets or completion. */
+ static struct kdp_observe dp_obs;
+ static struct kdp_service dp_service;
++/* Pure diagnostics: hart4 only, published with the existing snapshot.
++ * Never used as a token, ownership, admission or watchdog authority. */
++static struct kdp_perf_band dp_performance[2];
++/* perf.reserved[0..5]: submit samples/cycles/packets, other samples/cycles,
++ * revision. Published under service.seq; ABI8 layout is unchanged. */
++static u32 dp_load[6];
++void kite_dp_observe_transport(u32 band, u32 event)
++{
++ if (dp && band < 2 && event < 8) dp_performance[band].reserved[event]++;
++}
+ static u32 dp_observe_needs_init, dp_prepare_at[2];
+ static u32 dp_loop_stamp, dp_loop_sent, dp_loop_sampling;
+ static u32 dp_observe_mask, dp_observe_loop, dp_observe_published;
+@@ -37,6 +47,9 @@
+ {
+  npu_memset(&dp_obs, 0, sizeof(dp_obs));
+  npu_memset(&dp_service, 0, sizeof(dp_service));
++ npu_memset(dp_performance, 0, sizeof(dp_performance));
++ npu_memset(dp_load, 0, sizeof(dp_load));
++ dp_load[5] = 1;
+  dp_observe_needs_init = 0;
+  npu_memset(dp_observe_tokens, 0, sizeof(dp_observe_tokens));
+  npu_memset(dp_observe_active, 0, sizeof(dp_observe_active));
+@@ -113,11 +126,17 @@
+ }
+ void kite_dp_observe_loop_end(void)
+ {
+- u32 elapsed;
++ u32 elapsed, packets;
+  if (!dp_loop_sampling || !dp) return;
+  elapsed = (u32)csr_read(mcycle) - dp_loop_stamp;
+  dp_service.loop_samples++; dp_service.loop_cycles += elapsed;
+- dp_service.loop_packets += dp->tx_sent[0] + dp->tx_sent[1] - dp_loop_sent;
++ packets = dp->tx_sent[0] + dp->tx_sent[1] - dp_loop_sent;
++ dp_service.loop_packets += packets;
++ if (packets) {
++  dp_load[0]++; dp_load[1] += elapsed; dp_load[2] += packets;
++ } else {
++  dp_load[3]++; dp_load[4] += elapsed;
++ }
+  if (elapsed > dp_service.loop_max_cycles) dp_service.loop_max_cycles = elapsed;
+  dp_loop_sampling = 0;
+ }
+@@ -179,6 +198,9 @@
+  if ((u32)(now - dp_observe_published) < (1u << 26)) return;
+  dp_observe_published = now;
+  dp_obs.publishes++;
++ /* All performance[] writers are hart4. Stats may lag one publication;
++  * tx_sent/freed, gate/fault and DMA/WA proof remain immediate. */
++ npu_memcpy((void *)dp->performance, dp_performance, sizeof(dp_performance));
+  seq = dp->observe.seq + 1;
+  dp->observe.seq = seq;
+  KDP_BARRIER();
+@@ -189,6 +211,7 @@
+  seq = dp->service.seq + 1;
+  dp->service.seq = seq;
+  KDP_BARRIER();
++ npu_memcpy((void *)dp->perf.reserved, dp_load, sizeof(dp_load));
+  npu_memcpy((void *)&dp->service.loop_samples, &dp_service.loop_samples,
+             sizeof(dp_service) - sizeof(dp_service.seq));
+  KDP_BARRIER();
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -262,7 +262,7 @@
+ 	/* First establish that this route has an explicitly installed bridge
+ 	 * L4 capture policy. Routed WAN->Wi-Fi entries do not have one and must
+ 	 * continue through the existing direct datapath. */
+-	base = kdp_flow_bucket(packet->smac, packet->dmac, packet->vlan, wcid);
++	base = dp_l2_bucket(packet, wcid, band);
+ 	for (i = base; i < base + KDP_FLOW_WAYS; i++) {
+ 		volatile struct kdp_flow *f = &s->flow[i];
+ 		/* kdp_flow_matches samples version before and after the complete
+@@ -378,7 +378,7 @@
+  dp_parse[band].valid = 0;
+  if (!q->count) q->first = idx;
+  REG32(dp_ring + band * DP_TDMA_BYTES + idx * 32 + 8) = dp_payload_pa(token);
+- dp->performance[band].reserved[KDP_PERF_TDMA_REARM]++;
++ dp_performance[band].reserved[KDP_PERF_TDMA_REARM]++;
+  q->count++;
+  dp_idx[band] = (idx + 1) % DP_TDMA_COUNT;
+  if (q->count == 8) kite_dp_tx_flush(band);
+@@ -396,7 +396,7 @@
+  dp_observe_reap(id, reusable);
+  dp->perf.reap_probe++;
+  if (!reusable) return 0;
+- dp->performance[t->band].reserved[KDP_PERF_TX_READY]++;
++ dp_performance[t->band].reserved[KDP_PERF_TX_READY]++;
+  dp->tx_freed[t->band]++;
+  dp->perf.reap_ready++;
+  if (dp->perf.flags & KDP_PERF_TOKENQ) {
+@@ -527,11 +527,11 @@
+ 	len = REG32(desc + 4);
+  if (!(len & 0x80000000u)) {
+ 		dp_obs.band[band].tdma_empty++;
+-		dp->performance[band].reserved[KDP_PERF_TDMA_EMPTY]++;
++		dp_performance[band].reserved[KDP_PERF_TDMA_EMPTY]++;
+ 		return 0;
+ 	}
+ 	dp_obs.band[band].tdma_ready++;
+-	dp->performance[band].reserved[KDP_PERF_TDMA_READY]++;
++	dp_performance[band].reserved[KDP_PERF_TDMA_READY]++;
+ 	KDP_BARRIER();
+ 	len &= 0xffff;
+ 	addr = REG32(desc + 8);
+@@ -600,7 +600,7 @@
+  /* Completed TDMA ownership was acquired above; no short/unaligned overread. */
+  if ((dp->perf.flags & KDP_PERF_FAST) && len >= sizeof(header) &&
+      !((unsigned long)payload & 3)) {
+-  for (i = 0; i < 12; i++) header[i] = ((const volatile kdp_word *)payload)[i];
++  dp_header_copy(header, (const volatile kdp_word *)payload);
+   prefix = (const void *)header;
+  }
+  for (i = 0; i < 6; i++)
+@@ -614,9 +614,11 @@
+ 		dp_packet_copy(&packet, &cache->packet);
+ 		parsed = cache->parsed;
+ 		fast = cache->fast;
+-		dp->performance[band].parse_reuse++;
++		dp_performance[band].parse_reuse++;
+ 	} else {
+-  fast = (dp->perf.flags & KDP_PERF_FAST) && kdp_parse_ipv4_fast(prefix, len, &packet);
++  fast = (dp->perf.flags & KDP_PERF_FAST) &&
++         (prefix != payload ? dp_parse_ipv4_words(header, len, &packet) :
++                              kdp_parse_ipv4_fast(payload, len, &packet));
+   parsed = fast;
+   if (!fast) {
+    npu_memset(&packet, 0, sizeof(packet));
+@@ -625,27 +627,27 @@
+    parsed = kdp_parse_packet(payload, len, &packet);
+   }
+ 		if (fast)
+-			dp->performance[band].parse_fast++;
++			dp_performance[band].parse_fast++;
+ 		else
+-			dp->performance[band].parse_slow++;
++			dp_performance[band].parse_slow++;
+ 	}
+ 	dp_observe_time(band, KDP_OBS_PARSE, stamp, 1);
+ 	if (dp_observe_sample[band]) stamp = csr_read(mcycle);
+ 	{
+ 		int policy;
+ 		if (fast && dp_hint_matches(dp, sta, &packet, wcid, band)) {
+-			dp->performance[band].hint_hit++;
++			dp_performance[band].hint_hit++;
+ 			policy = 1;
+ 		} else {
+ 			if (fast)
+-				dp->performance[band].hint_miss++;
++				dp_performance[band].hint_miss++;
+ 			policy = dp_bridge_policy(dp, sta, &packet, parsed, wcid, band);
+ 		}
+ 		dp_observe_time(band, KDP_OBS_POLICY, stamp, 1);
+ 		if (policy == -2)
+ 			goto drop;
+ 		if (policy == 0) {
+-			dp->performance[band].reserved[KDP_PERF_FALLBACK_HOLD]++;
++			dp_performance[band].reserved[KDP_PERF_FALLBACK_HOLD]++;
+ 			dp_host_bridge_fallback(band, token, addr, len, wcid, sta);
+ 			return 0;
+ 		}
+@@ -670,7 +672,7 @@
+ 			cache->valid = 1;
+ 		}
+ 		dp->stats[band].tx_full++;
+-		dp->performance[band].retry++;
++		dp_performance[band].retry++;
+ 		return 0;
+ 	} /* keep TDMA ownership until a spare buffer exists */
+ 	/* No checksum offload requested: PPE supplied the final wire packet.
+@@ -688,9 +690,9 @@
+ 	}
+ 	dp_observe_time(band, KDP_OBS_TXWI, stamp, 1);
+ 	if (amsdu)
+-		dp->performance[band].tx_amsdu++;
++		dp_performance[band].tx_amsdu++;
+ 	else
+-		dp->performance[band].tx_single++;
++		dp_performance[band].tx_single++;
+ 	t->generation = sta->generation;
+ 	t->key_generation = sta->key_generation;
+ 	t->wcid = wcid;
+@@ -756,7 +758,7 @@
+ 	}
+ 	dp_observe_dma(token);
+ 	dp->token[token].dma_done = dp->token[token].submitted;
+-	dp->performance[dp->token[token].band].reserved[KDP_PERF_DMA_DONE]++;
++	dp_performance[dp->token[token].band].reserved[KDP_PERF_DMA_DONE]++;
+ 	KDP_BARRIER();
+  dp_try_reap(token, dp->token[token].submitted);
+ }
+--- a/npu_kite_tx.c
++++ b/npu_kite_tx.c
+@@ -151,7 +151,6 @@
+ static void kite_tx_publish(struct kite_tx_ring *t, u32 b)
+ {
+  volatile struct kite_tx_shared *s = t->s;
+- volatile struct kdp_shared *dpstats = kite_dp_shared();
+  u32 stamp;
+  kite_dp_tx_flush(b);
+  if (s->hw_producer == t->hw_producer) return;
+@@ -164,8 +163,7 @@
+   s->fault = KITE_TX_FAULT_MMIO;
+  else
+   kite_dp_tx_published(b);
+- if (!s->fault && dpstats)
+-  dpstats->performance[b].reserved[KDP_PERF_TX_PUBLISH]++;
++ if (!s->fault) kite_dp_observe_transport(b, KDP_PERF_TX_PUBLISH);
+  s->hw_producer = t->hw_producer;
+  kite_dp_observe_batch(b, 0, t->batch_ppe, stamp);
+  t->batch_ppe = 0;
+@@ -175,7 +173,6 @@
+ {
+ 	struct kite_tx_ring *t = &tx[b];
+ 	volatile struct kite_tx_shared *s = t->s;
+-	volatile struct kdp_shared *dpstats = kite_dp_shared();
+ 	u32 p, d, n, used, budget = KITE_TX_BUDGET;
+ 	u32 obs_packets = 0, obs_full = 0;
+ 	if (!s || s->fault)
+@@ -261,8 +258,7 @@
+ 			u16 token;
+ 			if (((t->hw_producer + 1) & KITE_TX_MASK) == t->hw_completed) {
+ 				obs_full = 1;
+-				if (dpstats)
+-					dpstats->performance[b].reserved[KDP_PERF_TX_RING_FULL]++;
++				kite_dp_observe_transport(b, KDP_PERF_TX_RING_FULL);
+ 				break;
+ 			}
+ 			if (!kite_dp_tx_next(b, &v, &token))

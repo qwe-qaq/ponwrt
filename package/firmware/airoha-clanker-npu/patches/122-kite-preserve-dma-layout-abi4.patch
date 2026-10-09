@@ -1,0 +1,75 @@
+Subject: Kite: preserve DMA alignment and reject incompatible diagnostic ABI
+
+Move policy telemetry into reserved per-band statistics words. Restore the
+128-byte header and aligned TDMA/TXWI/payload. Compile-time layout assertions
+and ABI4 magic prevent silent layout drift and mixed-version binding.
+
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -9,8 +9,8 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_ABI_VERSION 3u
+-#define KDP_MAGIC 0x4b440003u
++#define KDP_ABI_VERSION 4u
++#define KDP_MAGIC 0x4b440004u
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -148,7 +148,8 @@
+ 
+ struct kdp_band_stats {
+ 	unsigned int tx_bytes, rx_bytes, tx_stale, tx_full;
+-	unsigned int reserved[12];
++	unsigned int rx_policy_hit, rx_policy_miss, rx_tdma_full;
++	unsigned int reserved[9];
+ };
+ struct kdp_shared {
+ 	unsigned int magic, bytes, session, epoch;
+@@ -156,7 +157,6 @@
+ 	unsigned int tx_sent[2], tx_freed[2], tx_drop[2], tx_bad_done;
+ 	unsigned int rx_ppe[2], rx_host[2], rx_replay[2], rx_stale[2];
+ 	unsigned int rx_miss[2], rx_free[2], rx_unsupported[2], tx_aborted[2], reserved[1];
+-	unsigned int rx_policy_hit[2], rx_policy_miss[2], rx_tdma_full[2];
+ 	struct kdp_sta sta[KDP_WCIDS];
+ 	struct kdp_route route[KDP_ROUTES];
+ 	struct kdp_flow flow[KDP_FLOWS];
+@@ -169,6 +169,14 @@
+ 	unsigned char payload[KDP_TOKENS][KDP_BUFFER_BYTES];
+ 	struct kdp_band_stats stats[2];
+ };
++
++/* Counter extensions must never move hardware DMA regions. ABI4 rejects
++ * the incompatible ABI3 diagnostic layout, even when mixed by accident. */
++_Static_assert(sizeof(struct kdp_band_stats) == 64, "Kite statistics cache line");
++_Static_assert(__builtin_offsetof(struct kdp_shared, sta) == 128, "Kite header");
++_Static_assert(__builtin_offsetof(struct kdp_shared, tdma) % 64 == 0, "Kite TDMA alignment");
++_Static_assert(__builtin_offsetof(struct kdp_shared, txwi) % 64 == 0, "Kite TXWI alignment");
++_Static_assert(__builtin_offsetof(struct kdp_shared, payload) % 64 == 0, "Kite payload alignment");
+ 
+ /* Separate writers: firmware fault identity is never overwritten by a
+  * host WA parser. tx_bad_done is a saturating host error latch until a
+--- a/npu_kite_secure_rx.c
++++ b/npu_kite_secure_rx.c
+@@ -140,17 +140,17 @@
+ 			r->flags |= KDP_RX_REORDERED | (m->encrypted ? KDP_RX_PN : 0);
+ 			KDP_BARRIER();
+ 			if (policy) {
+-				s->rx_policy_hit[r->band]++;
++				s->stats[r->band].rx_policy_hit++;
+ 				if (!tdma_tx_submit(id, r->len - r->offset,
+ 						wifi_pkt_va(id) + r->offset, r->band)) {
+ 					s->rx_ppe[r->band]++;
+ 					s->stats[r->band].rx_bytes += r->len - r->offset;
+ 				} else {
+-					s->rx_tdma_full[r->band]++;
++					s->stats[r->band].rx_tdma_full++;
+ 					dp_rx_host(s, id);
+ 				}
+ 			} else {
+-				s->rx_policy_miss[r->band]++;
++				s->stats[r->band].rx_policy_miss++;
+ 				dp_rx_host(s, id);
+ 			}
+ 		}

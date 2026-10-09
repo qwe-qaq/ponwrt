@@ -1,0 +1,727 @@
+--- a/mt76.h
++++ b/mt76.h
+@@ -65,6 +65,10 @@
+ #define MT_NPU_Q_RX(_n)		__MT_NPU_Q(MT76_WED_Q_RX, _n)
+ #define MT_NPU_Q_TXFREE(_n)	(FIELD_PREP(MT_QFLAG_WED_TYPE, MT76_WED_Q_TXFREE) | \
+ 				 FIELD_PREP(MT_QFLAG_WED_RING, _n))
++
++/* Airoha NPU datapath profiles. */
++#define MT76_NPU_TYPE_EAGLE	0
++#define MT76_NPU_TYPE_KITE	1
+ 
+ struct mt76_dev;
+ struct mt76_phy;
+--- a/dma.c
++++ b/dma.c
+@@ -686,7 +686,7 @@
+ 		goto free_skb;
+ 
+ 	/* TODO: Take into account unlinear skbs */
+-	if (mt76_npu_device_active(dev) && skb_linearize(skb))
++	if (mt76_queue_is_npu_tx(q) && skb_linearize(skb))
+ 		goto free_skb;
+ 
+ 	t = mt76_get_txwi(dev);
+@@ -738,7 +738,7 @@
+ 	if (ret < 0)
+ 		goto unmap;
+ 
+-	if (mt76_npu_device_active(dev))
++	if (mt76_queue_is_npu_tx(q))
+ 		return mt76_npu_dma_add_buf(phy, q, skb, &tx_info.buf[1], txwi);
+ 
+ 	return mt76_dma_add_buf(dev, q, tx_info.buf, tx_info.nbuf,
+--- a/npu.c
++++ b/npu.c
+@@ -13,6 +13,8 @@
+ 
+ #define MT76_NPU_RX_BUF_SIZE	(1800 + \
+ 				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
++#define MT76_NPU_KITE_RX_BUF_SIZE	(3500 + \
++					 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
+ 
+ int mt76_npu_fill_rx_queue(struct mt76_dev *dev, struct mt76_queue *q)
+ {
+@@ -32,8 +34,10 @@
+ 		page = virt_to_head_page(e->buf);
+ 		e->dma_addr[0] = page_pool_get_dma_addr(page) + offset;
+ 
+-		memset(&desc[q->head], 0, sizeof(*desc));
++		/* Publish a replenished buffer before clearing firmware ownership. */
+ 		desc[q->head].addr = e->dma_addr[0];
++		dma_wmb();
++		WRITE_ONCE(desc[q->head].ctrl, 0);
+ 
+ 		q->head = (q->head + 1) % q->ndesc;
+ 		q->queued++;
+@@ -66,32 +70,64 @@
+ 	struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
+ 	int i, nframes, index = q->tail;
+ 	struct sk_buff *skb = NULL;
+-
+-	nframes = FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK, desc[index].info);
++	bool invalid;
++	u32 ctrl;
++
++	if (!q->queued)
++		return NULL;
++	ctrl = READ_ONCE(desc[index].ctrl);
++	if (!(ctrl & NPU_RX_DMA_DESC_DONE_MASK))
++		return NULL;
++	dma_rmb();
++	nframes = FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK, READ_ONCE(desc[index].info));
+ 	nframes = max_t(int, nframes, 1);
++	if (nframes > q->queued)
++		return NULL;
++	invalid = nframes > MAX_SKB_FRAGS + 1;
++
++	/* A partial chain still belongs to firmware. Validate it before taking
++	 * any page: freeing a partial skb would leave freed pages in the ring.
++	 */
++	for (i = 0; i < nframes; i++) {
++		int slot = (index + i) % q->ndesc;
++		int len;
++
++		ctrl = READ_ONCE(desc[slot].ctrl);
++		if (!(ctrl & NPU_RX_DMA_DESC_DONE_MASK))
++			return NULL;
++		dma_rmb();
++		len = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, ctrl);
++		if (!len || len > SKB_WITH_OVERHEAD(q->buf_size))
++			invalid = true;
++	}
++
++	if (!invalid) {
++		struct mt76_queue_entry *e = &q->entry[index];
++
++		dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0],
++					e->dma_len[0],
++					page_pool_get_dma_dir(q->page_pool));
++		skb = napi_build_skb(q->entry[index].buf, q->buf_size);
++		if (!skb)
++			return NULL;
++		skb_mark_for_recycle(skb);
++	}
+ 
+ 	for (i = 0; i < nframes; i++) {
+ 		struct mt76_queue_entry *e = &q->entry[index];
+ 		int len = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK,
+ 				    desc[index].ctrl);
+ 
+-		if (!FIELD_GET(NPU_RX_DMA_DESC_DONE_MASK, desc[index].ctrl)) {
+-			dev_kfree_skb(skb);
+-			return NULL;
+-		}
+-
+-		dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0],
+-					e->dma_len[0],
+-					page_pool_get_dma_dir(q->page_pool));
+-
+-		if (!skb) {
+-			skb = napi_build_skb(e->buf, q->buf_size);
+-			if (!skb)
+-				return NULL;
+-
++		if (invalid || i)
++			dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0],
++						e->dma_len[0],
++						page_pool_get_dma_dir(q->page_pool));
++
++		if (invalid) {
++			mt76_put_page_pool_buf(e->buf, false);
++		} else if (!i) {
+ 			__skb_put(skb, len);
+ 			skb_reset_mac_header(skb);
+-			skb_mark_for_recycle(skb);
+ 		} else {
+ 			struct skb_shared_info *shinfo = skb_shinfo(skb);
+ 			struct page *page = virt_to_head_page(e->buf);
+@@ -104,13 +140,18 @@
+ 		}
+ 
+ 		*info = desc[index].info;
++		e->buf = NULL;
+ 		index = (index + 1) % q->ndesc;
+ 	}
+ 	q->tail = index;
+ 	q->queued -= i;
+-	Q_WRITE(q, dma_idx, q->tail);
+-
+-	return skb;
++	/* Kite firmware owns OUT_DMA_IDX. The host only returns descriptors by
++	 * clearing DONE after refill; never move the producer index backwards.
++	 */
++	if (dev->mmio.npu_type != MT76_NPU_TYPE_KITE)
++		Q_WRITE(q, dma_idx, q->tail);
++
++	return invalid ? ERR_PTR(-EINVAL) : skb;
+ }
+ 
+ void mt76_npu_check_ppe(struct mt76_dev *dev, struct sk_buff *skb,
+@@ -161,6 +202,10 @@
+ 		skb = mt76_npu_dequeue(dev, &dev->q_rx[qid], &info);
+ 		if (!skb)
+ 			break;
++		if (IS_ERR(skb)) {
++			done++;
++			continue;
++		}
+ 
+ 		dev->drv->rx_skb(dev, qid, skb, &info);
+ 		mt76_rx_poll_complete(dev, qid, napi);
+@@ -258,7 +303,7 @@
+ int mt76_npu_rx_queue_init(struct mt76_dev *dev, struct mt76_queue *q)
+ {
+ 	int err, irq, qid = q - &dev->q_rx[0];
+-	int size, index = qid - MT_RXQ_NPU0;
++	int size, buf_size, index = qid - MT_RXQ_NPU0;
+ 	struct airoha_npu *npu;
+ 	const char *name;
+ 
+@@ -274,8 +319,10 @@
+ 
+ 	q->flags = MT_NPU_Q_RX(index);
+ 	size = qid == MT_RXQ_NPU1 ? NPU_RX1_DESC_NUM : NPU_RX0_DESC_NUM;
++	buf_size = dev->mmio.npu_type == MT76_NPU_TYPE_KITE ?
++		   MT76_NPU_KITE_RX_BUF_SIZE : MT76_NPU_RX_BUF_SIZE;
+ 	err = dev->queue_ops->alloc(dev, q, 0, size,
+-				    MT76_NPU_RX_BUF_SIZE, 0);
++				    buf_size, 0);
+ 	if (err)
+ 		goto out;
+ 
+@@ -443,6 +490,10 @@
+ 	struct airoha_npu *npu;
+ 	int err = 0;
+ 
++	/* Keep the existing Eagle entry point and explicitly allow Kite. */
++	if (type != MT76_NPU_TYPE_KITE && !is_mt7992(dev))
++		return 0;
++
+ 	mutex_lock(&dev->mutex);
+ 
+ 	npu = airoha_npu_get(dev->dev);
+@@ -474,9 +525,11 @@
+ 	dev->dma_dev = npu->dev;
+ 	dev->mmio.phy_addr = phy_addr;
+ 	dev->mmio.npu_type = type;
+-	/* NPU offloading requires HW-RRO for RX packet reordering. */
+-	dev->hwrro_mode = is_mt7996(dev) ? MT76_HWRRO_V3 : MT76_HWRRO_V3_1;
+-	dev->rx_token_size = 32768;
++	/* Eagle uses HW-RRO tokens; Kite reorders in the NPU firmware. */
++	if (type != MT76_NPU_TYPE_KITE) {
++		dev->hwrro_mode = is_mt7996(dev) ? MT76_HWRRO_V3 : MT76_HWRRO_V3_1;
++		dev->rx_token_size = 32768;
++	}
+ 
+ 	rcu_assign_pointer(dev->mmio.npu, npu);
+ 	rcu_assign_pointer(dev->mmio.ppe_dev, ppe_dev);
+@@ -506,16 +559,20 @@
+ 
+ 	npu = rcu_replace_pointer(dev->mmio.npu, NULL,
+ 				  lockdep_is_held(&dev->mutex));
++
++	ppe_dev = rcu_replace_pointer(dev->mmio.ppe_dev, NULL,
++				      lockdep_is_held(&dev->mutex));
++	synchronize_rcu();
+ 	if (npu)
+ 		airoha_npu_put(npu);
+-
+-	ppe_dev = rcu_replace_pointer(dev->mmio.ppe_dev, NULL,
+-				      lockdep_is_held(&dev->mutex));
+ 	if (ppe_dev)
+ 		airoha_ppe_put_dev(ppe_dev);
+ 
+ 	mutex_unlock(&dev->mutex);
+ 
+-	mt76_npu_queue_cleanup(dev, &dev->q_rx[MT_RXQ_NPU0]);
+-	mt76_npu_queue_cleanup(dev, &dev->q_rx[MT_RXQ_NPU1]);
+-}
++	if (dev->q_rx[MT_RXQ_NPU0].ndesc)
++		mt76_npu_queue_cleanup(dev, &dev->q_rx[MT_RXQ_NPU0]);
++	if (dev->q_rx[MT_RXQ_NPU1].ndesc)
++		mt76_npu_queue_cleanup(dev, &dev->q_rx[MT_RXQ_NPU1]);
++}
++EXPORT_SYMBOL_GPL(mt76_npu_deinit);
+--- a/mt7915/Makefile
++++ b/mt7915/Makefile
+@@ -5,6 +5,7 @@
+ 
+ mt7915e-y := pci.o init.o dma.o eeprom.o main.o mcu.o mac.o \
+ 	     debugfs.o mmio.o
++mt7915e-$(CONFIG_MT7915_NPU) += npu.o
+ 
+ mt7915e-$(CONFIG_NL80211_TESTMODE) += testmode.o
+ mt7915e-$(CONFIG_MT798X_WMAC) += soc.o
+--- a/mt7915/dma.c
++++ b/mt7915/dma.c
+@@ -306,6 +306,9 @@
+ 	if (dev->dbdc_support || dev->phy.mt76->band_idx)
+ 		irq_mask |= MT_INT_BAND1_RX_DONE;
+ 
++	if (mt76_npu_device_active(mdev))
++		irq_mask &= ~(MT_INT_RX(MT_RXQ_MAIN) | MT_INT_RX(MT_RXQ_BAND1));
++
+ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed) && wed_reset) {
+ 		u32 wed_irq_mask = irq_mask;
+ 		int ret;
+@@ -582,6 +585,11 @@
+ 			  mt7915_poll_tx);
+ 	napi_enable(&dev->mt76.tx_napi);
+ 
++	/* Transfer RX ownership while WFDMA is still disabled. */
++	ret = mt7915_npu_start(dev);
++	if (ret)
++		return ret;
++
+ 	mt7915_dma_enable(dev, false);
+ 
+ 	return 0;
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -897,9 +897,13 @@
+ 
+ 	INIT_WORK(&dev->init_work, mt7915_init_work);
+ 
++	ret = mt7915_npu_init(dev);
++	if (ret)
++		return ret;
++
+ 	ret = mt7915_dma_init(dev, phy2);
+ 	if (ret)
+-		return ret;
++		goto err_npu;
+ 
+ 	set_bit(MT76_STATE_INITIALIZED, &dev->mphy.state);
+ 
+@@ -928,6 +932,10 @@
+ 	rcu_assign_pointer(dev->mt76.wcid[idx], &dev->mt76.global_wcid);
+ 
+ 	return 0;
++
++err_npu:
++	mt76_npu_deinit(&dev->mt76);
++	return ret;
+ }
+ 
+ void mt7915_set_stream_vht_txbf_caps(struct mt7915_phy *phy)
+@@ -1277,9 +1285,12 @@
+ 		if (!mt76_queue_is_wed_rro(&dev->mt76.q_rx[i]))
+ 			napi_disable(&dev->mt76.napi[i]);
+ 	}
++	mt76_npu_disable_irqs(&dev->mt76);
+ 	mt7915_mcu_exit(dev);
+ 	mt76_connac2_tx_token_put(&dev->mt76);
+ 	mt7915_dma_cleanup(dev);
++	/* Drop the NPU/PPE references after all DMA queues are drained. */
++	mt76_npu_deinit(&dev->mt76);
+ 	tasklet_disable(&dev->mt76.irq_tasklet);
+ 
+ 	if (is_mt798x(&dev->mt76))
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -909,6 +909,10 @@
+ {
+ 	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
+ 	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
++	int band;
++
++	for (band = MT_BAND0; band < MT_BAND2; band++)
++		mt7915_npu_sta_del(dev, band, msta->wcid.idx);
+ 
+ 	mt7915_mac_wtbl_update(dev, msta->wcid.idx,
+ 			       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
+@@ -988,10 +992,18 @@
+ 		mt76_rx_aggr_start(&dev->mt76, &msta->wcid, tid, ssn,
+ 				   params->buf_size);
+ 		ret = mt7915_mcu_add_rx_ba(dev, params, true);
++		if (!ret)
++			ret = mt7915_npu_ba_set(dev,
++				mt7915_hw_phy(hw)->mt76->band_idx,
++				msta->wcid.idx, tid, ssn, params->buf_size);
+ 		break;
+ 	case IEEE80211_AMPDU_RX_STOP:
+ 		mt76_rx_aggr_stop(&dev->mt76, &msta->wcid, tid);
+ 		ret = mt7915_mcu_add_rx_ba(dev, params, false);
++		if (!ret)
++			ret = mt7915_npu_ba_set(dev,
++				mt7915_hw_phy(hw)->mt76->band_idx,
++				msta->wcid.idx, tid, 0, 0);
+ 		break;
+ 	case IEEE80211_AMPDU_TX_OPERATIONAL:
+ 		mtxq->aggr = true;
+@@ -1851,6 +1863,23 @@
+ 	ieee80211_queue_delayed_work(hw, &phy->mt76->mac_work,
+ 				     MT7915_WATCHDOG_TIME);
+ }
++
++#if defined(CONFIG_NET_MEDIATEK_SOC_WED) || defined(CONFIG_MT7915_NPU)
++static int
++mt7915_net_setup_tc(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++			    struct net_device *netdev, enum tc_setup_type type,
++			    void *type_data)
++{
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	struct mt7915_dev *dev = mt7915_hw_dev(hw);
++
++	if (mtk_wed_device_active(&dev->mt76.mmio.wed))
++		return mt76_wed_net_setup_tc(hw, vif, netdev, type, type_data);
++#endif
++	/* Kite's vendor metadata is not the Eagle PPE reason/FOE ABI. */
++	return -EOPNOTSUPP;
++}
++#endif
+ 
+ const struct ieee80211_ops mt7915_ops = {
+ 	.add_chanctx = ieee80211_emulate_add_chanctx,
+@@ -1909,7 +1938,9 @@
+ 	.set_radar_background = mt7915_set_radar_background,
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 	.net_fill_forward_path = mt7915_net_fill_forward_path,
+-	.net_setup_tc = mt76_wed_net_setup_tc,
++#endif
++#if defined(CONFIG_NET_MEDIATEK_SOC_WED) || defined(CONFIG_MT7915_NPU)
++	.net_setup_tc = mt7915_net_setup_tc,
+ #endif
+ 	.reconfig_complete = mt7915_reconfig_complete,
+ };
+--- a/mt7915/mmio.c
++++ b/mt7915/mmio.c
+@@ -819,6 +819,15 @@
+ {
+ 	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
+ 
++	if (q == MT_RXQ_NPU0 || q == MT_RXQ_NPU1) {
++		struct airoha_npu *npu;
++
++		npu = rcu_dereference(mdev->mmio.npu);
++		if (npu)
++			airoha_npu_wlan_enable_irq(npu, q - MT_RXQ_NPU0);
++		return;
++	}
++
+ 	mt7915_irq_enable(dev, MT_INT_RX(q));
+ }
+ 
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -262,6 +262,7 @@
+ 	};
+ 
+ 	struct mt7915_hif *hif2;
++	phys_addr_t pcie_bar0;
+ 	struct mt7915_reg_desc reg;
+ 	u8 q_id[MT7915_MAX_QUEUE];
+ 	u32 q_int_mask[MT7915_MAX_QUEUE];
+@@ -466,6 +467,34 @@
+ 
+ int mt7915_register_device(struct mt7915_dev *dev);
+ void mt7915_unregister_device(struct mt7915_dev *dev);
++#ifdef CONFIG_MT7915_NPU
++int mt7915_npu_init(struct mt7915_dev *dev);
++int mt7915_npu_start(struct mt7915_dev *dev);
++int mt7915_npu_ba_set(struct mt7915_dev *dev, u8 band, u16 wcid,
++		      u8 tid, u16 ssn, u16 win_size);
++int mt7915_npu_sta_del(struct mt7915_dev *dev, u8 band, u16 wcid);
++#else
++static inline int mt7915_npu_init(struct mt7915_dev *dev)
++{
++	return 0;
++}
++
++static inline int mt7915_npu_start(struct mt7915_dev *dev)
++{
++	return 0;
++}
++
++static inline int mt7915_npu_ba_set(struct mt7915_dev *dev, u8 band,
++				  u16 wcid, u8 tid, u16 ssn, u16 win_size)
++{
++	return 0;
++}
++
++static inline int mt7915_npu_sta_del(struct mt7915_dev *dev, u8 band, u16 wcid)
++{
++	return 0;
++}
++#endif
+ int mt7915_eeprom_init(struct mt7915_dev *dev);
+ void mt7915_eeprom_parse_hw_cap(struct mt7915_dev *dev,
+ 				struct mt7915_phy *phy);
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -0,0 +1,264 @@
++// SPDX-License-Identifier: ISC
++/*
++ * Airoha AN7581 + MT7916 Kite host integration.
++ *
++ * Clanker owns the MT7916 WiFi RX descriptor rings in NPU SRAM.  Linux owns
++ * the two host-adaptor rings exposed through the common mt76 NPU code.  The
++ * mailbox values here follow Clanker's SET_WAIT/GET_WAIT Kite handlers.
++ */
++
++#include <linux/of.h>
++
++#include "mt7915.h"
++
++#if IS_ENABLED(CONFIG_MT76_NPU)
++
++#define MT7915_KITE_RX_RING_SIZE	MT7915_RX_RING_SIZE
++#define MT7915_KITE_RING_REG_SIZE	0x10
++
++/* The vendor Kite RX metadata and reset protocol still need board validation.
++ * Loading Clanker firmware does not require transferring WiFi ring ownership.
++ * Keep normal mt7915 RX as the default until that protocol is complete.
++ */
++static bool npu_enable;
++module_param(npu_enable, bool, 0400);
++MODULE_PARM_DESC(npu_enable, "Experimental Kite RX ownership (default off)");
++
++static struct airoha_npu *mt7915_npu(struct mt7915_dev *dev)
++{
++	return rcu_access_pointer(dev->mt76.mmio.npu);
++}
++
++static bool mt7915_npu_present(struct mt7915_dev *dev)
++{
++	struct device_node *np = dev->mt76.dev->of_node;
++	struct device_node *npu;
++
++	if (!npu_enable || !is_mt7916(&dev->mt76) || !np)
++		return false;
++
++	npu = of_parse_phandle(np, "airoha,npu", 0);
++	if (!npu)
++		return false;
++	of_node_put(npu);
++
++	return true;
++}
++
++static int mt7915_npu_set(struct mt7915_dev *dev, int band,
++			  enum airoha_npu_wlan_set_cmd cmd, u32 val)
++{
++	struct airoha_npu *npu = mt7915_npu(dev);
++
++	if (!npu)
++		return -ENODEV;
++
++	return mt76_npu_send_msg(npu, band, cmd, val, GFP_KERNEL);
++}
++
++static int mt7915_npu_program_band(struct mt7915_dev *dev, u8 band,
++				   struct mt76_queue *q, u32 ring_reg)
++{
++	struct airoha_npu *npu = mt7915_npu(dev);
++	u32 rxdesc_base;
++	int ret;
++
++	/* SET 0 is the WiFi ring's BAR register address. */
++	ret = mt7915_npu_set(dev, band, WLAN_FUNC_SET_WAIT_PCIE_ADDR,
++			     lower_32_bits(dev->pcie_bar0 + ring_reg));
++	if (ret)
++		return ret;
++
++	/* SET 1 is the number of 16-byte descriptors, not a DMA address. */
++	ret = mt7915_npu_set(dev, band, WLAN_FUNC_SET_WAIT_DESC,
++			     MT7915_KITE_RX_RING_SIZE);
++	if (ret)
++		return ret;
++
++	ret = mt76_npu_get_msg(npu, band, WLAN_FUNC_GET_WAIT_RXDESC_BASE,
++			       &rxdesc_base, GFP_KERNEL);
++	if (ret)
++		return ret;
++
++	/* Clanker allocated the descriptor block in NPU SRAM. Point the MT7916
++	 * ring register at the returned address and leave the Linux shadow ring
++	 * unused while Kite is active. */
++	writel(rxdesc_base, &q->regs->desc_base);
++
++	dev_info(dev->mt76.dev, "Kite band%u RX descriptors at 0x%08x\n",
++		 band, rxdesc_base);
++	return 0;
++}
++
++int mt7915_npu_init(struct mt7915_dev *dev)
++{
++	struct device_node *np = dev->mt76.dev->of_node;
++	u32 port_type = 2;
++	int ret;
++
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_SOC_WED)
++	/* WED and Kite cannot consume the same MT7916 RX rings.  Leave WED in
++	 * charge when it attached successfully and keep NPU firmware idle. */
++	if (mtk_wed_device_active(&dev->mt76.mmio.wed)) {
++		dev_warn(dev->mt76.dev,
++			 "Kite NPU disabled because WED owns the MT7916 RX rings\n");
++		return 0;
++	}
++#endif
++
++	if (!mt7915_npu_present(dev))
++		return 0;
++
++	dev_warn(dev->mt76.dev,
++		 "Experimental Kite RX: reset and firmware stop are not validated\n");
++
++	if (of_property_read_u32(np, "airoha,npu-pcie-port-type", &port_type))
++		dev_info(dev->mt76.dev,
++			 "Kite PCIe port type not specified, using %u\n", port_type);
++	if (port_type > 3)
++		return -EINVAL;
++
++	ret = mt76_npu_init(&dev->mt76, dev->pcie_bar0,
++				    MT76_NPU_TYPE_KITE);
++	if (ret)
++		return ret;
++
++	/* Clanker uses model 2 for MT7916D DBDC and fast flag bit 0 for the
++	 * AN7581 pipeline.  The PCIe port type selects the two inbound windows. */
++	ret = mt7915_npu_set(dev, 0, WLAN_FUNC_SET_WAIT_DRIVER_MODEL, 2);
++	if (ret)
++		goto err_deinit;
++	ret = mt7915_npu_set(dev, 0, WLAN_FUNC_SET_WAIT_PCIE_PORT_TYPE,
++			     port_type);
++	if (ret)
++		goto err_deinit;
++	ret = mt7915_npu_set(dev, 0, WLAN_FUNC_SET_WAIT_FAST_FLAG, 1);
++	if (ret)
++		goto err_deinit;
++
++	dev_info(dev->mt76.dev, "Kite NPU profile enabled (port type %u)\n",
++		 port_type);
++	return 0;
++
++err_deinit:
++	mt76_npu_deinit(&dev->mt76);
++	return ret;
++}
++
++int mt7915_npu_start(struct mt7915_dev *dev)
++{
++	struct mt76_dev *mdev = &dev->mt76;
++	u32 hif1_ofs = dev->hif2 ? MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0) : 0;
++	int ret;
++
++	if (!mt76_npu_device_active(mdev))
++		return 0;
++
++	ret = mt76_npu_rx_queue_init(mdev, &mdev->q_rx[MT_RXQ_NPU0]);
++	if (ret)
++		return ret;
++	if (dev->dbdc_support) {
++		ret = mt76_npu_rx_queue_init(mdev, &mdev->q_rx[MT_RXQ_NPU1]);
++		if (ret)
++			return ret;
++	}
++
++
++	ret = mt7915_npu_program_band(dev, 0, &mdev->q_rx[MT_RXQ_MAIN],
++				      MT_RXQ_RING_BASE(MT_RXQ_MAIN) +
++				      MT_RXQ_ID(MT_RXQ_MAIN) * MT7915_KITE_RING_REG_SIZE);
++	if (ret)
++		return ret;
++
++	if (dev->dbdc_support) {
++		ret = mt7915_npu_program_band(dev, 1,
++					      &mdev->q_rx[MT_RXQ_BAND1],
++					      MT_RXQ_RING_BASE(MT_RXQ_BAND1) +
++					      MT_RXQ_ID(MT_RXQ_BAND1) * MT7915_KITE_RING_REG_SIZE +
++					      hif1_ofs);
++		if (ret)
++			return ret;
++	}
++
++	/* Enable each band after its ring is populated.  SET 3 is deliberately
++	 * left to the station/interface control path: value 1 means force every
++	 * frame to the host and would disable the Kite forwarding path. */
++	ret = mt7915_npu_set(dev, 0, WLAN_FUNC_SET_WAIT_PCIE_STATE, 1);
++	if (ret)
++		return ret;
++	if (dev->dbdc_support) {
++		ret = mt7915_npu_set(dev, 1, WLAN_FUNC_SET_WAIT_PCIE_STATE, 1);
++		if (ret)
++			return ret;
++	}
++
++
++	/* The WiFi data IRQs now belong to Clanker.  Keep the normal Linux queue
++	 * objects as shadows for teardown and recovery, but do not schedule their
++	 * host RX pollers. */
++	mt7915_dual_hif_set_irq_mask(dev, true,
++				    MT_INT_RX(MT_RXQ_MAIN) |
++				    MT_INT_RX(MT_RXQ_BAND1), 0);
++
++	airoha_npu_wlan_enable_irq(mt7915_npu(dev), 0);
++	if (dev->dbdc_support)
++		airoha_npu_wlan_enable_irq(mt7915_npu(dev), 1);
++
++	dev_info(dev->mt76.dev, "Kite host-adaptor RX queues ready\n");
++	return 0;
++}
++
++int mt7915_npu_ba_set(struct mt7915_dev *dev, u8 band, u16 wcid,
++		      u8 tid, u16 ssn, u16 win_size)
++{
++	u32 val;
++
++	if (!mt76_npu_device_active(&dev->mt76))
++		return 0;
++	if (!wcid || wcid > 255 || tid > 7 || win_size > 511 || ssn > 4095)
++		return -ERANGE;
++
++	/* Clanker SET_WAIT 4: tid[2:0], wcid[10:3], window[19:11],
++	 * starting sequence number[31:20].  A zero window/SSN resets the entry. */
++	val = FIELD_PREP(GENMASK(2, 0), tid) |
++	      FIELD_PREP(GENMASK(10, 3), wcid) |
++	      FIELD_PREP(GENMASK(19, 11), win_size) |
++	      FIELD_PREP(GENMASK(31, 20), ssn);
++
++	return mt7915_npu_set(dev, band, WLAN_FUNC_SET_WAIT_BA_WIN_SIZE, val);
++}
++
++int mt7915_npu_sta_del(struct mt7915_dev *dev, u8 band, u16 wcid)
++{
++	if (!mt76_npu_device_active(&dev->mt76))
++		return 0;
++	if (!wcid || wcid > 255)
++		return -ERANGE;
++
++	return mt7915_npu_set(dev, band, WLAN_FUNC_SET_WAIT_DEL_STA, wcid);
++}
++
++#else
++
++int mt7915_npu_init(struct mt7915_dev *dev)
++{
++	return 0;
++}
++
++int mt7915_npu_start(struct mt7915_dev *dev)
++{
++	return 0;
++}
++
++int mt7915_npu_ba_set(struct mt7915_dev *dev, u8 band, u16 wcid,
++		      u8 tid, u16 ssn, u16 win_size)
++{
++	return 0;
++}
++
++int mt7915_npu_sta_del(struct mt7915_dev *dev, u8 band, u16 wcid)
++{
++	return 0;
++}
++
++#endif
+--- a/mt7915/pci.c
++++ b/mt7915/pci.c
+@@ -134,6 +134,7 @@
+ 		return PTR_ERR(dev);
+ 
+ 	mdev = &dev->mt76;
++	dev->pcie_bar0 = pci_resource_start(pdev, 0);
+ 	mt7915_wfsys_reset(dev);
+ 
+ 	ret = mt7915_mmio_wed_init(dev, pdev, true, &irq);

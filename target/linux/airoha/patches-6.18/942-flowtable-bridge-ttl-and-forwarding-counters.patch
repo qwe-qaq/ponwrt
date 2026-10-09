@@ -1,0 +1,119 @@
+Subject: netfilter: preserve bridge IP headers and count software handoffs
+
+--- a/include/net/netns/flow_table.h
++++ b/include/net/netns/flow_table.h
+@@ -6,6 +6,8 @@
+ 	unsigned int count_wq_add;
+ 	unsigned int count_wq_del;
+ 	unsigned int count_wq_stats;
++	unsigned int sw_bridge_packets;
++	unsigned int sw_routed_packets;
+ };
+ 
+ struct netns_ft {
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -413,15 +413,17 @@
+ 	thoff -= ctx->offset;
+ 
+ 	iph = ip_hdr(skb);
+-	nf_flow_nat_ip(flow, skb, thoff, dir, iph);
+-
+-	dscp = FIELD_GET(INET_DSCP_MASK, ipv4_get_dsfield(iph));
+-	if (tuplehash->tuple.dscp != dscp)
+-		ipv4_change_dsfield(iph, INET_ECN_MASK,
+-				    FIELD_PREP(INET_DSCP_MASK,
+-					       tuplehash->tuple.dscp));
+-
+-	ip_decrease_ttl(iph);
++	if (flow_table->type->family != NFPROTO_BRIDGE) {
++		nf_flow_nat_ip(flow, skb, thoff, dir, iph);
++
++		dscp = FIELD_GET(INET_DSCP_MASK, ipv4_get_dsfield(iph));
++		if (tuplehash->tuple.dscp != dscp)
++			ipv4_change_dsfield(iph, INET_ECN_MASK,
++					    FIELD_PREP(INET_DSCP_MASK,
++						       tuplehash->tuple.dscp));
++
++		ip_decrease_ttl(iph);
++	}
+ 	skb_clear_tstamp(skb);
+ 
+ 	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
+@@ -498,6 +500,13 @@
+ 		return NF_DROP;
+ 	}
+ 
++	/* Count a validated software fast-path handoff, not table installation.
++	 * Device/queue errors can still prevent delivery; check endpoint counters.
++	 */
++	if (flow_table->type->family == NFPROTO_BRIDGE)
++		NF_FLOW_TABLE_STAT_INC(state->net, sw_bridge_packets);
++	else
++		NF_FLOW_TABLE_STAT_INC(state->net, sw_routed_packets);
+ 	return nf_flow_queue_xmit(state->net, skb, &xmit);
+ }
+ EXPORT_SYMBOL_GPL(nf_flow_offload_ip_hook);
+@@ -708,15 +717,17 @@
+ 	nf_flow_encap_pop(skb, tuplehash);
+ 
+ 	ip6h = ipv6_hdr(skb);
+-	nf_flow_nat_ipv6(flow, skb, dir, ip6h);
+-
+-	dscp = FIELD_GET(INET_DSCP_MASK, ipv6_get_dsfield(ip6h));
+-	if (tuplehash->tuple.dscp != dscp)
+-		ipv6_change_dsfield(ip6h, INET_ECN_MASK,
+-				    FIELD_PREP(INET_DSCP_MASK,
+-					       tuplehash->tuple.dscp));
+-
+-	ip6h->hop_limit--;
++	if (flow_table->type->family != NFPROTO_BRIDGE) {
++		nf_flow_nat_ipv6(flow, skb, dir, ip6h);
++
++		dscp = FIELD_GET(INET_DSCP_MASK, ipv6_get_dsfield(ip6h));
++		if (tuplehash->tuple.dscp != dscp)
++			ipv6_change_dsfield(ip6h, INET_ECN_MASK,
++					    FIELD_PREP(INET_DSCP_MASK,
++						       tuplehash->tuple.dscp));
++
++		ip6h->hop_limit--;
++	}
+ 	skb_clear_tstamp(skb);
+ 
+ 	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
+@@ -810,6 +821,13 @@
+ 		return NF_DROP;
+ 	}
+ 
++	/* Count a validated software fast-path handoff, not table installation.
++	 * Device/queue errors can still prevent delivery; check endpoint counters.
++	 */
++	if (flow_table->type->family == NFPROTO_BRIDGE)
++		NF_FLOW_TABLE_STAT_INC(state->net, sw_bridge_packets);
++	else
++		NF_FLOW_TABLE_STAT_INC(state->net, sw_routed_packets);
+ 	return nf_flow_queue_xmit(state->net, skb, &xmit);
+ }
+ EXPORT_SYMBOL_GPL(nf_flow_offload_ipv6_hook);
+--- a/net/netfilter/nf_flow_table_procfs.c
++++ b/net/netfilter/nf_flow_table_procfs.c
+@@ -45,14 +45,16 @@
+ 	const struct nf_flow_table_stat *st = v;
+ 
+ 	if (v == SEQ_START_TOKEN) {
+-		seq_puts(seq, "wq_add   wq_del   wq_stats\n");
++		seq_puts(seq, "wq_add   wq_del   wq_stats sw_bridge_packets sw_routed_packets\n");
+ 		return 0;
+ 	}
+ 
+-	seq_printf(seq, "%8d %8d %8d\n",
++	seq_printf(seq, "%8d %8d %8d %u %u\n",
+ 		   st->count_wq_add,
+ 		   st->count_wq_del,
+-		   st->count_wq_stats
++		   st->count_wq_stats,
++		   st->sw_bridge_packets,
++		   st->sw_routed_packets
+ 		);
+ 	return 0;
+ }

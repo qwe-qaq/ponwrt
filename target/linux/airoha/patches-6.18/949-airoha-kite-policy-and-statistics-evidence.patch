@@ -1,0 +1,73 @@
+Subject: net: airoha: make Kite policy and learning evidence auditable
+
+Keep software rule admission, actual L4/L2 learning, and hardware statistics
+safe and distinguishable. Statistics may race a revoked sentinel slot.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -751,6 +751,8 @@
+ 	atomic_t kite_scan_budget;
+ 	u32 kite_scan_slot, kite_version;
+ 	atomic64_t kite_scanned, kite_learned, kite_revoked;
++	/* Rule admission and hardware learning are separate evidence. */
++	atomic64_t kite_policy_accept, kite_policy_reject, kite_l4_learned, kite_l2_learned;
+ };
+ 
+ struct airoha_eth_soc_data {
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -319,6 +319,10 @@
+ 	e->kite_in_key = k->key_generation;
+ 	e->kite_policy = i;
+ put:
++	if (ret)
++		atomic64_inc(&ppe->kite_policy_reject);
++	else
++		atomic64_inc(&ppe->kite_policy_accept);
+ 	dev_put(idev);
+ 	return ret;
+ }
+@@ -406,6 +410,7 @@
+ 			     hwe->l2b.ingress_vlan) &&
+ 			    !airoha_ppe_foe_commit_subflow_entry(ppe, e, slot, true))
+ 				atomic64_inc(&ppe->kite_learned);
++				atomic64_inc(&ppe->kite_l2_learned);
+ 			goto unlock;
+ 		}
+ 		if (type != PPE_PKT_TYPE_IPV4_HNAPT && type != PPE_PKT_TYPE_IPV6_ROUTE_5T)
+@@ -430,6 +435,7 @@
+ 				e->hash = slot;
+ 				WRITE_ONCE(ppe->kite_dp->flow[e->kite_policy].hw_slot, slot);
+ 				atomic64_inc(&ppe->kite_learned);
++				atomic64_inc(&ppe->kite_l4_learned);
+ 			}
+ 			break;
+ 		}
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1588,6 +1588,11 @@
+ 	struct airoha_foe_entry *hwe;
+ 	u32 index;
+ 
++	/* Statistics requests can race aging/revocation. The software sentinel
++	 * 0xffff is not a PPE slot; reject every out-of-range access before
++	 * forming the MMIO/DRAM pointer. */
++	if (hash >= airoha_ppe_get_total_num_entries(ppe))
++		return;
+ 	hwe = ppe->foe + hash * sizeof(*hwe);
+ 	if (airoha_is_7581(eth) &&
+ 	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, READ_ONCE(hwe->ib1)) ==
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -216,6 +216,11 @@
+ 	seq_printf(m, "kite_scanned=%lld kite_learned=%lld kite_revoked=%lld\n",
+ 		atomic64_read(&ppe->kite_scanned), atomic64_read(&ppe->kite_learned),
+ 		atomic64_read(&ppe->kite_revoked));
++	seq_printf(m, "kite_policy_accept=%lld kite_policy_reject=%lld kite_l4_learned=%lld kite_l2_learned=%lld\n",
++		atomic64_read(&ppe->kite_policy_accept),
++		atomic64_read(&ppe->kite_policy_reject),
++		atomic64_read(&ppe->kite_l4_learned),
++		atomic64_read(&ppe->kite_l2_learned));
+ 	mutex_unlock(&flow_offload_mutex);
+ 	seq_printf(m, "setup_attempts=%lld\n", atomic64_read(&ppe->setup_attempts));
+ 	seq_printf(m, "setup_ok=%lld\n", atomic64_read(&ppe->setup_ok));

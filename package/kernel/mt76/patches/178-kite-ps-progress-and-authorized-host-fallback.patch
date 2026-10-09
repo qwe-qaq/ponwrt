@@ -1,0 +1,116 @@
+Subject: [PATCH] r64 mt76 downlink performance and resume correctness
+
+Revalidate native authority; preserve stopped unchanged soft rules, not old
+FOEs. Keep single hart, exact policy, PN and DMA/WA ownership contracts.
+
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1330,8 +1330,13 @@
+  dp->r60.ps[ctx.wcid].consumed_serial=record[0]; accounted=true;
+  spin_unlock_irqrestore(&dev->kite.dp_done_lock,flags);
+ 	reject = MT7915_KITE_HOST_GATE;
+-	if (!READ_ONCE(dp->enabled) || READ_ONCE(dp->gate))
+-		goto reject;
++ /* PARK gates NPU mutation, not native mac80211 TX. A copied PS frame
++  * still needs its current exact soft authorization below. Normal broad
++  * fallback has no such proof and remains gated. Hard faults always fail. */
++ if (!READ_ONCE(dp->enabled) || kdp_failed(dp) ||
++     (READ_ONCE(dp->gate) && !request) ||
++     (READ_ONCE(dp->sta[ctx.wcid].tx_blocked) & ~KDP_TX_BLOCK_SOFTWARE))
++  goto reject;
+ 	reject = MT7915_KITE_HOST_STA;
+ 	if (!READ_ONCE(dp->sta[ctx.wcid].enabled) ||
+ 	    !READ_ONCE(dp->sta[ctx.wcid].authorized) ||
+@@ -1354,6 +1359,7 @@
+   if (!kdp_parse_packet(skb->data,skb->len,&packet) ||
+       !kdp_soft_record_matches(dp,&packet,ctx.wcid,request,slot,record[3],record[4]))
+    goto reject;
++  if (READ_ONCE(dp->gate)) dev->kite.host_soft_park++;
+  }
+ 
+ 	reject = MT7915_KITE_HOST_WCID;
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -300,6 +300,8 @@
+  u32 probe_mask, probe_count, reason[10], dma_wait, fence_reset;
+  u64 probe_ns, probe_max_ns;
+  u32 progress_wakes, worker_runs, seen_consumed, seen_drained, seen_reaped, seen_staged;
++ u32 progress_coalesced;
++ unsigned long queue_retry_at;
+  u64 queued_ns, queue_delay_ns, queue_delay_max_ns;
+  u64 awake_ns, drain_ns, revoke_ns, sleep_at_ns, sleep_ns;
+  unsigned long changed_at;
+@@ -367,6 +369,7 @@
+   u32 dp_done_publish_skips, dp_done_events;
+   u32 ba_refresh, ba_timer_refresh, ba_starts, ba_start_failed;
+   struct delayed_work dp_ps_work;
++ u32 host_soft_park;
+   u32 ps_cursor, ps_event_serial;
+   struct mt7915_kite_ps_event ps_events[MT7915_KITE_PS_EVENTS];
+   struct mt7915_kite_ps_state ps[KDP_WCIDS];
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1976,7 +1976,7 @@
+ 	ret = mt7915_kite_command(dev, KITE_CTL_DP_BIND, args, 3);
+ 	if (!ret)
+ 		dev_info(dev->mt76.dev,
+-			 "Kite datapath r63 ABI12 bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
++			 "Kite datapath r64 ABI12 bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
+ 			 s->session, s->epoch, sizeof(*s), s->perf.flags, npu_amsdu);
+ out:
+ 	if (ret)
+--- a/mt7915/npu-ps.inc
++++ b/mt7915/npu-ps.inc
+@@ -46,12 +46,24 @@
+   struct mt76_queue *q;
+   u32 consumed,drained,reaped,staged,band=s->sta[wi].band;
+   if (band>=2 || (s->sta[wi].tx_blocked & KDP_TX_BLOCK_PS)) continue;
++  if (p->queued_ns) { p->progress_coalesced++; continue; }
+   q=dev->kite.txq[band]; if (!q || !q->kite_tx) continue;
+   consumed=READ_ONCE(s->r60.ps[wi].consumed);
+   drained=READ_ONCE(s->r60.ps[wi].drained);
+   reaped=kite_tx_read(&q->kite_tx->reaped); staged=READ_ONCE(q->kite_staged);
+-  if (consumed==p->seen_consumed && drained==p->seen_drained &&
+-      reaped==p->seen_reaped && staged==p->seen_staged) continue;
++  /* Notify only when the current wait can finish. Global staging traffic
++   * does not prove this station's software queue empty. Its already armed
++   * bounded retry remains the fallback; native completion does not busy-
++   * wake a sleeping worker repeatedly within that same jiffy. */
++  if (p->fence_valid) {
++   if ((s32)(reaped-p->fence.target)<0) { p->progress_coalesced++; continue; }
++  } else if (drained!=p->request ||
++       READ_ONCE(s->r60.ps[wi].issued)-READ_ONCE(s->r60.ps[wi].failed)!=consumed) {
++   if (consumed==p->seen_consumed && drained==p->seen_drained) continue;
++  } else if (p->probe_mask && time_before(jiffies,p->queue_retry_at)) {
++   p->progress_coalesced++; continue;
++  } else if (consumed==p->seen_consumed && drained==p->seen_drained &&
++             reaped==p->seen_reaped) continue;
+   p->seen_consumed=consumed; p->seen_drained=drained;
+   p->seen_reaped=reaped; p->seen_staged=staged;
+   p->progress_wakes++; if (!p->queued_ns) p->queued_ns=ktime_get_ns(); wake=true;
+@@ -239,6 +251,7 @@
+    p->probe_count++; p->probe_ns+=elapsed;
+    if (elapsed>p->probe_max_ns) p->probe_max_ns=elapsed;
+    p->probe_mask=pending;
++   p->queue_retry_at=jiffies+max_t(unsigned long,1,msecs_to_jiffies(MT7915_KITE_DRAIN_RETRY_MS));
+    for (reason=0;reason<ARRAY_SIZE(p->reason);reason++)
+     if (pending & BIT(reason)) p->reason[reason]++;
+    if (pending || changes!=p->changes || (s->sta[wi].tx_blocked & KDP_TX_BLOCK_PS) ||
+--- a/mt7915/npu-r59-observe.inc
++++ b/mt7915/npu-r59-observe.inc
+@@ -98,6 +98,7 @@
+     valid?(u32)(first-READ_ONCE(s->r60.ps[i].resume_ms)):0,
+     bound?(u32)(READ_ONCE(s->r60.ps[i].learned_ms)-first):0);
+   }
++  seq_printf(m,"r64_ps%u progress_coalesced=%u\n",i,p.progress_coalesced);
+   seq_printf(m,"r63_ps%u progress_wakes=%u worker_runs=%u queue_delay_ns=%llu queue_delay_max_ns=%llu\n",
+    i,p.progress_wakes,p.worker_runs,p.queue_delay_ns,p.queue_delay_max_ns);
+   wcid = rcu_dereference_protected(dev->mt76.wcid[i], lockdep_is_held(&dev->mt76.mutex));
+@@ -128,6 +129,7 @@
+   s->r60.bind_state,s->r60.bind_glb_before,s->r60.bind_glb_after,s->r60.unbind_glb,s->r60.ingress_p7);
+  seq_printf(m,"r60_soft full=%u unsupported=%u\n",s->r60.soft_full,s->r60.soft_unsupported);
+  for (b=0;b<2;b++) {
++  if (!b) seq_printf(m,"r64_host soft_park=%u\n",dev->kite.host_soft_park);
+   seq_printf(m,"r60_quality%u wait_polls=%u parse_drop=%u policy_drop=%u host_rejected=%u host_delivered=%u\n",b,s->r60.ps_wait_polls[b],s->r60.ps_parse_drop[b],s->r60.ps_policy_drop[b],s->r60.host_ps_rejected[b],s->r60.host_ps_delivered[b]);
+   seq_printf(m,"r60_ingress%u base=%08x count=%08x cpu=%u dma=%u degraded=%u reason=%u\n",b,
+    s->r60.bind_ring[b][0],s->r60.bind_ring[b][1],s->r60.bind_ring[b][2],s->r60.bind_ring[b][3],

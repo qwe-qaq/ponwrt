@@ -1,0 +1,119 @@
+From: ponwrt development <noreply@local>
+Subject: [PATCH] Kite: preserve firmware fault identity on host WA errors
+
+Keep host completion failure in its saturating counter. Both sides close
+admission on either error; stopping still evaluates the original firmware
+ownership fault. A late WA cannot turn quarantine into recoverable fault 9.
+
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -164,6 +164,14 @@
+ 	unsigned char payload[KDP_TOKENS][KDP_BUFFER_BYTES];
+ 	struct kdp_band_stats stats[2];
+ };
++
++/* Separate writers: firmware fault identity is never overwritten by a
++ * host WA parser. tx_bad_done is a saturating host error latch until a
++ * proved stop and fresh shared session initialization. */
++static inline int kdp_failed(const volatile struct kdp_shared *s)
++{
++	return s->fault || s->tx_bad_done;
++}
+ 
+ static inline unsigned int kdp_get_le32(const unsigned char *p)
+ {
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -1989,7 +1989,7 @@
+ 		    wi && wi < KDP_WCIDS && vif->type == NL80211_IFTYPE_AP &&
+ 		    !test_bit(MT_WCID_FLAG_4ADDR, &ns->wcid.flags) &&
+ 		    READ_ONCE(dp->enabled) && !READ_ONCE(dp->gate) &&
+-		    !READ_ONCE(dp->fault) && READ_ONCE(dp->sta[wi].enabled) &&
++		    !kdp_failed(dp) && READ_ONCE(dp->sta[wi].enabled) &&
+ 		    READ_ONCE(dp->sta[wi].authorized) &&
+ 		    !READ_ONCE(dp->sta[wi].tx_blocked)) {
+ 			path->type = DEV_PATH_AIROHA_NPU;
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -939,7 +939,7 @@
+ 		if (dev->kite.dp_bound) {
+ 			struct kdp_shared *dp = dev->mt76.kite_dp;
+ 
+-			if (READ_ONCE(dp->fault))
++			if (kdp_failed(dp))
+ 				goto fault;
+ 			for (i = 0; i < KDP_TOKENS; i++)
+ 				if (READ_ONCE(dp->token[i].state) == KDP_TOKEN_WIFI ||
+@@ -966,7 +966,7 @@
+ 		mt7915_kite_tx_gate(dev, false);
+ 		if (dev->kite.dp_bound && !dev->kite.dp_changing &&
+ 		    READ_ONCE(dev->mt76.kite_dp->enabled) &&
+-		    !READ_ONCE(dev->mt76.kite_dp->fault)) {
++		    !kdp_failed(dev->mt76.kite_dp)) {
+ 			dma_wmb();
+ 			WRITE_ONCE(dev->mt76.kite_dp->gate, 0);
+ 		}
+@@ -997,10 +997,10 @@
+ 			dp_pending = READ_ONCE(dp->tx_sent[b]) - READ_ONCE(dp->tx_freed[b]);
+ 			if (report)
+ 				dev_info(dev->mt76.dev,
+-					 "Kite DP band%d: gate=%u fault=%u RX_ppe=%u RX_return=%u RX_free=%u replay=%u stale=%u TX_sent=%u TX_freed=%u TX_drop=%u pending=%u\n",
++					 "Kite DP band%d: gate=%u fault=%u RX_ppe=%u RX_return=%u RX_free=%u replay=%u stale=%u TX_sent=%u TX_freed=%u TX_drop=%u pending=%u WA_bad=%u\n",
+ 					 b, dp->gate, dp->fault, dp->rx_ppe[b], dp->rx_miss[b],
+ 					 dp->rx_free[b], dp->rx_replay[b], dp->rx_stale[b],
+-					 dp->tx_sent[b], dp->tx_freed[b], dp->tx_drop[b], dp_pending);
++					 dp->tx_sent[b], dp->tx_freed[b], dp->tx_drop[b], dp_pending, dp->tx_bad_done);
+ 		}
+ 		if (progress != q->kite_last_progress ||
+ 		    (!READ_ONCE(q->queued) && !READ_ONCE(q->kite_pending) && !dp_pending)) {
+@@ -1021,7 +1021,7 @@
+ 				READ_ONCE(q->kite_gated),
+ 				kite_tx_read(&s->fault),
+ 				READ_ONCE(dev->mt76.token_count));
+-		if (kite_tx_read(&s->fault) || (dp && READ_ONCE(dp->fault)) ||
++		if (kite_tx_read(&s->fault) || (dp && kdp_failed(dp)) ||
+ 		    time_after(jiffies, q->kite_progress_at + 15 * HZ)) {
+ 			mt7915_kite_tx_gate(dev, true);
+ 			dev->kite.tx_reset_requested = true;
+@@ -1113,7 +1113,7 @@
+ 	struct kdp_shared *s = READ_ONCE(dev->mt76.kite_dp);
+ 	unsigned int b, i, sta = 0, flows = 0, wifi = 0, tdma = 0, quarantine = 0;
+ 
+-	seq_printf(m, "abi=1 negotiated=%u bound=%u attached=%u changing=%u\n",
++	seq_printf(m, "abi=2 negotiated=%u bound=%u attached=%u changing=%u\n",
+ 		dev->kite.datapath, dev->kite.dp_bound, dev->kite.dp_attached,
+ 		dev->kite.dp_changing);
+ 	seq_printf(m, "rx_fence_stage=%u pauses=%u resumes=%u failures=%u held=%u key_pending=%u pse_empty=%08x query=%08x count=%u\n",
+@@ -1284,9 +1284,10 @@
+ 	    READ_ONCE(t->state) != KDP_TOKEN_WIFI || !seq ||
+ 	    READ_ONCE(t->wa_done) || READ_ONCE(t->wcid) >= KDP_WCIDS ||
+ 	    READ_ONCE(t->band) > 1) {
+-		WRITE_ONCE(s->tx_bad_done, READ_ONCE(s->tx_bad_done) + 1);
++		if (READ_ONCE(s->tx_bad_done) != U32_MAX)
++			WRITE_ONCE(s->tx_bad_done, READ_ONCE(s->tx_bad_done) + 1);
+ 		WRITE_ONCE(s->gate, 1);
+-		WRITE_ONCE(s->fault, 9);
++		/* Preserve any firmware identity/ownership fault (R5 stop gate). */
+ 		spin_unlock_irqrestore(&dev->kite.dp_done_lock, flags);
+ 		return true;
+ 	}
+--- a/mt7915/npu-datapath.inc
++++ b/mt7915/npu-datapath.inc
+@@ -29,7 +29,7 @@
+ 
+ 	mutex_lock(&dev->kite.lock);
+ 	ret = mt7915_kite_command(dev, KITE_CTL_RESUME, NULL, 0);
+-	if (!ret && !dev->kite.dp_changing && READ_ONCE(s->enabled)) {
++	if (!ret && !dev->kite.dp_changing && READ_ONCE(s->enabled) && !kdp_failed(s)) {
+ 		dma_wmb();
+ 		WRITE_ONCE(s->gate, 0);
+ 	}
+@@ -221,7 +221,7 @@
+ 			mt76_clear(dev, MT_ARB_SCR(b), MT_ARB_SCR_RX_DISABLE);
+ 	dev->kite.dp_rx_held = dev->kite.dp_changing = false;
+ 	dma_wmb();
+-	if (s->enabled && !s->fault)
++	if (s->enabled && !kdp_failed(s))
+ 		WRITE_ONCE(s->gate, 0);
+ 	dev->kite.dp_rx_stage = 10;
+ 	dev->kite.dp_rx_resumes++;

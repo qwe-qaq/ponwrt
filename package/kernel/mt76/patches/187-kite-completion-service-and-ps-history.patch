@@ -1,0 +1,161 @@
+From: ponwrt maintainers
+Subject: [PATCH] r76: Observe bounded completion service and PS history.
+
+Native incremental patch on release75. Datapath ABI12 and DMA ownership unchanged.
+
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1899,8 +1899,26 @@
+ }
+ DEFINE_SHOW_ATTRIBUTE(mt7915_kite_events);
+ 
++static int mt7915_kite_ps_history_show(struct seq_file *m, void *unused)
++{
++ struct mt7915_dev *dev=m->private;u32 last;
++ spin_lock_bh(&dev->kite.dp_done_lock);last=dev->kite.ps_event_serial;spin_unlock_bh(&dev->kite.dp_done_lock);
++ seq_printf(m,"r76_ps_ring last=%u first=%u overwritten=%u capacity=%u serial_modulo_u32=1\n",
++  last,last>MT7915_KITE_PS_EVENTS?last-MT7915_KITE_PS_EVENTS+1:!!last,
++  last>MT7915_KITE_PS_EVENTS?last-MT7915_KITE_PS_EVENTS:0,MT7915_KITE_PS_EVENTS);
++ for(u32 i=0;i<MT7915_KITE_PS_EVENTS;i++){
++  struct mt7915_kite_ps_event e;
++  spin_lock_bh(&dev->kite.dp_done_lock);e=dev->kite.ps_events[i];spin_unlock_bh(&dev->kite.dp_done_lock);
++  if(e.serial)seq_printf(m,"r63_ps_event serial=%u ns=%llu event=%u wcid=%u raw=%u generation=%u key_generation=%u request=%u blocked=%u issued=%u consumed=%u\n",
++   e.serial,e.ns,e.event,e.wcid,e.raw,e.generation,e.key_generation,e.request,e.blocked,e.issued,e.consumed);
++ }
++ return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mt7915_kite_ps_history);
++
+ void mt7915_npu_tx_debugfs(struct mt7915_dev *dev, struct dentry *dir)
+ {
++	debugfs_create_file("kite_ps_history",0400,dir,dev,&mt7915_kite_ps_history_fops);
+ 	debugfs_create_file("kite_datapath", 0400, dir, dev, &mt7915_kite_datapath_fops);
+  debugfs_create_file("kite_datapath_light",0400,dir,dev,&mt7915_kite_datapath_light_fops);
+ 	debugfs_create_file("kite_tx", 0400, dir, dev, &mt7915_kite_tx_fops);
+@@ -1992,6 +2010,7 @@
+ 		(npu_cached_hdr ? KDP_PERF_CACHED_HDR : 0) : 0;
+ 	/* Invalid profiling input disables optional sampling, never the link. */
+ 	s->perf.sample_shift = npu_profile >= 6 && npu_profile <= 12 ? npu_profile : 0;
++ WRITE_ONCE(dev->kite.observe_service,!!s->perf.sample_shift);
+ 	s->magic = KDP_MAGIC;
+ 	s->bytes = sizeof(*s);
+ 	s->session = dev->kite.session;
+--- a/mt7915/npu-wa.inc
++++ b/mt7915/npu-wa.inc
+@@ -44,6 +44,10 @@
+  dev->kite.dp_done_publish_calls++;
+  start = ktime_get_mono_fast_ns();
+  for (n=0;n<2;n++) if (bands[n]) {
++  u64 previous=dev->kite.wa.last_ns[n];
++  if(previous){u64 gap=start-previous;dev->kite.wa.gap_samples[n]++;
++   dev->kite.wa.gap_ns[n]+=gap;if(gap>dev->kite.wa.gap_max_ns[n])dev->kite.wa.gap_max_ns[n]=gap;}
++  dev->kite.wa.last_ns[n]=start;
+   dev->kite.wa.token_done[n]+=bands[n];
+   dev->kite.wa.event_done[n]+=events[n];
+   dev->kite.wa.overflow_done[n]+=overflows[n];
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -350,10 +350,11 @@
+ struct mt7915_kite_wa_stats {
+  u64 reports, events, batches, errors, total_ns, max_ns, publish_ns, publish_max_ns;
+  u32 token_done[2], event_done[2], overflow_done[2], last_done_ms[2];
++ u64 last_ns[2], gap_samples[2], gap_ns[2], gap_max_ns[2];
+  u64 age[8];
+  u64 mpdu[2], retries[2], final_failed[2], no_status_reports;
+ };
+-struct mt7915_kite_napi_stats { u64 polls, budget, packets, total_ns, max_ns; };
++struct mt7915_kite_napi_stats { u64 polls, budget, packets, total_ns, max_ns; u64 schedule_ns, delay_samples, delay_ns, delay_max_ns, last_poll_ns; };
+ struct mt7915_kite_trace_event {
+ 	u32 seq;
+ 	u32 event;
+@@ -414,6 +415,7 @@
+   struct mt7915_kite_failed_wcid failed_wcid[MT7916_WTBL_SIZE];
+   u32 failed_serial;
+   u64 failed_class[3][4]; /* band0, band1, unknown; source unknown/native/KDP/mixed */
++  bool observe_service;
+   struct mt7915_kite_napi_stats napi[__MT_RXQ_MAX];
+ 		DECLARE_BITMAP(dp_ps_pending, KDP_WCIDS);
+ 		bool dp_work_stopping, dp_work_initialized;
+--- a/mt7915/mmio.c
++++ b/mt7915/mmio.c
+@@ -815,6 +815,22 @@
+ }
+ 
+ #ifdef CONFIG_MT7915_NPU
++/* First pending tasklet scheduling timestamp, consumed once by the poll.
++ * No descriptor access, no logging, and never holds a lock across NAPI. */
++static void mt7915_kite_rx_schedule(struct mt7915_dev *dev, u32 intr)
++{
++ static const u8 queues[]={MT_RXQ_MCU,MT_RXQ_MCU_WA,MT_RXQ_MAIN_WA,MT_RXQ_BAND1_WA};
++ unsigned long flags;u64 now;
++ if (!READ_ONCE(dev->kite.dp_bound) || !READ_ONCE(dev->kite.observe_service)) return;
++ now=ktime_get_mono_fast_ns();
++ spin_lock_irqsave(&dev->kite.dp_done_lock,flags);
++ for(u32 i=0;i<ARRAY_SIZE(queues);i++){
++  u32 q=queues[i];
++  if ((intr&MT_INT_RX(q)) && !dev->kite.napi[q].schedule_ns)
++   dev->kite.napi[q].schedule_ns=now;
++ }
++ spin_unlock_irqrestore(&dev->kite.dp_done_lock,flags);
++}
+ static void mt7915_rx_poll_observe(struct mt76_dev *mdev, int q, int done, int budget, u64 ns)
+ {
+  struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
+@@ -824,6 +840,16 @@
+  spin_lock_irqsave(&dev->kite.dp_done_lock, flags);
+  v = &dev->kite.napi[q]; v->polls++; v->packets += done; v->budget += done >= budget;
+  v->total_ns += ns; if (ns > v->max_ns) v->max_ns = ns;
++ if (READ_ONCE(dev->kite.observe_service)) {
++  u64 end=ktime_get_mono_fast_ns(),start=end>=ns?end-ns:0;
++  if (v->schedule_ns && start>=v->schedule_ns) {
++   u64 delay=start-v->schedule_ns;
++   v->delay_samples++;v->delay_ns+=delay;if(delay>v->delay_max_ns)v->delay_max_ns=delay;
++   v->schedule_ns=0;
++  }
++  /* A concurrently scheduled next poll timestamp must not be consumed. */
++  v->last_poll_ns=end;
++ }
+  spin_unlock_irqrestore(&dev->kite.dp_done_lock, flags);
+  mt7915_npu_ps_progress(mdev);
+ }
+@@ -883,6 +909,9 @@
+ 		mask |= MT_INT_TX_DONE_MCU;
+ 
+ 	mt7915_irq_disable(dev, mask);
++#ifdef CONFIG_MT7915_NPU
++ mt7915_kite_rx_schedule(dev,intr);
++#endif
+ 
+ 	if (intr & MT_INT_TX_DONE_MCU)
+ 		napi_schedule(&dev->mt76.tx_napi);
+--- a/mt7915/npu-r59-observe.inc
++++ b/mt7915/npu-r59-observe.inc
+@@ -136,12 +136,17 @@
+  seq_puts(m, "r59_wa_age");
+  for (i = 0; i < 8; i++) seq_printf(m, " bin%u=%llu", i, wa.age[i]);
+  seq_putc(m, '\n');
++ for(b=0;b<2;b++)
++  seq_printf(m,"r76_wa%u last_ns=%llu gap_samples=%llu gap_ns=%llu gap_max_ns=%llu scope=host_WA_batch_arrival_includes_idle\n",
++   b,wa.last_ns[b],wa.gap_samples[b],wa.gap_ns[b],wa.gap_max_ns[b]);
+  for (i = 0; i < __MT_RXQ_MAX; i++) {
+   struct mt7915_kite_napi_stats z;
+   spin_lock_bh(&dev->kite.dp_done_lock); z = dev->kite.napi[i];
+   spin_unlock_bh(&dev->kite.dp_done_lock);
+   seq_printf(m, "r59_napi%u polls=%llu budget=%llu packets=%llu total_ns=%llu max_ns=%llu\n",
+              i, z.polls, z.budget, z.packets, z.total_ns, z.max_ns);
++  seq_printf(m,"r76_napi%u samples=%llu schedule_to_poll_ns=%llu max_ns=%llu pending_since_ns=%llu last_poll_ns=%llu scope=tasklet_schedule_to_poll_not_HW_IRQ\n",
++   i,z.delay_samples,z.delay_ns,z.delay_max_ns,z.schedule_ns,z.last_poll_ns);
+  }
+  for (i = 0; i < 2; i++) {
+   struct mt7915_kite_host_stats h;
+@@ -203,6 +208,10 @@
+   mt7915_kite_aggregation_sta(m, dev, msta, i);
+ 
+  }
++ {u32 last;spin_lock_bh(&dev->kite.dp_done_lock);last=dev->kite.ps_event_serial;spin_unlock_bh(&dev->kite.dp_done_lock);
++  seq_printf(m,"r76_ps_ring last=%u first=%u overwritten=%u capacity=%u serial_modulo_u32=1\n",
++   last,last>MT7915_KITE_PS_EVENTS?last-MT7915_KITE_PS_EVENTS+1:!!last,
++   last>MT7915_KITE_PS_EVENTS?last-MT7915_KITE_PS_EVENTS:0,MT7915_KITE_PS_EVENTS);}
+  if (detail) for (i=0;i<MT7915_KITE_PS_EVENTS;i++) {
+   struct mt7915_kite_ps_event e;
+   spin_lock_bh(&dev->kite.dp_done_lock); e=dev->kite.ps_events[i];

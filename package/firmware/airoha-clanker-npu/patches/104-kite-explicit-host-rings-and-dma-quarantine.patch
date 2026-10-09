@@ -1,0 +1,613 @@
+--- a/Makefile
++++ b/Makefile
+@@ -52,7 +52,7 @@
+            npu_mbox.c npu_sram.c npu_bridge.c npu_printf.c \
+            npu_dba.c npu_tr471.c npu_dbg.c \
+            npu_wifi.c npu_wifi_bufid.c npu_wifi_fwd.c npu_wifi_ba.c \
+-           npu_wifi_rx.c npu_wifi_init.c npu_kite_control.c \
++           npu_wifi_rx.c npu_wifi_init.c npu_kite_control.c npu_kite_dma.c \
+            npu_wifi_kite.c npu_wifi_eagle.c npu_wifi_eagle_dp.c \
+            npu_tdma.c npu_hostadpt.c npu_sta_q.c \
+            npu_tunnel.c npu_ppe.c npu_l4s.c
+@@ -76,7 +76,7 @@
+ 	$(CC) $(ASFLAGS) -c -o $@ $<
+ 
+ $(BUILD)/%.o: %.c npu_config.h npu_regs.h npu_types.h npu_internal.h \
+-		 npu_wifi.h kite_rxd.h kite-control.h $(FLAGS) | $(BUILD)
++		 npu_wifi.h kite_rxd.h kite-control.h kite-host.h $(FLAGS) | $(BUILD)
+ 	$(CC) $(CFLAGS) -c -o $@ $<
+ 
+ $(ELF): $(OBJS) link.ld
+--- a/kite-control.h
++++ b/kite-control.h
+@@ -23,6 +23,7 @@
+ #define KITE_CTL_CAP_CONTROL_ONLY 16u
+ #define KITE_CTL_CAP_ARM_PA 32u
+ #define KITE_CTL_CAPS 63u
++#define KITE_CTL_CAP_HOST_RING 64u /* optional explicit bind/unbind, not DMA ownership */
+ #define KITE_CTL_MODE_DATA 0u
+ #define KITE_CTL_MODE_CONTROL_ONLY 1u
+ 
+@@ -55,6 +56,8 @@
+ 	KITE_CTL_KEY, /* wcid, generation, key generation, cipher, keyid */
+ 	KITE_CTL_BA, /* wcid, generation, tid, window (0=DELBA), SSN */
+ 	KITE_CTL_CLOSE,
++	KITE_CTL_HOST_BIND, /* ring0 ARM PA, ring1 ARM PA or 0, bands (1 or 3), count512 */
++	KITE_CTL_HOST_UNBIND, /* expected bind serial; host writer only, not full DMA stop */
+ };
+ enum kite_ctl_result {
+ 	KITE_CTL_OK,
+@@ -69,6 +72,7 @@
+ 	KITE_CTL_RUNNING,
+ 	KITE_CTL_PARKING,
+ 	KITE_CTL_PARKED,
++	KITE_CTL_FAULTED, /* DMA completion unknown; no reclaim or automatic resume */
+ };
+ /* Reply: magic, words, capabilities, session, last serial, result, state,
+  * ack mask, WCID count, required DRAM bytes, accepted commands, rejected
+--- /dev/null
++++ b/kite-host.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PONWRT_KITE_HOST_H
++#define PONWRT_KITE_HOST_H
++
++/* Firmware source ownership is retained on HOLD, including a partial
++ * chain. Neither DONE nor the producer index may be published. */
++#define KITE_HOST_HOLD (-2)
++#define KITE_HOST_DIAG_MAGIC 0x4b480001u
++#define KITE_HOST_RING_COUNT 512u
++#define KITE_HOST_RING_BYTES (KITE_HOST_RING_COUNT * 24u)
++
++static inline int kite_host_ring_valid(unsigned long long addr)
++{
++	return addr >= 0x80000000ull && addr < 0xc0000000ull &&
++	       !(addr & 63) && KITE_HOST_RING_BYTES <= 0xc0000000ull - addr;
++}
++
++#if defined(AN7581) && defined(MT7916)
++int kite_host_copy(u32 src, u32 dst, u32 len);
++int kite_host_dma_idle(void);
++int kite_host_faulted(void);
++void kite_host_dma_snapshot(u32 *out);
++int kite_host_bind(u32 session, u32 epoch, u32 bandmask, u32 pa0, u32 pa1);
++int kite_host_unbind(u32 session, u32 epoch);
++u32 kite_host_bound(void);
++void kite_host_snapshot(u32 *out);
++#else
++static inline int kite_host_faulted(void) { return 0; }
++#endif
++#endif
+--- a/npu_hostadpt.c
++++ b/npu_hostadpt.c
+@@ -8,6 +8,7 @@
+ 
+ #include "npu_internal.h"
+ #include "npu_wifi.h"
++#include "kite-host.h"
+ 
+ 
+ /* ================================================================
+@@ -20,6 +21,70 @@
+ static u32 hostadpt_tx_ring_base;
+ volatile u8 hostadpt_tx_ring_ready;
+ static u32 hostadpt_rx_ring_base;
++
++#if defined(AN7581) && defined(MT7916)
++static u32 kite_host_session, kite_host_epoch, kite_host_bands;
++
++u32 kite_host_bound(void)
++{
++	return kite_host_bands;
++}
++
++/* Core 0 calls only after fresh ACKs from all three workers. Ring MMIO
++ * pointers are not authority: explicit session/serial binds the bases. */
++int kite_host_bind(u32 session, u32 epoch, u32 bandmask, u32 pa0, u32 pa1)
++{
++	if (kite_host_bands || !kite_host_dma_idle() || !session || !epoch ||
++	    session < kite_host_session ||
++	    (session == kite_host_session && epoch <= kite_host_epoch) ||
++	    (bandmask != 1 && bandmask != 3) || !kite_host_ring_valid(pa0) ||
++	    (bandmask == 3 ? !kite_host_ring_valid(pa1) : pa1 != 0))
++		return 0;
++	if (bandmask == 3 && pa0 < pa1 + KITE_HOST_RING_BYTES &&
++	    pa1 < pa0 + KITE_HOST_RING_BYTES)
++		return 0;
++	if (REG32(HOSTADPT_RX_DMA_IDX(0)) ||
++	    (bandmask == 3 && REG32(HOSTADPT_RX_DMA_IDX(1))))
++		return 0; /* caller must initialize indices before a new binding */
++	hostadpt_tx_ring_base = (pa0 & 0x3fffffff) | 0x40000000;
++	hostadpt_rx_ring_base = bandmask == 3 ?
++		(pa1 & 0x3fffffff) | 0x40000000 : 0;
++	kite_host_session = session;
++	kite_host_epoch = epoch;
++	kite_host_bands = bandmask;
++	__asm__ volatile("fence iorw,iorw" ::: "memory");
++	hostadpt_tx_ring_ready = 1;
++	return 1;
++}
++
++int kite_host_unbind(u32 session, u32 epoch)
++{
++	if (!kite_host_bands || session != kite_host_session ||
++	    epoch != kite_host_epoch || !kite_host_dma_idle())
++		return 0;
++	hostadpt_tx_ring_ready = 0;
++	__asm__ volatile("fence iorw,iorw" ::: "memory");
++	hostadpt_tx_ring_base = hostadpt_rx_ring_base = 0;
++	kite_host_bands = 0;
++	return 1;
++}
++
++/* GET32 page1 words31..42. Observational until workers are parked. */
++void kite_host_snapshot(u32 *out)
++{
++	u32 dma[8], i;
++
++	kite_host_dma_snapshot(dma);
++	out[0] = KITE_HOST_DIAG_MAGIC;
++	out[1] = kite_host_epoch;
++	out[2] = kite_host_bands;
++	for (i = 0; i < 5; i++)
++		out[3 + i] = dma[i];
++	out[8] = kite_host_session;
++	for (i = 0; i < 3; i++)
++		out[9 + i] = dma[5 + i];
++}
++#endif
+ 
+ #ifdef HAS_NPU_WIFI_TX
+ /* host -> NPU tx rings: 208-byte entries, bit0 of word0 is the own bit */
+@@ -42,6 +107,13 @@
+ 	hostadpt_in_size[0] = REG32(HOSTADPT_IN_MAX_CNT(0));
+ 	hostadpt_in_size[1] = REG32(HOSTADPT_IN_MAX_CNT(1));
+ #endif
++#if defined(AN7581) && defined(MT7916)
++	/* A stale nonzero MMIO base must never reattach a freed Linux ring.
++	 * SET33 HOST_BIND is serviced by the core0 mailbox ISR while waiting. */
++	while (!hostadpt_tx_ring_ready)
++		npu_dbg_poll();
++	return 0;
++#else
+ 	/* wait for host to configure RX DMA pointer */
+ 	while (REG32(HOSTADPT_RX_DMA_PTR) == 0)
+ 		npu_dbg_poll();
+@@ -50,6 +122,7 @@
+ 	hostadpt_rx_ring_base = (REG32(HOSTADPT_RX_DMA_PTR) & 0x3FFFFFFF) | 0x40000000;
+ 	hostadpt_tx_ring_ready = 1;
+ 	return 0;
++#endif
+ }
+ 
+ #ifdef HAS_WIFI
+@@ -81,16 +154,21 @@
+ 			(*(u32 *)(counter_base_tri + 0x30))++;
+ 	}
+ 
++#if defined(AN7581) && defined(MT7916)
++	if (kite_host_copy(buf_addr, d[3], dma_len))
++		return 0; /* valid control words always contain DONE bit0 */
++#else
+ 	bridge_dma_copy(3, buf_addr, d[3], dma_len);
++#endif
+ 
+ 	d[2] = info;
+ 	d[1] = (wcid & 0xFFFF) | ((amsdu & 0x1F) << 16) |
+-	       ((fwd_type & 0x3F) << 26);
++	       ((u32)(fwd_type & 0x3F) << 26);
+ 	return 1 | ((orig_len & 0x3FFF) << 1) | ((pkt_len & 0x3FFF) << 15) |
+ 	       ((is_last & 1) << 29);
+ }
+ 
+-static void host_ring_write_desc(u32 desc_addr, u32 buf_addr, u16 pkt_len,
++static int host_ring_write_desc(u32 desc_addr, u32 buf_addr, u16 pkt_len,
+ 				 u16 wcid, u8 amsdu, u8 fwd_type,
+ 				 u16 orig_len, u8 is_last, u32 info)
+ {
+@@ -98,6 +176,8 @@
+ 					 amsdu, fwd_type, orig_len, is_last, info);
+ 	volatile u32 *d = (volatile u32 *)desc_addr;
+ 
++	if (!ctrl)
++		return KITE_HOST_HOLD;
+ 	__asm__ volatile("fence iorw,iorw" ::: "memory");
+ 	d[0] = ctrl;
+ 	/* Publish DONE before the caller rings the OUT_DMA_IDX doorbell. */
+@@ -105,6 +185,7 @@
+ 
+ 	if ((wifi_debug_flags & 4) && counter_base_tri)
+ 		(*(u32 *)(counter_base_tri + 0x38))++;
++	return 0;
+ }
+ 
+ static int host_ring_submit_impl(u32 buf_addr, u16 pkt_len, u32 band,
+@@ -113,8 +194,11 @@
+ {
+ 	u32 idx, check_idx, ring_base, desc_addr;
+ 
++	if (kite_host_faulted())
++		return KITE_HOST_HOLD;
+ 	if (!hostadpt_tx_ring_ready || band > 1 || !pkt_len || !orig_len)
+ 		return -1;
++	__asm__ volatile("fence iorw,iorw" ::: "memory");
+ #ifdef WIFI_KITE
+ 	if (pkt_len > HOSTADPT_BUFFER_LEN || orig_len != pkt_len)
+ 		return -1; /* segmented frames use the all-or-nothing chain writer */
+@@ -157,8 +241,9 @@
+ 		    (((volatile u32 *)desc_addr)[0] & 1))
+ 			return -1;
+ 		__asm__ volatile("fence iorw,iorw" ::: "memory");
+-		host_ring_write_desc(desc_addr, buf_addr, pkt_len, wcid,
+-				     amsdu, fwd_type, orig_len, is_last, info);
++		if (host_ring_write_desc(desc_addr, buf_addr, pkt_len, wcid,
++					 amsdu, fwd_type, orig_len, is_last, info))
++			return KITE_HOST_HOLD;
+ 		idx++;
+ 		REG32(HOSTADPT_RX_DMA_IDX(0)) = (idx < HOSTADPT_RING_SIZE) ? idx : 0;
+ 		return 0;
+@@ -189,8 +274,9 @@
+ 		    (((volatile u32 *)desc_addr)[0] & 1))
+ 			return -1;
+ 		__asm__ volatile("fence iorw,iorw" ::: "memory");
+-		host_ring_write_desc(desc_addr, buf_addr, pkt_len, wcid,
+-				     amsdu, fwd_type, orig_len, is_last, info);
++		if (host_ring_write_desc(desc_addr, buf_addr, pkt_len, wcid,
++					 amsdu, fwd_type, orig_len, is_last, info))
++			return KITE_HOST_HOLD;
+ 		idx++;
+ 		REG32(HOSTADPT_RX_DMA_IDX(1)) = (idx < HOSTADPT_RING_SIZE) ? idx : 0;
+ 		return 0;
+@@ -217,12 +303,18 @@
+  * any DONE bit, then publish the head last. Congestion drops a whole frame. */
+ static int host_ring_submit_kite_chain_impl(const u32 *nodes, u32 n, u32 band)
+ {
+-	u32 ring = band ? hostadpt_rx_ring_base : hostadpt_tx_ring_base;
++	u32 ring;
+ 	u32 idx, slot, i, sum = 0, total;
+ 	u32 ctrl[7], slots[7];
+ 	volatile u32 *d;
+ 
+-	if (band > 1 || !hostadpt_tx_ring_ready || !ring || !n || n > 7)
++	if (kite_host_faulted())
++		return KITE_HOST_HOLD;
++	if (band > 1 || !hostadpt_tx_ring_ready || !n || n > 7)
++		return -1;
++	__asm__ volatile("fence iorw,iorw" ::: "memory");
++	ring = band ? hostadpt_rx_ring_base : hostadpt_tx_ring_base;
++	if (!ring)
+ 		return -1;
+ 	idx = REG32(HOSTADPT_RX_DMA_IDX(band));
+ 	if (idx >= HOSTADPT_RING_SIZE)
+@@ -242,10 +334,13 @@
+ 	if (sum != total || total <= HOSTADPT_BUFFER_LEN || total >= 0x4000)
+ 		return -1;
+ 	__asm__ volatile("fence iorw,iorw" ::: "memory");
+-	for (i = 0; i < n; i++)
++	for (i = 0; i < n; i++) {
+ 		ctrl[i] = host_ring_prepare_desc(slots[i],
+ 			wifi_pkt_dma(*(u32 *)nodes[i]), total, 0, 0,
+ 			(n << 3) | (i + 1), *(u16 *)(nodes[i] + 6), i == n - 1, 0);
++		if (!ctrl[i])
++			return KITE_HOST_HOLD;
++	}
+ 	for (i = n; i-- > 0; ) {
+ 		__asm__ volatile("fence iorw,iorw" ::: "memory");
+ 		*(volatile u32 *)slots[i] = ctrl[i];
+@@ -323,7 +418,7 @@
+ 	o->next = (idx + 1 < HOSTADPT_RING_SIZE) ? idx + 1 : 0;
+ 	o->w2 = info;
+ 	o->w1 = (wcid & 0xFFFF) | ((amsdu & 0x1F) << 16) |
+-		((fwd_type & 0x3F) << 26);
++		((u32)(fwd_type & 0x3F) << 26);
+ 	o->w0 = 1 | ((orig_len & 0x3FFF) << 1) | ((pkt_len & 0x3FFF) << 15) |
+ 		((is_last & 1) << 29);
+ }
+--- a/npu_kite_control.c
++++ b/npu_kite_control.c
+@@ -5,6 +5,7 @@
+  */
+ #include "npu_internal.h"
+ #include "npu_wifi.h"
++#include "kite-host.h"
+ #include "kite-control.h"
+ 
+ #if defined(AN7581) && defined(MT7916)
+@@ -38,7 +39,8 @@
+ 
+ int kite_ctl_rx_held(void)
+ {
+-	return ctl.state == KITE_CTL_PARKING || ctl.state == KITE_CTL_PARKED;
++	return kite_host_faulted() || ctl.state == KITE_CTL_PARKING ||
++	       ctl.state == KITE_CTL_PARKED;
+ }
+ 
+ /* Call only between complete units of work, never from inside a DMA copy,
+@@ -46,8 +48,12 @@
+  * writer; there is no shared read-modify-write on the ack mask. */
+ int kite_ctl_pausepoint(u32 hart)
+ {
+-	if (!kite_ctl_rx_held())
+-		return 0;
++	if (kite_host_faulted())
++		return 1; /* hold workers, but never ACK an unfinished DMA */
++	if (!kite_ctl_rx_held()) {
++		ctl_fence(); /* acquire ring/table changes before leaving PARK */
++		return 0;
++	}
+ 	if (hart < 1 || hart > 3)
+ 		return 0;
+ 	ctl_fence();
+@@ -60,7 +66,7 @@
+ {
+ 	u32 i, mask = 0;
+ 
+-	if (!kite_ctl_rx_held())
++	if (kite_host_faulted() || !kite_ctl_rx_held())
+ 		return 0;
+ 	ctl_fence();
+ 	for (i = 1; i <= 3; i++)
+@@ -71,6 +77,8 @@
+ 
+ static int kite_ctl_parked(void)
+ {
++	if (kite_host_faulted())
++		return 0;
+ 	if (ctl.state == KITE_CTL_PARKING &&
+ 	    kite_ctl_ack() == KITE_CTL_WORKERS) {
+ 		ctl_fence();
+@@ -149,8 +157,10 @@
+ 	u32 op = d[2], wcid = d[5], gen = d[6], tid, addr, i;
+ 	struct kite_ctl_sta *sta;
+ 
++	if (kite_host_faulted())
++		return KITE_CTL_BUSY;
+ 	if (op == KITE_CTL_OPEN) {
+-		if (kite_ctl_active() || kite_ctl_rings_live())
++		if (kite_ctl_active() || kite_ctl_rings_live() || kite_host_bound())
+ 			return KITE_CTL_BUSY;
+ 		if (!d[3] || d[3] <= ctl.session || d[4] != 1)
+ 			return KITE_CTL_STALE;
+@@ -188,7 +198,32 @@
+ 	}
+ 	if (!kite_ctl_parked())
+ 		return KITE_CTL_BUSY;
++	if (op == KITE_CTL_HOST_BIND) {
++		u32 ba = (wifi_dram_ba_node_addr & 0x3fffffff) | 0x80000000;
++		u32 bands = d[7];
++
++		if (ctl.mode != KITE_CTL_MODE_DATA || kite_ctl_rings_live() ||
++		    kite_host_bound())
++			return KITE_CTL_BUSY;
++		if ((bands != 1 && bands != 3) || d[8] != KITE_HOST_RING_COUNT ||
++		    !kite_host_ring_valid(d[5]) ||
++		    (bands == 3 ? !kite_host_ring_valid(d[6]) : d[6] != 0))
++			return KITE_CTL_INVALID;
++		for (i = 0; i < (bands == 3 ? 2u : 1u); i++)
++			if (d[5+i] < ba + 0x200000 && ba < d[5+i] + KITE_HOST_RING_BYTES)
++				return KITE_CTL_INVALID;
++		return kite_host_bind(ctl.session, d[4], bands, d[5], d[6]) ?
++			KITE_CTL_OK : KITE_CTL_INVALID;
++	}
++	if (op == KITE_CTL_HOST_UNBIND) {
++		if (ctl.mode != KITE_CTL_MODE_DATA)
++			return KITE_CTL_BUSY;
++		return kite_host_unbind(ctl.session, d[5]) ? KITE_CTL_OK : KITE_CTL_STALE;
++	}
+ 	if (op == KITE_CTL_RESUME) {
++		if (ctl.mode == KITE_CTL_MODE_DATA && kite_ctl_rings_live() &&
++		    !kite_host_bound())
++			return KITE_CTL_BUSY;
+ 		ctl_fence();
+ 		ctl.state = KITE_CTL_RUNNING;
+ 		return KITE_CTL_OK;
+@@ -196,6 +231,8 @@
+ 	if (op != KITE_CTL_BA && kite_ctl_rings_live())
+ 		return KITE_CTL_BUSY;
+ 	if (op == KITE_CTL_CLOSE) {
++		if (kite_host_bound())
++			return KITE_CTL_BUSY;
+ 		for (i = 1; i < KITE_CTL_WCIDS; i++)
+ 			kite_ctl_discard(i);
+ 		ctl.stations = 0;
+@@ -286,10 +323,11 @@
+ 
+ 	if (bytes != (KITE_CTL_WORDS + 2) * 4 || (msg[0] & 15) ||
+ 	    d[0] != KITE_CTL_MAGIC || d[1] != KITE_CTL_WORDS ||
+-	    d[2] < KITE_CTL_OPEN || d[2] > KITE_CTL_CLOSE)
++	    d[2] < KITE_CTL_OPEN || d[2] > KITE_CTL_HOST_UNBIND)
+ 		return 0;
+ 	used = d[2] == KITE_CTL_OPEN ? 8 : d[2] == KITE_CTL_STA_DEL ? 7 :
+-	       d[2] == KITE_CTL_STA_ADD ? 9 : d[2] == KITE_CTL_PORT ? 8 :
++	       d[2] == KITE_CTL_STA_ADD || d[2] == KITE_CTL_HOST_BIND ? 9 :
++	       d[2] == KITE_CTL_HOST_UNBIND ? 6 : d[2] == KITE_CTL_PORT ? 8 :
+ 	       d[2] == KITE_CTL_KEY || d[2] == KITE_CTL_BA ? 10 : 5;
+ 	for (i = used; i < KITE_CTL_WORDS; i++)
+ 		if (d[i])
+@@ -335,11 +373,11 @@
+ 	npu_memset(d, 0, KITE_CTL_WORDS * 4);
+ 	d[0] = KITE_CTL_MAGIC;
+ 	d[1] = KITE_CTL_WORDS;
+-	d[2] = KITE_CTL_CAPS;
++	d[2] = KITE_CTL_CAPS | KITE_CTL_CAP_HOST_RING;
+ 	d[3] = ctl.session;
+ 	d[4] = ctl.serial;
+ 	d[5] = ctl.result;
+-	d[6] = ctl.state;
++	d[6] = kite_host_faulted() ? KITE_CTL_FAULTED : ctl.state;
+ 	d[7] = kite_ctl_ack();
+ 	d[8] = KITE_CTL_WCIDS;
+ 	d[9] = KITE_CTL_DRAM_BYTES;
+--- /dev/null
++++ b/npu_kite_dma.c
+@@ -0,0 +1,102 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* AN7581 MT7916: channel 3 has exactly one writer (host delivery, hart 3).
++ * A timeout is loss of completion proof, NOT cancellation of DMA. Keep
++ * both source and destination owned, suppress publication, and latch the
++ * fault for the rest of this boot. Only a verified hardware reset could
++ * make automatic recovery safe; none is claimed here.
++ */
++#include "npu_internal.h"
++#include "kite-host.h"
++
++#if defined(AN7581) && defined(MT7916)
++#define KITE_COPY_CHANNEL 3u
++#define KITE_COPY_MASK (1u << KITE_COPY_CHANNEL)
++#define KITE_COPY_POLLS 1000000u
++/* Cycle bound also works when the timer ISR is not running. This is a
++ * conservative budget, not a claim about a fixed wall-clock duration. */
++#define KITE_COPY_CYCLES 8000000u
++
++static struct {
++	volatile u32 inflight, fault;
++	u32 submitted, completed, timeouts, src, dst, len;
++} kite_copy;
++
++static u32 kite_copy_read(u32 reg)
++{
++	return REG32(reg);
++}
++
++static void kite_copy_write(u32 reg, u32 value)
++{
++	REG32(reg) = value;
++}
++
++int kite_host_faulted(void)
++{
++	return kite_copy.fault != 0;
++}
++
++int kite_host_dma_idle(void)
++{
++	return !kite_copy.inflight && !kite_copy.fault;
++}
++
++void kite_host_dma_snapshot(u32 *out)
++{
++	out[0] = kite_copy.inflight;
++	out[1] = kite_copy.fault;
++	out[2] = kite_copy.submitted;
++	out[3] = kite_copy.completed;
++	out[4] = kite_copy.timeouts;
++	out[5] = kite_copy.src;
++	out[6] = kite_copy.dst;
++	out[7] = kite_copy.len;
++}
++
++int kite_host_copy(u32 src, u32 dst, u32 len)
++{
++	u32 start, polls;
++
++	if (!kite_host_dma_idle())
++		return KITE_HOST_HOLD;
++	if (!src || !dst || !len || len > 3500) {
++		kite_copy.fault = 1; /* invalid request; nothing submitted */
++		return KITE_HOST_HOLD;
++	}
++	/* Clear only our W1C bit. Never accept a stale DONE as proof of this
++	 * transfer, and never clear another channel's completion. */
++	kite_copy_write(DMA_COPY_STATUS, KITE_COPY_MASK);
++	__asm__ volatile("fence iorw,iorw" ::: "memory");
++	if (kite_copy_read(DMA_COPY_STATUS) & KITE_COPY_MASK) {
++		kite_copy.fault = 2;
++		return KITE_HOST_HOLD;
++	}
++	kite_copy.src = src;
++	kite_copy.dst = dst;
++	kite_copy.len = len;
++	kite_copy.inflight = 1;
++	kite_copy.submitted++;
++	__asm__ volatile("fence iorw,iorw" ::: "memory");
++	kite_copy_write(DMA_COPY_SRC(KITE_COPY_CHANNEL), src);
++	kite_copy_write(DMA_COPY_DST(KITE_COPY_CHANNEL), dst);
++	kite_copy_write(DMA_COPY_CTRL(KITE_COPY_CHANNEL), (len << 16) | 0x23);
++	__asm__ volatile("fence iorw,iorw" ::: "memory");
++	start = csr_read(mcycle);
++	for (polls = 0; polls < KITE_COPY_POLLS; polls++) {
++		if (kite_copy_read(DMA_COPY_STATUS) & KITE_COPY_MASK) {
++			__asm__ volatile("fence iorw,iorw" ::: "memory");
++			kite_copy_write(DMA_COPY_STATUS, KITE_COPY_MASK);
++			__asm__ volatile("fence iorw,iorw" ::: "memory");
++			kite_copy.completed++;
++			kite_copy.inflight = 0;
++			return 0;
++		}
++		if ((u32)(csr_read(mcycle) - start) >= KITE_COPY_CYCLES)
++			break;
++	}
++	kite_copy.timeouts++;
++	__asm__ volatile("fence iorw,iorw" ::: "memory");
++	kite_copy.fault = 3;
++	return KITE_HOST_HOLD;
++}
++#endif
+--- a/npu_wifi.c
++++ b/npu_wifi.c
+@@ -8,6 +8,7 @@
+ 
+ #include "npu_internal.h"
+ #include "npu_wifi.h"
++#include "kite-host.h"
+ #include "kite-control.h"
+ 
+ 
+@@ -107,6 +108,7 @@
+ 		d[25] = wifi_force_to_cpu;
+ 		d[26] = wifi_band_cap;
+ 		kite_tdma_snapshot(d + 27);
++		kite_host_snapshot(d + 31);
+ 	}
+ 	return 1;
+ }
+--- a/npu_wifi_fwd.c
++++ b/npu_wifi_fwd.c
+@@ -5,6 +5,7 @@
+ 
+ #include "npu_internal.h"
+ #include "npu_wifi.h"
++#include "kite-host.h"
+ 
+ 
+ /* per-band per-queue stats: 16 queues x u64 */
+@@ -248,6 +249,8 @@
+ 	s32 buf_id;
+ 	int ret;
+ 
++	if (kite_host_faulted())
++		return;
+ 	if (band != 0) {
+ 		ridx = pinode_ridx_5g;
+ 		entry = (u32 *)(pinode_base_5g + (u32)ridx * 16);
+@@ -281,6 +284,8 @@
+ 				       *(u16 *)((u32)entry + 8),
+ 				       (*(u8 *)((u32)entry + 10) >> 1) & 1,
+ 				       *(u8 *)((u32)entry + 12));
++		if (ret == KITE_HOST_HOLD)
++			return; /* retain node and source until DMA completion is proven */
+ 		wifi_cnt_inc(band == 1, ret ? 108 : 48);
+ 		buf_id_free(0, band, *(u16 *)entry);
+ 	}
+@@ -307,6 +312,9 @@
+ 	u32 nodes[7], n = 0, total = 0, scan = ridx, flags;
+ 	u32 i;
+ 	int complete = 0;
++
++	if (kite_host_faulted())
++		return;
+ 
+ 	/* Leave an unpublished suffix alone. If a failed producer is followed
+ 	 * by another frame, discard only the old prefix, preserving the head
+@@ -333,8 +341,9 @@
+ 		}
+ 		scan = (scan + 1) % RXNODE_RING_SIZE;
+ 	}
+-	if (complete)
+-		host_ring_submit_kite_chain(nodes, n, band);
++	if (complete &&
++	    host_ring_submit_kite_chain(nodes, n, band) == KITE_HOST_HOLD)
++		return; /* even a copied prefix remains unpublished and owned */
+ 	for (i = 0; i < n; i++) {
+ 		buf_id_free(0, band, *(u32 *)nodes[i]);
+ 		*(u32 *)nodes[i] = (u32)-1;

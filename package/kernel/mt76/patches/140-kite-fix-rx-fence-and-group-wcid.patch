@@ -1,0 +1,392 @@
+From: ponwrt development <noreply@local>
+Subject: [PATCH] mt7915: fix STA RX fence and preserve source WCID identity
+
+Do not gate RX drain on PSE SFD_PARK (bit 21 / port 2 queue 5).
+MT7916 retains StoreForward pages; the failed CU readback 0x9fdfffff
+shows all receive queues empty while the SFD queue remains occupied.
+Keep MDP_RX/SEC_RX/RXIOC/HIF drain, dual WFDMA stop, worker ACK and
+both old-RX purges before publishing new station/key generations.
+
+Use the original RXD WCID for NPU epoch checks before the group RX
+mapping to the vif GTK WCID. Group traffic cannot carry NPU security
+proofs. Add fence stage/register and per-band RX identity diagnostics.
+
+Validated with extracted production functions, captured-register
+regression and fault injection; hardware acceptance remains pending.
+
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -297,6 +297,102 @@
+ 	mtk_wed_device_ppe_check(&dev->mt76.mmio.wed, skb,
+ 				 FIELD_GET(MT_DMA_PPE_CPU_REASON, info),
+ 				 FIELD_GET(MT_DMA_PPE_ENTRY, info));
++}
++
++/* Metadata epochs describe the WCID in the hardware RXD. For group RX,
++ * mt7915_rx_get_wcid() selects the vif WCID for GTK/mac80211 processing;
++ * that separate key owner must not replace the source identity check. */
++static int
++mt7915_kite_rx_security(struct mt7915_dev *dev, struct mt76_rx_status *status,
++		       enum mt76_rxq_id q, const u32 *info, u16 raw_wcid,
++		       bool unicast, __le16 fc, u16 seq_ctrl)
++{
++#ifdef CONFIG_MT7915_NPU
++	struct kdp_shared *dp = READ_ONCE(dev->mt76.kite_dp);
++	u32 meta;
++	unsigned int band;
++	int ret;
++
++	if (!dp || (q != MT_RXQ_NPU0 && q != MT_RXQ_NPU1))
++		return 0;
++	band = q - MT_RXQ_NPU0;
++	if (!status->wcid) {
++		/* Unknown peers' authentication/association frames remain host
++		 * owned, with no reorder or PN proof attached. */
++		dev->kite.dp_rx_meta_untracked[band]++;
++		return 0;
++	}
++	meta = info[0];
++	if (raw_wcid >= KDP_WCIDS ||
++	    (meta & 0xffff0000u) != KDP_RX_MAGIC ||
++	    (meta & ~(KDP_RX_MAGIC | KDP_RX_REORDERED | KDP_RX_PN |
++		       KDP_RX_PPE_RETURN))) {
++		ret = -EPROTO;
++		goto reject;
++	}
++	if (info[1] != READ_ONCE(dp->sta[raw_wcid].generation) ||
++	    info[2] != READ_ONCE(dp->sta[raw_wcid].key_generation)) {
++		ret = -ESTALE;
++		goto reject;
++	}
++	/* Firmware never grants accelerated/PN proofs to group traffic.
++	 * GTK replay remains owned by the vif WCID and mac80211. */
++	if (!unicast || raw_wcid != status->wcid->idx) {
++		if (meta & (KDP_RX_REORDERED | KDP_RX_PN | KDP_RX_PPE_RETURN)) {
++			ret = -EPROTO;
++			goto reject;
++		}
++		goto accepted;
++	}
++	if ((meta & KDP_RX_REORDERED) &&
++	    (!ieee80211_is_data_qos(fc) || ieee80211_has_morefrags(fc) ||
++	     (seq_ctrl & 15) || (status->amsdu && !(status->flag & RX_FLAG_8023)))) {
++		ret = -EPROTO;
++		goto reject;
++	}
++	if ((meta & KDP_RX_PN) &&
++	    (!(meta & KDP_RX_REORDERED) || !(status->flag & RX_FLAG_DECRYPTED) ||
++	     READ_ONCE(dp->sta[raw_wcid].cipher) != KDP_CIPHER_CCMP)) {
++		ret = -EPROTO;
++		goto reject;
++	}
++	status->npu_security = 1;
++	status->npu_generation = info[1];
++	status->npu_key_generation = info[2];
++	status->flag &= ~(RX_FLAG_AMPDU_DETAILS | RX_FLAG_MACTIME_START |
++			  RX_FLAG_MACTIME_END | RX_FLAG_MACTIME_PLCP_START);
++	if ((meta & KDP_RX_PPE_RETURN) && mt76_ppe_device_active(&dev->mt76)) {
++		struct airoha_ppe_dev *ppe = rcu_dereference(dev->mt76.mmio.ppe_dev);
++
++		if (ppe)
++			airoha_kite_learn_hint(ppe);
++	}
++	if (meta & KDP_RX_REORDERED) {
++		/* PPE can consume siblings of a translated A-MSDU: each host
++		 * subframe is already complete and must not be reassembled. */
++		status->amsdu = status->first_amsdu = status->last_amsdu = 0;
++		status->npu_reordered = 1;
++	}
++	if (meta & KDP_RX_PN)
++		status->npu_pn_proof = 1;
++accepted:
++	dev->kite.dp_rx_meta_ok[band]++;
++	return 0;
++reject:
++	if (ret == -ESTALE)
++		dev->kite.dp_rx_meta_stale[band]++;
++	else
++		dev->kite.dp_rx_meta_invalid[band]++;
++	dev_warn_ratelimited(dev->mt76.dev,
++		"Kite RX metadata rejected: band=%u raw_wcid=%u key_wcid=%u fc=%04x meta=%08x generation=%u/%u key_generation=%u/%u err=%d\n",
++		band, raw_wcid, status->wcid->idx, le16_to_cpu(fc), meta,
++		info[1], raw_wcid < KDP_WCIDS ? READ_ONCE(dp->sta[raw_wcid].generation) : 0,
++		info[2], raw_wcid < KDP_WCIDS ? READ_ONCE(dp->sta[raw_wcid].key_generation) : 0,
++		ret);
++	return ret;
++#else
++	return 0;
++#endif
+ }
+ 
+ static int
+@@ -572,53 +668,13 @@
+ 	if (rxv && mode >= MT_PHY_TYPE_HE_SU && !(status->flag & RX_FLAG_8023))
+ 		mt76_connac2_mac_decode_he_radiotap(&dev->mt76, skb, rxv, mode);
+ 
+-#ifdef CONFIG_MT7915_NPU
+-	if (READ_ONCE(dev->mt76.kite_dp) && status->wcid &&
+-	    (q == MT_RXQ_NPU0 || q == MT_RXQ_NPU1)) {
+-		struct kdp_shared *dp = dev->mt76.kite_dp;
+-		u16 wi = status->wcid->idx;
+-		u32 meta = info[0];
+-		if (wi >= KDP_WCIDS || (meta & 0xffff0000u) != KDP_RX_MAGIC ||
+-		    (meta & ~(KDP_RX_MAGIC | KDP_RX_REORDERED | KDP_RX_PN |
+-			       KDP_RX_PPE_RETURN)) ||
+-		    info[1] != READ_ONCE(dp->sta[wi].generation) ||
+-		    info[2] != READ_ONCE(dp->sta[wi].key_generation))
+-			return -ESTALE;
+-		status->npu_security = 1;
+-		status->npu_generation = info[1];
+-		status->npu_key_generation = info[2];
+-		status->flag &= ~(RX_FLAG_AMPDU_DETAILS | RX_FLAG_MACTIME_START |
+-				  RX_FLAG_MACTIME_END | RX_FLAG_MACTIME_PLCP_START);
+-		if ((meta & KDP_RX_PPE_RETURN) && mt76_ppe_device_active(&dev->mt76)) {
+-			struct airoha_ppe_dev *ppe = rcu_dereference(dev->mt76.mmio.ppe_dev);
+-
+-			if (ppe)
+-				airoha_kite_learn_hint(ppe);
+-		}
+-		if (meta & KDP_RX_REORDERED) {
+-			if (!ieee80211_is_data_qos(fc) ||
+-			    ieee80211_has_morefrags(fc) || (seq_ctrl & 15))
+-				return -EPROTO;
+-			/* NPU already assembled and PN-checked the complete MPDU.
+-			 * Each translated subframe is a standalone Ethernet skb: PPE
+-			 * may have consumed its siblings, so Linux cannot reassemble
+-			 * the original hardware A-MSDU chain a second time. */
+-			if (status->amsdu) {
+-				if (!(status->flag & RX_FLAG_8023))
+-					return -EPROTO;
+-				status->amsdu = status->first_amsdu = status->last_amsdu = 0;
+-			}
+-			status->npu_reordered = 1;
+-		}
+-		if (meta & KDP_RX_PN) {
+-			if (!(meta & KDP_RX_REORDERED) ||
+-			    !(status->flag & RX_FLAG_DECRYPTED) ||
+-			    READ_ONCE(dp->sta[wi].cipher) != KDP_CIPHER_CCMP)
+-				return -EPROTO;
+-			status->npu_pn_proof = 1;
+-		}
+-	}
+-#endif
++	{
++		int ret = mt7915_kite_rx_security(dev, status, q, info, idx,
++						unicast, fc, seq_ctrl);
++
++		if (ret)
++			return ret;
++	}
+ 
+ 	if (!status->wcid || !ieee80211_is_data_qos(fc))
+ 		return 0;
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -276,6 +276,10 @@
+ 		u32 dp_epoch;
+ 		bool dp_attached, dp_changing, dp_rx_held;
+ 		u32 dp_rx_cfg[2], dp_rx_mac[2], dp_key_pending;
++		u32 dp_rx_stage, dp_rx_pse_empty, dp_rx_pse_query, dp_rx_pse_count;
++		u32 dp_rx_pauses, dp_rx_resumes, dp_rx_failures;
++		u32 dp_rx_meta_ok[2], dp_rx_meta_untracked[2];
++		u32 dp_rx_meta_stale[2], dp_rx_meta_invalid[2];
+ 		spinlock_t dp_done_lock;
+ 		struct work_struct dp_ps_work;
+ 		DECLARE_BITMAP(dp_ps_pending, KDP_WCIDS);
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -505,6 +505,8 @@
+ 	args[2] = msta->vif->phy->mt76->band_idx;
+ 	args[3] = msta->vif->mt76.idx;
+ 	ret = mt7915_kite_update(dev, KITE_CTL_STA_ADD, args, 4);
++	dev_info(dev->mt76.dev, "Kite STA add: band=%u wcid=%u generation=%u result=%d rx_stage=%u\n",
++		 args[2], idx, args[1], ret, dev->kite.dp_rx_stage);
+ 	if (!ret) {
+ 		dev->kite.key_generation[idx] = 0;
+ 		dev->kite.live[idx] = true;
+@@ -566,6 +568,8 @@
+ 	args[1] = dev->kite.generation[idx];
+ 	args[2] = authorized;
+ 	ret = mt7915_kite_update(dev, KITE_CTL_PORT, args, 3);
++	dev_info(dev->mt76.dev, "Kite port: wcid=%u authorized=%u result=%d rx_stage=%u\n",
++		 idx, authorized, ret, dev->kite.dp_rx_stage);
+ 	mutex_unlock(&dev->kite.lock);
+ 	return mt7915_kite_host_result(dev, ret);
+ }
+@@ -1112,6 +1116,14 @@
+ 	seq_printf(m, "abi=1 negotiated=%u bound=%u attached=%u changing=%u\n",
+ 		dev->kite.datapath, dev->kite.dp_bound, dev->kite.dp_attached,
+ 		dev->kite.dp_changing);
++	seq_printf(m, "rx_fence_stage=%u pauses=%u resumes=%u failures=%u held=%u key_pending=%u pse_empty=%08x query=%08x count=%u\n",
++		dev->kite.dp_rx_stage, dev->kite.dp_rx_pauses, dev->kite.dp_rx_resumes,
++		dev->kite.dp_rx_failures, dev->kite.dp_rx_held, dev->kite.dp_key_pending,
++		dev->kite.dp_rx_pse_empty, dev->kite.dp_rx_pse_query, dev->kite.dp_rx_pse_count);
++	for (b = 0; b < 2; b++)
++		seq_printf(m, "rx_meta_band%u accepted=%u untracked=%u stale=%u invalid=%u\n",
++			b, READ_ONCE(dev->kite.dp_rx_meta_ok[b]), READ_ONCE(dev->kite.dp_rx_meta_untracked[b]),
++			READ_ONCE(dev->kite.dp_rx_meta_stale[b]), READ_ONCE(dev->kite.dp_rx_meta_invalid[b]));
+ 	if (!s)
+ 		return 0;
+ 	dma_rmb();
+--- a/mt7915/npu-datapath.inc
++++ b/mt7915/npu-datapath.inc
+@@ -68,23 +68,33 @@
+ 	return 0;
+ }
+ 
+-/* MT7916 wf_pse_top: true PSE RX/SEC/RXIOC/SFD and HIF queues.
+- * Check both read-only empty bits (including band1 RXIOC) and explicit
+- * queue counts. Do not reuse PLE debugfs offsets as PSE drain evidence. */
++/* MT7916 wf_pse_top: MDP_RX, SEC_RX, RXIOC and HIF receive queues.
++ * SFD_PARK (bit 21, port 2 queue 5) retains StoreForward pages; the PLE
++ * AMSDU_GC DIS_SFD_KEEP_SAME_PAGE control documents that retention.
++ * It is not an RX drain queue and may remain occupied with RF RX held.
++ * Do not flush firmware-owned SFD packets or wait for that TX lifetime.
++ * Check both read-only RX empty bits (including band1 RXIOC) and explicit
++ * queue counts. Physical DMA stop, worker ACK and RX purges follow. */
+ static bool mt7915_dp_rx_queues_empty(struct mt7915_dev *dev)
+ {
+-	static const u8 pid[] = { 2, 2, 2, 2, 0, 0, 0, 0, 0, 0 };
+-	static const u8 qid[] = { 2, 4, 5, 7, 0, 1, 2, 3, 4, 5 };
++	static const u8 pid[] = { 2, 2, 2, 0, 0, 0, 0, 0, 0 };
++	static const u8 qid[] = { 2, 4, 7, 0, 1, 2, 3, 4, 5 };
+ 	unsigned int i;
+ 
+-	if ((mt76_rr(dev, MT_KITE_PSE_EMPTY) & MT_KITE_PSE_RX_EMPTY) !=
+-	    MT_KITE_PSE_RX_EMPTY)
++	dev->kite.dp_rx_pse_empty = mt76_rr(dev, MT_KITE_PSE_EMPTY);
++	dev->kite.dp_rx_pse_query = dev->kite.dp_rx_pse_count = 0;
++	if ((dev->kite.dp_rx_pse_empty & MT_KITE_PSE_RX_EMPTY) != MT_KITE_PSE_RX_EMPTY)
+ 		return false;
+ 	for (i = 0; i < ARRAY_SIZE(pid); i++) {
+ 		mt76_wr(dev, MT_KITE_PSE_QUERY,
+ 			BIT(31) | ((u32)pid[i] << 10) | ((u32)qid[i] << 24));
+-		if (!mt76_poll(dev, MT_KITE_PSE_QUERY, BIT(31), 0, 10) ||
+-		    mt76_get_field(dev, MT_KITE_PSE_COUNT, GENMASK(11, 0)))
++		if (!mt76_poll(dev, MT_KITE_PSE_QUERY, BIT(31), 0, 10)) {
++			dev->kite.dp_rx_pse_query = mt76_rr(dev, MT_KITE_PSE_QUERY);
++			return false;
++		}
++		dev->kite.dp_rx_pse_query = mt76_rr(dev, MT_KITE_PSE_QUERY);
++		dev->kite.dp_rx_pse_count = mt76_get_field(dev, MT_KITE_PSE_COUNT, GENMASK(11, 0));
++		if (dev->kite.dp_rx_pse_count)
+ 			return false;
+ 	}
+ 	return true;
+@@ -115,6 +125,24 @@
+ 		mt76_set(dev, MT_WFDMA0_GLO_CFG + ofs, MT_WFDMA0_GLO_CFG_RX_DMA_EN);
+ }
+ 
++/* Capture the failing fence before control is latched. No key material or
++ * client addresses are logged, and no register is written by this helper. */
++static int mt7915_dp_rx_error(struct mt7915_dev *dev, int ret)
++{
++	u32 ofs = dev->hif2 ? MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0) : 0;
++
++	dev->kite.dp_rx_failures++;
++	dev_err(dev->mt76.dev,
++		"Kite RX fence failed: stage=%u err=%d serial=%u pse_empty=%08x need=%08x query=%08x count=%u dma0=%08x dma1=%08x mac0=%08x mac1=%08x; admission held\n",
++		dev->kite.dp_rx_stage, ret, dev->kite.serial,
++		dev->kite.dp_rx_pse_empty, (u32)MT_KITE_PSE_RX_EMPTY,
++		dev->kite.dp_rx_pse_query, dev->kite.dp_rx_pse_count,
++		mt76_rr(dev, MT_WFDMA0_GLO_CFG),
++		ofs ? mt76_rr(dev, MT_WFDMA0_GLO_CFG + ofs) : 0,
++		mt76_rr(dev, MT_ARB_SCR(0)), mt76_rr(dev, MT_ARB_SCR(1)));
++	return ret;
++}
++
+ static int mt7915_dp_rx_pause(struct mt7915_dev *dev)
+ {
+ 	u32 ofs = dev->hif2 ? MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0) : 0;
+@@ -124,6 +152,8 @@
+ 	lockdep_assert_held(&dev->kite.lock);
+ 	if (!dev->kite.dp_bound)
+ 		return 0;
++	dev->kite.dp_rx_pauses++;
++	dev->kite.dp_rx_stage = 1; /* radio hold */
+ 	for (b = 0; b < 2; b++) {
+ 		dev->kite.dp_rx_mac[b] = mt76_rr(dev, MT_ARB_SCR(b));
+ 		mt76_set(dev, MT_ARB_SCR(b), MT_ARB_SCR_RX_DISABLE);
+@@ -133,26 +163,34 @@
+ 	 * the hardware queue counts to drain the decrypt/translation/HIF path.
+ 	 * The elapsed delay alone is not the completion condition. */
+ 	usleep_range(6000, 8000);
++	dev->kite.dp_rx_stage = 2; /* PSE drain */
+ 	while (!mt7915_dp_rx_queues_empty(dev)) {
+ 		if (time_after_eq(jiffies, until))
+-			return -ETIMEDOUT;
++			return mt7915_dp_rx_error(dev, -ETIMEDOUT);
+ 		usleep_range(1000, 2000);
+ 	}
+ 	dev->kite.dp_rx_cfg[0] = mt76_rr(dev, MT_WFDMA0_GLO_CFG);
+ 	if (ofs)
+ 		dev->kite.dp_rx_cfg[1] = mt76_rr(dev, MT_WFDMA0_GLO_CFG + ofs);
++	dev->kite.dp_rx_stage = 3; /* physical RX stop */
+ 	ret = mt7915_dp_dma_rx_disable(dev);
+-	if (!ret)
++	if (!ret) {
++		dev->kite.dp_rx_stage = 4; /* worker PARK/ACK */
+ 		ret = mt7915_kite_command(dev, KITE_CTL_PARK, NULL, 0);
++	}
+ 	if (!ret)
+ 		ret = mt7915_kite_wait_parked(dev);
+-	if (!ret)
++	if (!ret) {
++		dev->kite.dp_rx_stage = 5; /* old RX descriptors */
+ 		ret = mt7915_kite_command(dev, KITE_CTL_DP_RX_PURGE, NULL, 0);
++	}
+ 	/* WM/WA command completions share WFDMA. Restore their DMA while
+ 	 * keeping radio RX and both NPU RX workers stopped during MCU rekey. */
+-	if (!ret)
+-		mt7915_dp_dma_rx_restore(dev);
+-	return ret;
++	if (ret)
++		return mt7915_dp_rx_error(dev, ret);
++	mt7915_dp_dma_rx_restore(dev);
++	dev->kite.dp_rx_stage = 6; /* MCU command RX window; radio still held */
++	return 0;
+ }
+ 
+ static int mt7915_dp_rx_finish(struct mt7915_dev *dev)
+@@ -165,13 +203,18 @@
+ 		return 0;
+ 	/* Purge again while radio RX is still disabled: no unread descriptor
+ 	 * can acquire the replacement key's generation merely by resuming. */
++	dev->kite.dp_rx_stage = 7;
+ 	ret = mt7915_dp_dma_rx_disable(dev);
+-	if (!ret)
++	if (!ret) {
++		dev->kite.dp_rx_stage = 8;
+ 		ret = mt7915_kite_command(dev, KITE_CTL_DP_RX_PURGE, NULL, 0);
+-	if (!ret)
++	}
++	if (!ret) {
++		dev->kite.dp_rx_stage = 9;
+ 		ret = mt7915_kite_command(dev, KITE_CTL_RESUME, NULL, 0);
++	}
+ 	if (ret)
+-		return mt7915_kite_fault(dev, ret);
++		return mt7915_kite_fault(dev, mt7915_dp_rx_error(dev, ret));
+ 	mt7915_dp_dma_rx_restore(dev);
+ 	for (b = 0; b < 2; b++)
+ 		if (!(dev->kite.dp_rx_mac[b] & MT_ARB_SCR_RX_DISABLE))
+@@ -180,6 +223,8 @@
+ 	dma_wmb();
+ 	if (s->enabled && !s->fault)
+ 		WRITE_ONCE(s->gate, 0);
++	dev->kite.dp_rx_stage = 10;
++	dev->kite.dp_rx_resumes++;
+ 	mt7915_npu_tx_unfence(dev);
+ 	return 0;
+ }
+--- a/mt7915/regs.h
++++ b/mt7915/regs.h
+@@ -171,7 +171,7 @@
+ #define MT_KITE_PSE_QUERY		MT_PSE(0x1b0)
+ #define MT_KITE_PSE_COUNT		MT_PSE(0x1bc)
+ #define MT_KITE_PSE_RX_EMPTY		(GENMASK(15, 4) | BIT(18) | BIT(20) | \
+-					 BIT(21) | BIT(23) | BIT(27))
++					 BIT(23) | BIT(27))
+ 
+ /* WF MDP TOP */
+ #define MT_MDP_BASE			0x820cd000

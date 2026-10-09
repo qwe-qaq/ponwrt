@@ -1,0 +1,22 @@
+Subject: r68 kite-datapath.h: opt-in D-cache header flag defines
+
+Keeps the kernel copy of the shared ABI header byte-identical to the
+firmware and mt76 copies. Defines only; ABI12 layout and size unchanged.
+
+--- a/include/linux/soc/airoha/kite-datapath.h
++++ b/include/linux/soc/airoha/kite-datapath.h
+@@ -213,6 +213,14 @@
+  * The old DMA regions do not move. The host writes flags only before BIND. */
+ #define KDP_PERF_FAST 1u
+ #define KDP_PERF_TOKENQ 2u
++/* r68 opt-in: hart4 reads the TX header line through the D-cache after a
++ * line invalidate. The host may set only CACHED_HDR; hart4 reports the
++ * result of its on-core self-test with OK or FAIL, and SEEN when a stale
++ * cached read proved the cache is really in the load path. Layout unchanged. */
++#define KDP_PERF_CACHED_HDR 4u
++#define KDP_PERF_CACHED_FAIL 8u
++#define KDP_PERF_CACHED_SEEN 16u
++#define KDP_PERF_CACHED_OK 32u
+ struct kdp_perf_control {
+ 	unsigned int flags, free_count, pending_count, alloc_probe;
+ 	unsigned int alloc_empty, reap_probe, reap_ready, cache_flush;

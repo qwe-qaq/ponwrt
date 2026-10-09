@@ -1,0 +1,48 @@
+Subject: mt7915: resolve completed Kite mailbox transactions after timeout
+
+The mailbox send path can time out after the NPU has accepted and executed a
+control transaction. Treating every -ETIMEDOUT as an unknown ownership fault
+parks the workers and starts a full radio reset even when GET33 already proves
+that the expected serial completed. Poll the status mailbox a few times before
+raising the failure latch; an unchanged or unavailable status remains a hard
+failure and keeps the existing DMA ownership contract.
+
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -78,7 +78,33 @@ static int __mt7915_kite_command(struct mt7915_dev *dev, u32 op,
+ 	ret = airoha_npu_wlan_send_msg(npu, 0,
+ 		(enum airoha_npu_wlan_set_cmd)33, wire, sizeof(wire), GFP_KERNEL);
+-	if (ret)
+-		return ret;
+-	ret = mt7915_kite_status(dev, s);
++	if (ret && ret != -ETIMEDOUT && ret != -EAGAIN)
++		return ret;
++	if (ret) {
++		int send_ret = ret;
++		unsigned int attempt;
++
++		/* A timeout only says that the SET response was not observed.  The
++		 * firmware may have committed the command already.  GET33 is the
++		 * authoritative serial/result observation, so poll it before
++		 * declaring the session uncertain.  The lower mailbox timeout is
++		 * 100 ms, so allow a bounded post-timeout window for DONE and
++		 * GET33 publication before treating ownership as lost. */
++		for (attempt = 0; attempt < 16; attempt++) {
++			usleep_range(5000, 10000);
++			ret = mt7915_kite_status(dev, s);
++			if (!ret && s[3] == dev->kite.session &&
++			    s[4] == dev->kite.serial) {
++				dev_info(dev->mt76.dev,
++					 "Kite control timeout resolved: op=%u serial=%u attempt=%u\n",
++					 op, dev->kite.serial, attempt + 1);
++				break;
++			}
++		}
++		if (ret || s[3] != dev->kite.session ||
++		    s[4] != dev->kite.serial)
++			return send_ret;
++	} else {
++		ret = mt7915_kite_status(dev, s);
++	}
+ 	if (ret)
+ 		return ret;

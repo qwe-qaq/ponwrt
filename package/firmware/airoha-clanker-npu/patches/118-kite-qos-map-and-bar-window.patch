@@ -1,0 +1,168 @@
+From: ponwrt development <noreply@local>
+Subject: [PATCH] Kite: preserve configured QoS and advance BA on validated BAR
+
+Shared datapath ABI 2 rejects mismatched host/firmware layouts.
+Retain PN, A-MSDU, ownership, bridge fallback and recovery protections.
+
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -9,7 +9,7 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_MAGIC 0x4b440001u
++#define KDP_MAGIC 0x4b440002u
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -111,7 +111,8 @@
+ 	unsigned int host_tids, reserved_sta;
+ 	unsigned int tx_tag;
+ 	unsigned char addr[6];
+-	unsigned char tx_blocked, reserved;
++	unsigned char tx_blocked, qos_valid;
++	unsigned char qos_map[64];
+ 	struct kdp_pn pn[KDP_TIDS];
+ };
+ 
+--- a/kite-packet.h
++++ b/kite-packet.h
+@@ -102,6 +102,20 @@
+ 	}
+ }
+ 
++/* The configured map is flattened by cfg80211 itself. The outer VLAN
++ * priority has the same precedence as cfg80211_classify8021d(). */
++static inline unsigned int kdp_sta_tid(const volatile struct kdp_sta *sta,
++	const struct kdp_packet *p)
++{
++	if (!sta->wme)
++		return 0;
++	if (p->vlan != KDP_SLOT_NONE && (p->vlan >> 13))
++		return p->vlan >> 13;
++	if (sta->qos_valid && (p->type == KDP_FLOW_IPV4 || p->type == KDP_FLOW_IPV6))
++		return sta->qos_map[p->dsfield >> 2];
++	return kdp_packet_tid(p);
++}
++
+ static inline unsigned int kdp_flow_bucket(const unsigned char *smac,
+ 	const unsigned char *dmac, unsigned int vlan, unsigned int wcid)
+ {
+--- a/kite-reorder.h
++++ b/kite-reorder.h
+@@ -64,6 +64,22 @@
+ 	}
+ 	b->head = ssn & 4095;
+ 	b->window = window <= KDP_BA_SLOTS ? window : 0;
++}
++
++/* Advance only within the forward half of the 12-bit sequence space.
++ * Release complete MPDUs in order; incomplete chains are dropped by the
++ * release callback. BAR never resets or bypasses replay state. */
++static inline void kdp_ba_bar(struct kdp_ba *b, unsigned int ssn,
++	const struct kdp_reorder_ops *ops, void *ctx)
++{
++	unsigned int delta = (ssn - b->head) & 4095;
++	if (!b->window || b->window > KDP_BA_SLOTS || delta >= 2048)
++		return;
++	while (delta--)
++		kdp_ba_release(b, ops, ctx);
++	while (b->slot[b->head & (KDP_BA_SLOTS - 1)].count &&
++	       b->slot[b->head & (KDP_BA_SLOTS - 1)].complete)
++		kdp_ba_release(b, ops, ctx);
+ }
+ 
+ /* MT7916 payload-format: 0 single, 3 first, 2 middle, 1 last.
+--- a/kite-secure-rxd.h
++++ b/kite-secure-rxd.h
+@@ -63,4 +63,50 @@
+ 		return 0;
+ 	return 1;
+ }
++/* Single-TID compressed BAR. Validate descriptor bounds, hardware receive
++ * identity and the actual transmitter before advancing the shared window.
++ * Multi-TID/fragmented/corrupt control frames cannot change NPU state. */
++static inline int kdp_parse_bar(const unsigned char *p, unsigned int len,
++	unsigned int band, const volatile struct kdp_sta *sta,
++	unsigned int *tid, unsigned int *ssn)
++{
++	unsigned int w0, w1, w2, off = 24, ctl, i, fc;
++	if (len < 44 || len > 3500 || band > 1)
++		return 0;
++	w0 = kdp_get_le32(p); w1 = kdp_get_le32(p + 4);
++	w2 = kdp_get_le32(p + 8);
++	if ((w0 & 0xffff) != len || w0 >> 27 != 2 || (w2 & (1u << 13)))
++		return 0;
++	if (w1 & (1u << 14)) off += 16;
++	if (w1 & (1u << 11)) off += 16;
++	if (w1 & (1u << 12)) off += 8;
++	if (w1 & (1u << 13)) off += 8;
++	if (w1 & (1u << 15)) {
++		if (!(w1 & (1u << 13))) return 0;
++		off += 72;
++	}
++	off += 2 * ((w2 >> 14) & 3);
++	if (off > len || len - off != 20)
++		return 0;
++	fc = p[off] | (unsigned int)p[off + 1] << 8;
++	if ((fc & 0x00fc) != 0x0084)
++		return 0;
++	/* Identified BAR, including rejected BAR: caller must never interpret
++	 * its descriptor TID as unsupported data and latch a host data stream. */
++	if ((fc & 0xc7ff) != 0x0084 || (p[off + 4] & 1) ||
++	    ((w1 >> 28) & 1) != band || ((w1 >> 16) & 31) ||
++	    ((kdp_get_le32(p + 12) >> 16) & 3) != 1 ||
++	    (w1 & (31u << 23)) || (w2 & ((1u << 21) | 0xbf800000u)))
++		return -1;
++	for (i = 0; i < 6; i++)
++		if (p[off + 10 + i] != sta->addr[i])
++			return -1;
++	ctl = p[off + 16] | (unsigned int)p[off + 17] << 8;
++	if ((ctl & 0x0ffe) != 4 || (ctl >> 12) > 7 || (p[off + 18] & 15))
++		return -1;
++	*tid = ctl >> 12;
++	*ssn = ((unsigned int)p[off + 19] << 4) | (p[off + 18] >> 4);
++	return 1;
++}
++
+ #endif
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -233,7 +233,7 @@
+ 		dp->payload[token][i] = 0;
+ 	if (!kdp_make_txwi((void *)dp->txwi[token], addr, len, token, wcid,
+ 			 band, bss, sta->omac, sta->wmm,
+-			 sta->wme ? kdp_packet_tid(&packet) : 0, !!sta->cipher,
++			 kdp_sta_tid(sta, &packet), !!sta->cipher,
+ 			 sta->wme, sta->amsdu)) {
+ 		dp->token[replacement].state = KDP_TOKEN_FREE;
+ 		goto drop;
+--- a/npu_kite_secure_rx.c
++++ b/npu_kite_secure_rx.c
+@@ -243,8 +243,24 @@
+ 	r->bss = kdp_get_le32(p + 8) & 63;
+ 	r->tid = tid;
+ 	if (!s->enabled || !sta->enabled || !sta->authorized ||
+-	    sta->band != band || r->bss != sta->bss || tid > 7 ||
+-	    (sta->host_tids & (1u << tid)))
++	    sta->band != band || r->bss != sta->bss)
++		return 0;
++	ctx.s = s;
++	ctx.band = band;
++	{
++		u32 bar_tid, ssn;
++		int bar = kdp_parse_bar(p, len, band, sta, &bar_tid, &ssn);
++		if (bar < 0)
++			return 0;
++		if (bar > 0) {
++			ba = dp_ba_find(s, wcid, bar_tid);
++			if (ba && !(sta->host_tids & (1u << bar_tid)))
++				kdp_ba_bar(ba, ssn, &dp_rx_ops, &ctx);
++			/* Linux receives the same BAR for its fallback window. */
++			return 0;
++		}
++	}
++	if (tid > 7 || (sta->host_tids & (1u << tid)))
+ 		return 0;
+ 	/* Non-QoS control/management traffic does not belong to the TID's BA
+ 	 * sequence space and must not permanently latch its data path to Linux. */

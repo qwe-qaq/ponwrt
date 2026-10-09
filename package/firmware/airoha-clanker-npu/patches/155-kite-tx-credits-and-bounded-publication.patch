@@ -1,0 +1,465 @@
+From: ponwrt maintainers
+Subject: [PATCH] r75: Bound route proof and counters; demand-driven band credit with DMA/WA ownership.
+
+Native incremental patch on release74. Datapath ABI12 and DMA ownership unchanged.
+
+--- a/npu_kite_tx.c
++++ b/npu_kite_tx.c
+@@ -316,6 +316,7 @@
+    debug_passes = 0;
+   }
+ 		if (kite_ctl_pausepoint(4)) {
++   if (!parked) kite_dp_tx_park();
+ 			parked = 1;
+ 			continue;
+ 		}
+@@ -333,6 +334,7 @@
+ 		kite_dp_tx_reap();
+   kite_dp_service_time(KDP_SERVICE_REAP, service_stamp, 1);
+ 		kite_tx_step(0);
++  kite_dp_tx_pressure_reap();
+ 		kite_tx_step(1);
+ 		kite_dp_observe_loop_end();
+ 	}
+--- a/kite-observe.inc
++++ b/kite-observe.inc
+@@ -108,6 +108,10 @@
+  dp_tune.pressure_events++; dp_tune.pressure_pending = dp_wait_count;
+  dp_tune.dma_wait = dp_tune.wa_wait = dp_tune.ready_wait = dp_tune.oldest_ticks = 0;
+  dp_tune.done_backlog = dp->done.producer - dp->done.consumer;
++ for (u32 b=0;b<2;b++) {
++  dp_credit.band[b].dma_wait=dp_credit.band[b].wa_wait=dp_credit.band[b].ready_wait=0;
++ }
++ dp_credit.pressure_tick=dp_r63.pressure_tick;
+  now = dp_observe_mask ? (u32)csr_read(mcycle) >> 8 : 0;
+  for (i = 0; i < KDP_TOKENS; i++) {
+   u32 pending = !!(dp_pending[i >> 5] & (1u << (i & 31)));
+@@ -118,6 +122,11 @@
+   volatile struct kdp_token *t = &dp->token[i];
+   u32 seq = t->submitted, dma = t->dma_done, wa = t->wa_done;
+   u32 age = dp_observe_mask ? (now - dp_born[i]) & 0xffffffu : 0;
++  u32 band=t->band;
++  if (band>1) { dp_tune.bitmap_fault++; dp->fault=4; break; }
++  dp_credit.band[band].dma_wait += dma != seq;
++  dp_credit.band[band].wa_wait += wa != seq;
++  dp_credit.band[band].ready_wait += dma == seq && wa == seq;
+   dp_tune.dma_wait += dma != seq; dp_tune.wa_wait += wa != seq;
+   dp_tune.ready_wait += dma == seq && wa == seq;
+   if (age > dp_tune.oldest_ticks) dp_tune.oldest_ticks = age;
+@@ -198,6 +207,7 @@
+ {
+  /* Only hart4 initializes its cached accumulators. Publish reset identity
+   * before normal sampling; readers never see previous-session statistics. */
++ dp_credit_init();
+  npu_memset(dp_cost,0,sizeof(dp_cost));
+  for (u32 b=0;b<2;b++) {
+   dp_cost[b].session=dp_session; dp_cost[b].epoch=dp_epoch;
+@@ -366,7 +376,7 @@
+  start = csr_read(mcycle);
+  dp_observe_published = start;
+  dp_obs.publishes++;
+- dp_cost_publish(0); dp_cost_publish(1);
++ dp_cost_publish(0); dp_cost_publish(1); dp_credit_publish();
+  seq=dp->r63.seq+1; dp->r63.seq=seq; KDP_BARRIER();
+  dp->r63.tick=dp_observe_tick(); dp->r63.pressure_tick=dp_r63.pressure_tick;
+  dp_snapshot_words((void *)dp->r63.band,dp_r63.band,sizeof(dp_r63.band));
+@@ -427,7 +437,8 @@
+  now = csr_read(mcycle);
+  /* A retained full head skips allocation retries. A deferred full proof
+   * must still run, even without another allocator/peak event. */
+- if (dp_pressure_due && (u32)(now-dp_pressure_at)>=dp_pressure_period)
++ if ((dp_pressure_due || dp_credit.band[0].wait_kind || dp_credit.band[1].wait_kind) &&
++     (u32)(now-dp_pressure_at)>=dp_pressure_period)
+   dp_pressure(1);
+  if ((u32)(now - dp_observe_published) < (1u << 26)) return;
+  kite_dp_observe_snapshot();
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -59,16 +59,18 @@
+ static struct dp_publish_batch dp_batch[2];
+ static u32 dp_tid[2];
+ static u32 dp_gate_active[2], dp_gate_since[2];
+-/* Statistics only, never token/ownership authority. Flush at every bounded
+- * TDMA batch and at every transport tail, including held/full tails. */
++/* Statistics only, never token/ownership authority. Publish at bounded TX
++ * end (or direct flush outside a transaction), including held/full tails. */
+ static u32 dp_sent_delta[2], dp_bytes_delta[2], dp_bridge_delta[2];
+ static u32 dp_freed_delta[2], dp_freed_defer;
+ static void dp_publish_freed(void);
++static void dp_publish_sent(u32 band);
+ struct dp_parse_cache {
+ 	u32 valid, token, len, tag;
+ 	int parsed, fast;
+ 	struct kdp_packet packet;
+ };
++#include "kite-credit.inc"
+ #include "kite-observe.inc"
+ #include "kite-fast.inc"
+ static u32 dp_len[2];
+@@ -150,12 +152,14 @@
+  if (dp_batch_valid && dp_observe_needs_init) dp_observe_init();
+  if (dp_private_needs_init) kite_dp_cache_invalidate();
+  dp_private.context_valid = dp_batch_valid;
++ dp_private.route_tag[0] = dp_private.route_tag[1] = 0;
+  dp_private.sta_checked[0] = dp_private.sta_checked[1] = 0;
+  dp_private.context_session = dp_session; dp_private.context_epoch = dp_epoch;
+  dp_freed_defer = 1;
+ }
+ void kite_dp_tx_end(void)
+ {
++ dp_publish_sent(0); dp_publish_sent(1);
+  dp_publish_freed(); dp_freed_defer = 0;
+  dp_private.context_valid = 0; dp_batch_valid = 0;
+  dp_private.sta_checked[0] = dp_private.sta_checked[1] = 0;
+@@ -281,7 +285,7 @@
+ 	dp_session = session;
+ 	dp_epoch = epoch;
+ 	dp_path_seq = 0;
+- dp_cost_seq[0]=dp_cost_seq[1]=0;
++ dp_cost_seq[0]=dp_cost_seq[1]=0; dp_credit_seq=0;
+ 	dp_ring = ring;
+ 	dp_observe_needs_init = 1; /* sample DRAM belongs exclusively to hart4 */
+ 	dp_alloc = dp_reap = 0;
+@@ -464,8 +468,12 @@
+  }
+  q = &dp_host[band][tail % DP_HOST_COUNT];
+  if (q->state != DP_HOST_IDLE) { dp->fault = 4; return; }
++ /* This validated fallback also competes for a replacement. In particular
++  * a PS head bypasses normal PPE admission: expose its demand so the other
++  * band's bulk traffic cannot consume every newly released token first. */
++ dp_credit.band[band].demand=1;
+  replacement = dp_alloc_token();
+- if (replacement < 0) { v->fallback_full++; return; }
++ if (replacement < 0) { dp_credit_wait(band,1); v->fallback_full++; return; }
+  t->generation = sta->generation; t->key_generation = sta->key_generation;
+  t->wcid = wcid; t->band = band;
+  q->token = token; q->addr = addr; q->len = len; q->wcid = wcid;
+@@ -646,10 +654,8 @@
+ 
+ /* Publish only consecutive descriptors whose payload ownership was
+  * already resolved. Held fallback/replacement failures never advance idx. */
+-void kite_dp_tx_flush(u32 band)
+-{
+- struct dp_publish_batch *q = &dp_batch[band];
+- u32 n, last;
++static void dp_publish_sent(u32 band)
++{
+  if (!dp) return;
+  if (dp_sent_delta[band]) {
+   dp->tx_sent[band] += dp_sent_delta[band];
+@@ -660,6 +666,15 @@
+   dp->stats[band].reserved[KDP_STAT_BRIDGE_HIT] += dp_bridge_delta[band];
+   dp_bridge_delta[band] = 0;
+  }
++}
++void kite_dp_tx_flush(u32 band)
++{
++ struct dp_publish_batch *q = &dp_batch[band];
++ u32 n, last;
++ if (!dp) return;
++ /* Counters are not ownership: coalesce until bounded TX end. Direct
++  * helper users still publish on flush. DMA/MMIO publication is unchanged. */
++ if (!dp_private.context_valid) dp_publish_sent(band);
+  if (!q->count) return;
+  KDP_BARRIER(); /* all replacement addresses before any ready control */
+  for (n = 0; n < q->count; n++)
+@@ -707,6 +722,9 @@
+      !(dp_pending[id >> 5] & (1u << (id & 31))) ||
+      (dp_free_count >= KDP_TOKENS)) {
+   dp_tune.bitmap_fault++; dp->fault = 4; return 0;
++ }
++ if (!dp_credit_release(id, band)) {
++  dp_tune.bitmap_fault++; dp->fault=4; return 0;
+  }
+  dp_performance[band].reserved[KDP_PERF_TX_READY]++;
+  if (dp_freed_defer) dp_freed_delta[band]++;
+@@ -801,6 +819,15 @@
+  u32 deferred = dp_freed_defer;
+  dp_freed_defer = 1; dp_tx_reap_inner();
+  dp_publish_freed(); dp_freed_defer = deferred;
++}
++
++void kite_dp_tx_pressure_reap(void)
++{
++ if (dp_tx_shared() && dp_free_count < DP_CREDIT_RESERVE &&
++     dp->done.producer != dp->done.consumer) {
++  dp_credit.extra_reaps++;
++  kite_dp_tx_reap();
++ }
+ }
+ 
+ /* Only called after WFDMA doorbell/readback. Publish a batched per-TID
+@@ -874,6 +901,8 @@
+  if (dp_private_needs_init) kite_dp_cache_invalidate();
+ 	if (band > 1 || !dp_tx_shared())
+ 		return 0;
++ dp_credit.band[band].demand = 0;
++ dp_credit_wait(band, 0);
+  packet = &dp_private.scratch[band];
+  compact = &dp_private.compact[band];
+  /* Keep an empty fallback FIFO off the per-packet cold-call path. */
+@@ -921,13 +950,13 @@
+ 	tag = ((info >> 14) & 0x7ff) |
+ 	      (((REG32(desc + 24) >> 24) & 0x7f) << 11);
+ 	b = (info >> 25) & 1;
+-	if (!tag || tag > KDP_ROUTE_MAX ||
+-	    dp->route[tag & (KDP_ROUTES - 1)].tag != tag) {
+-		dp->stats[band].tx_stale++;
+-		goto drop;
+-	}
+-	KDP_BARRIER();
+-	wcid = dp->route[tag & (KDP_ROUTES - 1)].wcid;
++ /* Route writers require PARK. A hit is valid only inside this begin/end;
++  * a new transaction, route tag or direct helper call must read live. */
++ wcid = dp_route_wcid(band, tag);
++ if (!wcid) {
++  dp->stats[band].tx_stale++;
++  goto drop;
++ }
+ 	if (!wcid || wcid >= KDP_WCIDS || b != band ||
+ 	    len < 14 || len > KDP_BUFFER_BYTES) {
+ 		dp->quality[band].format_drop++;
+@@ -976,6 +1005,7 @@
+   if (dp_ps_fallback(band,token,addr,len,wcid,&sc->value)) return 0;
+   goto drop; /* PS exception rejection has distinct r60 reason counters. */
+  }
++ dp_credit.band[band].demand = 1;
+  /* A retained head with no spare token cannot make progress. Current
+   * route/STA/PS/hard admission above still run; completion service and the
+   * other band are outside this helper. Revalidate exact policy as soon as
+@@ -983,6 +1013,7 @@
+  cache=&dp_parse[band];
+  if (!dp_free_count && (dp_perf_flags & KDP_PERF_FAST) && cache->valid &&
+      cache->token==token && cache->len==len && cache->tag==tag) {
++  dp_credit_wait(band, 1);
+   dp_r63.band[band].full_skip++;
+   dp_performance[band].retry++; dp->stats[band].tx_full++;
+   return 0;
+@@ -1096,8 +1127,10 @@
+ 		return 0;
+ 	}
+ 	if (dp_batch[band].packets >= 16) { dp->fault = 6; return 0; }
++ if (dp_credit_hold(band)) return 0;
+ 	replacement = dp_alloc_token();
+ 	if (replacement < 0) {
++  dp_credit_wait(band, 1);
+ 		/* Cache only a held packet-> The common successful submission
+ 		 * pays no packet-key copy or cache-line writes. */
+ 		if ((dp_perf_flags & KDP_PERF_FAST) && !cache->valid) {
+@@ -1164,13 +1197,16 @@
+  u32 hot = 0;
+  if (dp_observe_sample[0]) hot = csr_read(mcycle);
+ 	if (!dp_tx_shared() || band > 1 || dp_prepared[band] != token ||
+-	    dp_replacement[band] >= KDP_TOKENS) {
++	    dp_replacement[band] >= KDP_TOKENS || dp_batch[band].packets >= 16) {
+ 		if (dp && !kdp_failed(dp))
+ 			dp->fault = 6;
+ 		return;
+ 	}
+  if (dp_wait_count >= KDP_TOKENS || (dp_pending[token >> 5] & (1u << (token & 31)))) {
+   dp_tune.bitmap_fault++; dp->fault = 4; return;
++ }
++ if (!dp_credit_commit(token, band, dp_batch[band].wcid[dp_batch[band].packets])) {
++  dp_tune.bitmap_fault++; dp->fault=4; return;
+  }
+  dp_wait_count++;
+  dp_pending[token >> 5] |= 1u << (token & 31);
+--- a/kite-fast.inc
++++ b/kite-fast.inc
+@@ -66,6 +66,7 @@
+  struct dp_wan_cache wan[2][4];
+  u32 context_valid, context_session, context_epoch;
+  u32 sta_checked[2], bridge_first[2];
++ u32 route_tag[2], route_wcid[2];
+  u32 last_hint[2]; /* tail keeps all r64 cache offsets; index + 1, not authority */
+ } dp_private __attribute__((section(".kite_private"), aligned(64)));
+ _Static_assert(sizeof(dp_private) <= 8192, "private cache budget");
+@@ -82,6 +83,21 @@
+ static u32 dp_policy_epoch(volatile struct kdp_shared *s)
+ {
+  return dp_private.context_valid && s == dp ? dp_private.context_epoch : s->epoch;
++}
++static u32 dp_route_wcid(u32 band, u32 tag)
++{
++ if (!tag || tag > KDP_ROUTE_MAX) return 0;
++ if (dp_private.context_valid && dp_private.route_tag[band] == tag)
++  return dp_private.route_wcid[band];
++ volatile struct kdp_route *r = &dp->route[tag & (KDP_ROUTES - 1)];
++ if (r->tag != tag) return 0;
++ KDP_BARRIER();
++ u32 wi = r->wcid;
++ if (!wi || wi >= KDP_WCIDS) return 0;
++ if (dp_private.context_valid) {
++  dp_private.route_tag[band]=tag; dp_private.route_wcid[band]=wi;
++ }
++ return wi;
+ }
+ static unsigned int dp_sta_tid(const struct dp_sta_tx *sta,
+                               const struct kdp_packet *p)
+--- a/kite-datapath-fw.h
++++ b/kite-datapath-fw.h
+@@ -62,6 +62,9 @@
+ 
+ 
+ void kite_dp_cost_snapshot(u32 band, u32 *out);
++void kite_dp_queue_snapshot(u32 *out);
++void kite_dp_tx_pressure_reap(void);
++void kite_dp_tx_park(void);
+ 
+ /* Hart4-only sampling eligibility, no function call on an unsampled loop. */
+ extern u32 dp_observe_sample[2];
+--- a/npu_wifi.c
++++ b/npu_wifi.c
+@@ -69,7 +69,7 @@
+ 	u32 page = msg[0] & 15, i;
+ 	u32 *d = msg + 2;
+ 
+-	if (cnt != 256 || page > 6)
++	if (cnt != 256 || page > 7)
+ 		return 0;
+ 	for (i = 0; i < 62; i++)
+ 		d[i] = 0;
+@@ -125,6 +125,9 @@
+ 	} else if (page == 4) {
+ 		kite_dp_path_snapshot(d + 4);
+ 		d[61] = 0x4b500001; /* KP1 last exact-policy miss, observational */
++	} else if (page == 7) {
++  kite_dp_queue_snapshot(d + 4);
++  d[61] = 0x4b460001; /* KF1 */
+ 	} else if (page >= 5) {
+ 		kite_dp_cost_snapshot(page - 5, d + 4);
+ 		d[61] = 0x4b430001; /* KC1 costs */
+--- a/kite-credit.inc
++++ b/kite-credit.inc
+@@ -0,0 +1,131 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Hart4-only persistent accounting. Unlike the parse cache, this survives
++ * PARK. Only a new, validated BIND requests initialization on hart4. Nothing
++ * here authorizes a packet or substitutes for shared DMA + WA proof. */
++#define DP_CREDIT_RESERVE 64u
++struct dp_credit_band {
++ u32 pending, peak, demand, holds, empty;
++ u32 wait_kind, wait_at, empty_cycles, credit_cycles;
++ u32 released, dma_wait, wa_wait, ready_wait;
++ u32 owner_wcid, owner_pending, sta_peak, empty_hi, credit_hi;
++};
++static struct {
++ struct dp_credit_band band[2];
++ u16 owner[KDP_TOKENS], sta[2][KDP_WCIDS];
++ u32 extra_reaps, pressure_tick;
++} dp_credit __attribute__((section(".kite_observe"), aligned(64)));
++static volatile u32 dp_credit_seq;
++static u32 dp_credit_publication[64]
++ __attribute__((section(".kite_observe"), aligned(64)));
++static void dp_credit_init(void)
++{
++ npu_memset(&dp_credit,0,sizeof(dp_credit));
++}
++static void dp_credit_elapsed(struct dp_credit_band *v, u32 now)
++{
++ u32 d=(u32)(now-v->wait_at), old;
++ if (v->wait_kind==1) {
++  old=v->empty_cycles; v->empty_cycles+=d; v->empty_hi+=v->empty_cycles<old;
++ } else if (v->wait_kind==2) {
++  old=v->credit_cycles; v->credit_cycles+=d; v->credit_hi+=v->credit_cycles<old;
++ }
++ v->wait_at=now;
++}
++static void dp_credit_wait(u32 b, u32 kind)
++{
++ struct dp_credit_band *v=&dp_credit.band[b];
++ if (!v->wait_kind && !kind) return;
++ u32 now=csr_read(mcycle);
++ dp_credit_elapsed(v,now);
++ if (kind==1) v->empty++;
++ if (kind==2) v->holds++;
++ v->wait_at=now; v->wait_kind=kind;
++}
++/* Called only on the first PARK observation, after the ACK. Local hart4
++ * state and clock only: never dereference the now host-owned mapping. */
++void kite_dp_tx_park(void)
++{
++ dp_credit_wait(0,0);dp_credit_wait(1,0);
++ dp_credit.band[0].demand=dp_credit.band[1].demand=0;
++}
++static int dp_credit_hold(u32 b)
++{
++ struct dp_credit_band *other=&dp_credit.band[b^1];
++ /* A competing, validated TDMA head can claim a small floor. Idle bands
++  * reserve nothing, so a lone bulk flow borrows the whole free pool. Keep
++  * the head in place: same-band STA queue bypass would violate ordering.
++  * No holder can take back a buffer already owned by WiFi or the host. */
++ if (dp_free_count && other->demand && other->pending<DP_CREDIT_RESERVE &&
++     dp_credit.band[b].pending>=DP_CREDIT_RESERVE &&
++     dp_free_count<=DP_CREDIT_RESERVE-other->pending) {
++  dp_credit_wait(b,2); return 1;
++ }
++ return 0;
++}
++static int dp_credit_commit(u32 id, u32 band, u32 wi)
++{
++ if (id>=KDP_TOKENS || band>1 || !wi || wi>=KDP_WCIDS ||
++     dp_credit.owner[id] || dp_credit.band[band].pending>=KDP_TOKENS ||
++     dp_credit.sta[band][wi]>=KDP_TOKENS) return 0;
++ dp_credit.owner[id]=wi | (band<<10);
++ u32 n=++dp_credit.band[band].pending, count=++dp_credit.sta[band][wi];
++ if (n>dp_credit.band[band].peak) dp_credit.band[band].peak=n;
++ if (count>dp_credit.band[band].sta_peak) dp_credit.band[band].sta_peak=count;
++ return 1;
++}
++static int dp_credit_release(u32 id, u32 band)
++{
++ u32 owner=dp_credit.owner[id], wi=owner&1023u;
++ if (!wi || wi>=KDP_WCIDS || (owner>>10)!=band || !dp_credit.sta[band][wi] ||
++     !dp_credit.band[band].pending) return 0;
++ dp_credit.sta[band][wi]--; dp_credit.owner[id]=0;
++ dp_credit.band[band].pending--; dp_credit.band[band].released++;
++ return 1;
++}
++/* Pure diagnostics. Published on the existing ~84ms snapshot, no token
++ * scan here. Only this isolated uncached alias is read by hart0. */
++static void dp_credit_publish(void)
++{
++ volatile u32 *v=KDP_DIAG_UNCACHED(dp_credit_publication);
++ u32 seq=(dp_credit_seq&~1u)+2;
++ if (!seq) seq=2;
++ dp_credit_seq=seq-1; KDP_BARRIER();
++ for (u32 b=0;b<2;b++) {
++  struct dp_credit_band *s=&dp_credit.band[b];
++  /* Account a continuing wait without adding another retry attempt. */
++  if (s->wait_kind) {
++   u32 now=csr_read(mcycle);
++   dp_credit_elapsed(s,now);
++  }
++  s->owner_wcid=s->owner_pending=0;
++ }
++ for (u32 b=0;b<2;b++) for (u32 wi=1;wi<KDP_WCIDS;wi++)
++  if (dp_credit.sta[b][wi]>dp_credit.band[b].owner_pending) {
++   dp_credit.band[b].owner_pending=dp_credit.sta[b][wi];
++   dp_credit.band[b].owner_wcid=wi;
++  }
++ v[0]=1;v[1]=seq;v[2]=dp_session;v[3]=dp_epoch;
++ v[4]=75;v[5]=cpu_clock_get();v[6]=(u32)csr_read(mcycle)>>8;
++ v[7]=dp_free_count;v[8]=dp_wait_count;
++ v[9]=dp->done.producer;v[10]=dp->done.consumer;v[11]=DP_CREDIT_RESERVE;
++ for (u32 b=0;b<2;b++) {
++  const u32 *s=(const void *)&dp_credit.band[b];
++  for (u32 i=0;i<18;i++) v[12+b*18+i]=s[i];
++ }
++ v[48]=dp_credit.extra_reaps;v[49]=dp_credit.pressure_tick;
++ for (u32 i=50;i<57;i++) v[i]=0;
++ KDP_BARRIER();dp_credit_seq=seq;
++}
++void kite_dp_queue_snapshot(u32 *out)
++{
++ const volatile u32 *v=KDP_DIAG_UNCACHED(dp_credit_publication);
++ for (u32 retry=0;retry<3;retry++) {
++  u32 seq=dp_credit_seq;
++  if (!seq || (seq&1)) continue;
++  KDP_BARRIER();
++  for (u32 i=0;i<57;i++) out[i]=v[i];
++  KDP_BARRIER();
++  if (seq==dp_credit_seq && out[1]==seq) return;
++ }
++ for (u32 i=0;i<57;i++) out[i]=0;
++}

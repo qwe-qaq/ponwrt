@@ -1,0 +1,83 @@
+Subject: [PATCH] r65 firmware bounded observation and downlink processing cost
+
+Revalidate native authority; preserve stopped unchanged soft rules, not old
+FOEs. Keep single hart, exact policy, PN and DMA/WA ownership contracts.
+
+--- a/kite-fast.inc
++++ b/kite-fast.inc
+@@ -32,6 +32,7 @@
+  struct dp_sta_cache sta[2][4];
+  struct dp_l2_hash l2[2][4];
+  struct dp_wan_cache wan[2][4];
++ u32 last_hint[2]; /* tail keeps all r64 cache offsets; index + 1, not authority */
+ } dp_private __attribute__((section(".kite_private"), aligned(64)));
+ _Static_assert(sizeof(dp_private) <= 8192, "private cache budget");
+ #define dp_parse dp_private.parse
+@@ -301,29 +302,45 @@
+ static int dp_hint_ipv4(volatile struct kdp_shared *s, const struct kdp_sta *sta,
+                        const struct dp_ipv4_key *p, u32 wcid, u32 band)
+ {
+- u32 hash=p->ports ^ p->src ^ (p->dst<<7) ^ wcid;
+- hash^=hash>>16; hash*=0x7feb352du; hash^=hash>>15;
+- for (u32 way=0;way<DP_HINT_WAYS;way++) {
+-  struct dp_policy_hint *h=&dp_hint[band][hash & (DP_HINT_SETS-1)][way];
+-  const kdp_word *mac=h->mac;
+-  dp_obs.band[band].hint_probe++;
+-  if (!h->cap_version || h->key!=hash || h->capture>=KDP_FLOWS ||
+-      h->exact>=KDP_FLOWS || !h->exact_version) continue;
+-  if (h->session!=s->session || h->generation!=sta->generation ||
+-      h->key_generation!=sta->key_generation || h->tag!=sta->tx_tag ||
+-      h->wcid!=wcid || h->band!=band || h->bss!=sta->bss ||
+-      h->vlan!=KDP_SLOT_NONE || (h->cap_ds & h->cap_mask) ||
+-      (h->exact_ds & h->exact_mask) || h->src!=p->src || h->dst!=p->dst ||
+-      h->ports!=p->ports || h->protocol!=p->protocol ||
+-      mac[0]!=p->mac[0] || mac[1]!=p->mac[1] || mac[2]!=p->mac[2]) continue;
+-  /* h is immutable hart4-private authorization data saved under versions.
+-   * Read live publications after the full key. A changed record's version
+-   * cannot ABA (host versions never wrap); no shared payload is consumed. */
+-  KDP_BARRIER();
+-  if (s->flow[h->capture].version!=h->cap_version ||
+-      s->flow[h->exact].version!=h->exact_version) continue;
+-  s->stats[band].reserved[KDP_STAT_BRIDGE_HIT]++; return 1;
++ u32 hash = 0, way = 0, index, last = dp_private.last_hint[band];
++ int hashed = 0;
++ struct dp_policy_hint *h;
++ /* Repeated P1/bursts often use the same exact rule. Avoid hashing/probing
++  * another way, but retain every identity, tuple and live version check. */
++ if (last && last <= DP_HINT_SETS * DP_HINT_WAYS) {
++  index = last - 1;
++  goto probe;
+  }
++next:
++ if (!hashed) {
++  hash=p->ports ^ p->src ^ (p->dst<<7) ^ wcid;
++  hash^=hash>>16; hash*=0x7feb352du; hash^=hash>>15;
++  hashed = 1;
++ }
++ if (way == DP_HINT_WAYS) return 0;
++ index = (hash & (DP_HINT_SETS-1)) * DP_HINT_WAYS + way++;
++ if (index + 1 == last) goto next;
++probe:
++ h=&dp_hint[band][index / DP_HINT_WAYS][index % DP_HINT_WAYS];
++ dp_obs.band[band].hint_probe++;
++ if (!h->cap_version || h->capture>=KDP_FLOWS ||
++     h->exact>=KDP_FLOWS || !h->exact_version) goto next;
++ /* P4/interleaved traffic rejects another last-hit key using private
++  * words first. Never pay an uncached session read for that extra probe. */
++ if (h->ports!=p->ports || h->src!=p->src || h->dst!=p->dst ||
++     h->protocol!=p->protocol || h->mac[0]!=p->mac[0] ||
++     h->mac[1]!=p->mac[1] || h->mac[2]!=p->mac[2] ||
++     h->vlan!=KDP_SLOT_NONE || (h->cap_ds & h->cap_mask) ||
++     (h->exact_ds & h->exact_mask) || h->wcid!=wcid || h->band!=band ||
++     h->generation!=sta->generation || h->key_generation!=sta->key_generation ||
++     h->tag!=sta->tx_tag || h->bss!=sta->bss || h->session!=s->session) goto next;
++ /* Private exact data is valid only while both live publications agree.
++  * Lifecycle changes PARK hart4; host policy versions never ABA. */
++ KDP_BARRIER();
++ if (s->flow[h->capture].version!=h->cap_version ||
++     s->flow[h->exact].version!=h->exact_version) goto next;
++ dp_private.last_hint[band] = index + 1;
++ s->stats[band].reserved[KDP_STAT_BRIDGE_HIT]++; return 1;
+  return 0;
+ }
+ static int dp_wan_ipv4(volatile struct kdp_shared *s, const struct kdp_sta *sta,

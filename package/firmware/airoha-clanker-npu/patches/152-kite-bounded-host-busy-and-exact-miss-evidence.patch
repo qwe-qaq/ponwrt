@@ -1,0 +1,356 @@
+From: ponwrt maintainers
+Subject: [PATCH] r72: Retain pre-DMA busy heads with bounded retry and full policy-miss evidence.
+
+Native incremental patch on release71; no datapath ABI or DMA layout change.
+
+--- a/kite-host.h
++++ b/kite-host.h
+@@ -12,6 +12,12 @@
+ /* Firmware source ownership is retained on HOLD, including a partial
+  * chain. Neither DONE nor the producer index may be published. */
+ #define KITE_HOST_HOLD (-2)
++/* Zero DMA side effects: caller retains its queue head and retries fairly. */
++#define KITE_HOST_BUSY (-4)
++#define KITE_HOST_RETRY_TICKS 200u /* nominal 20 ms, timer tick 100 us */
++void kite_host_retry_cancel(u32 band, u32 origin);
++void kite_host_retry_snapshot(u32 *out);
++void kite_dp_path_snapshot(u32 *out);
+ #define KITE_HOST_DIAG_MAGIC 0x4b480001u
+ #define KITE_HOST_RING_COUNT 512u
+ #define KITE_HOST_RING_BYTES (KITE_HOST_RING_COUNT * 24u)
+--- a/npu_hostadpt.c
++++ b/npu_hostadpt.c
+@@ -24,6 +24,49 @@
+ static u32 hostadpt_tx_ring_base;
+ volatile u8 hostadpt_tx_ring_ready;
+ static u32 hostadpt_rx_ring_base;
++
++/* Hart3 owns retry state. Core0 resets only with workers parked at BIND.
++ * Three independent queue heads per band: RX, TX fallback, segmented RX.
++ * HOLD is never subject to this deadline: its DMA ownership is unknown. */
++struct host_retry_state { u32 source, since, active; };
++static struct host_retry_state host_retry[2][3];
++static volatile u32 host_retry_stats[11]; /* attempts[6], expired[2], recovered[2], max ticks */
++void kite_host_retry_cancel(u32 band, u32 origin)
++{
++	if (band < 2 && origin < 3)
++		host_retry[band][origin].active = 0;
++}
++void kite_host_retry_snapshot(u32 *out)
++{
++	for (u32 i = 0; i < 11; i++) out[i] = host_retry_stats[i];
++}
++static int host_retry_result(u32 band, u32 origin, u32 source, int ret)
++{
++	struct host_retry_state *r;
++	u32 age = 0, now = timer_raw_tick;
++	if (band > 1 || origin > 2) return ret;
++	r = &host_retry[band][origin];
++	if (r->active && r->source != source) r->active = 0;
++	if (r->active) {
++		age = now - r->since;
++		if (age > host_retry_stats[10]) host_retry_stats[10] = age;
++	}
++	if (ret == KITE_HOST_BUSY) {
++		host_retry_stats[origin * 2 + band]++;
++		if (!r->active) {
++			r->source = source; r->since = now; r->active = 1;
++		} else if (age >= KITE_HOST_RETRY_TICKS) {
++			host_retry_stats[6 + band]++;
++			r->active = 0;
++			return -1; /* no DMA started; caller may now release once */
++		}
++	} else {
++		if (!ret && r->active) host_retry_stats[8 + band]++;
++		r->active = 0;
++	}
++	return ret;
++}
++
+ 
+ #if defined(AN7581) && defined(MT7916)
+ static u32 kite_host_session, kite_host_epoch, kite_host_bands;
+@@ -97,6 +140,8 @@
+ 	kite_host_session = session;
+ 	kite_host_epoch = epoch;
+ 	kite_host_bands = bandmask;
++	for (u32 b = 0; b < 2; b++)
++		for (u32 o = 0; o < 3; o++) kite_host_retry_cancel(b, o);
+ 	__asm__ volatile("fence iorw,iorw" ::: "memory");
+ 	hostadpt_tx_ring_ready = 1;
+ 	return 1;
+@@ -296,7 +341,7 @@
+ {
+ 	volatile u32 *v;
+ 	u32 ring, idx, counter;
+-	if (!ret || band > 1)
++	if (!ret || ret == KITE_HOST_BUSY || band > 1)
+ 		return;
+ 	counter = origin == 2 ? NC_HOST_CHAIN_REJECT0 :
+ 		(origin == 1 ? NC_HOST_TX_REJECT0 : NC_HOST_RX_REJECT0);
+@@ -382,7 +427,7 @@
+ 			else
+ 				REG32(HOSTADPT_RX_DMA_IDX(0)) = 511;
+ 			REG32(HOSTADPT_RX_DMA_IDX(0)) = idx;
+-			return host_reject(band, NC_HOST_GUARD0, -1);
++			return host_reject(band, NC_HOST_GUARD0, KITE_HOST_BUSY);
+ 		}
+ 
+ 		desc_addr = ring_base + idx * 24;
+@@ -415,7 +460,7 @@
+ 			else
+ 				REG32(HOSTADPT_RX_DMA_IDX(1)) = 511;
+ 			REG32(HOSTADPT_RX_DMA_IDX(1)) = idx;
+-			return host_reject(band, NC_HOST_GUARD0, -1);
++			return host_reject(band, NC_HOST_GUARD0, KITE_HOST_BUSY);
+ 		}
+ 
+ 		desc_addr = ring_base + idx * 24;
+@@ -466,7 +511,9 @@
+ {
+ 	int ret = host_ring_submit_impl(buf_addr, pkt_len, band, wcid, amsdu, fwd_type, orig_len, is_last, info);
+ 
+-	if (band < 2)
++	ret = host_retry_result(band, fwd_type == KDP_HOST_FWD_WIFI_TX, buf_addr, ret);
++
++	if (band < 2 && ret != KITE_HOST_BUSY)
+ 		NDBG_CNT((ret ? NC_KITE_HOST_FAIL0 : NC_KITE_HOST0) + band);
+ 	if (!ret)
+ 		kite_host_meta_count(band, info);
+@@ -478,7 +525,7 @@
+ 
+ #ifdef WIFI_KITE
+ /* Core 3 is the only producer. Claim/copy the entire chain before publishing
+- * any DONE bit, then publish the head last. Congestion drops a whole frame. */
++ * any DONE bit, then publish the head last. BUSY retains the whole frame. */
+ static int host_ring_submit_kite_chain_impl(const u32 *nodes, u32 n, u32 band)
+ {
+ 	u32 ring;
+@@ -507,7 +554,9 @@
+ 		d = (volatile u32 *)slots[i];
+ 		if (!len || len > HOSTADPT_BUFFER_LEN || *(u16 *)(nodes[i] + 4) != total)
+ 			return host_reject(band, NC_HOST_INVALID0, -1);
+-		if (!d[3] || (d[0] & 1))
++		if (d[0] & 1)
++			return host_reject(band, NC_HOST_GUARD0, KITE_HOST_BUSY);
++		if (!d[3])
+ 			return host_reject(band, NC_HOST_DESC0, -1);
+ 		sum += len;
+ 		slot = (slot + 1) % HOSTADPT_RING_SIZE;
+@@ -544,7 +593,9 @@
+ {
+ 	int ret = host_ring_submit_kite_chain_impl(nodes, n, band);
+ 
+-	if (band < 2)
++	ret = host_retry_result(band, 2, n && n <= 7 ? nodes[0] : 0, ret);
++
++	if (band < 2 && ret != KITE_HOST_BUSY)
+ 		NDBG_CNT((ret ? NC_KITE_CHAIN_FAIL0 : NC_KITE_CHAIN0) + band);
+ 	if (!ret)
+ 		kite_host_meta_count(band,
+--- a/npu_wifi_fwd.c
++++ b/npu_wifi_fwd.c
+@@ -351,7 +351,7 @@
+ 				       *(u16 *)((u32)entry + 8),
+ 				       (*(u8 *)((u32)entry + 10) >> 1) & 1,
+ 				       *(u32 *)((u32)entry + 12));
+-		if (ret == KITE_HOST_HOLD)
++		if (ret == KITE_HOST_HOLD || ret == KITE_HOST_BUSY)
+ 			return; /* retain node and source until DMA completion is proven */
+ 		wifi_cnt_inc(band == 1, ret ? 108 : 48);
+ 		buf_id_free(0, band, *(u16 *)entry);
+@@ -408,9 +408,13 @@
+ 		}
+ 		scan = (scan + 1) % RXNODE_RING_SIZE;
+ 	}
+-	if (complete &&
+-	    host_ring_submit_kite_chain(nodes, n, band) == KITE_HOST_HOLD)
+-		return; /* even a copied prefix remains unpublished and owned */
++	if (complete) {
++		int ret = host_ring_submit_kite_chain(nodes, n, band);
++		if (ret == KITE_HOST_HOLD || ret == KITE_HOST_BUSY)
++			return; /* retain the entire chain, including an unpublished prefix */
++	} else {
++		kite_host_retry_cancel(band, 2);
++	}
+ 	for (i = 0; i < n; i++) {
+ 		buf_id_free(0, band, *(u32 *)nodes[i]);
+ 		*(u32 *)nodes[i] = (u32)-1;
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -14,6 +14,22 @@
+ #define DP_TDMA_BYTES (DP_TDMA_COUNT * 32u)
+ static volatile struct kdp_shared *dp;
+ static u32 dp_pa, dp_session, dp_epoch, dp_ring, dp_idx[2], dp_alloc, dp_reap;
++/* Cold failure evidence only. NOLOAD DRAM is inaccessible to readers until
++ * the SRAM sequence is nonzero/even; BIND clears sequence while parked. */
++static volatile u32 dp_path_seq;
++static volatile u32 dp_path_event[55]
++ __attribute__((section(".kite_observe"), aligned(16)));
++void kite_dp_path_snapshot(u32 *out)
++{
++ u32 seq = dp_path_seq;
++ out[0] = seq; out[1] = 0;
++ if (!seq || (seq & 1)) return;
++ KDP_BARRIER();
++ for (u32 i = 0; i < 55; i++) out[2 + i] = dp_path_event[i];
++ KDP_BARRIER();
++ out[1] = seq == dp_path_seq;
++}
++
+ static u16 dp_prepared[2], dp_replacement[2];
+ /* All queue/cache writers are hart4, except initialization with workers
+  * parked. The ARM WA consumer writes only completion sequence numbers. */
+@@ -254,6 +270,7 @@
+ 	dp_pa = pa;
+ 	dp_session = session;
+ 	dp_epoch = epoch;
++	dp_path_seq = 0;
+ 	dp_ring = ring;
+ 	dp_observe_needs_init = 1; /* sample DRAM belongs exclusively to hart4 */
+ 	dp_alloc = dp_reap = 0;
+@@ -458,6 +475,77 @@
+ {
+  dp_host_bridge_fallback_record(band,token,addr,len,wcid,sta,0,KDP_SLOT_NONE);
+ }
++/* Last candidate in the exact bucket is evidence, never authorization.
++ * Preserve the full packet and a version-checked candidate; no payload/key.
++ * Word address/ports are canonical network numeric order; MAC words are
++ * packed byte0 in bits7:0 for a stable little-endian diagnostics contract. */
++static __attribute__((noinline)) void dp_path_miss(const struct kdp_packet *p,
++ u32 wi, u32 request)
++{
++ volatile u32 *v = dp_path_event;
++ struct kdp_flow f;
++ u32 base = kdp_flow_bucket(p->smac,p->dmac,p->vlan,wi);
++ u32 bucket = kdp_flow_l4_bucket(base,p->src,p->dst,p->ports,p->protocol,p->type);
++ u32 slot = KDP_SLOT_NONE, ver = 0, req = 0, stable = 0, diff = 0;
++ npu_memset(&f, 0, sizeof(f));
++ for (u32 i = bucket; i < bucket + KDP_FLOW_WAYS; i++) {
++  if (!dp->r60.soft[i].version || dp->r60.soft[i].wcid != wi) continue;
++  slot = i;
++  if (dp->r60.soft_request[i] == request) break;
++ }
++ if (slot != KDP_SLOT_NONE) {
++  volatile struct kdp_flow *q = &dp->r60.soft[slot];
++  ver = q->version; KDP_BARRIER();
++  npu_memcpy(&f, (const void *)q, sizeof(f)); req = dp->r60.soft_request[slot]; KDP_BARRIER();
++  stable = ver && ver == q->version && ver == f.version &&
++           req == dp->r60.soft_request[slot];
++  if (f.session != dp_session || f.generation != dp->sta[wi].generation ||
++      f.key_generation != dp->sta[wi].key_generation || f.wcid != wi ||
++      f.band != dp->sta[wi].band || f.bss != dp->sta[wi].bss) diff |= 1u;
++  if (req != request) diff |= 2u;
++  if ((f.vlan == KDP_SLOT_NONE) != (p->vlan == KDP_SLOT_NONE) ||
++      (f.vlan != KDP_SLOT_NONE && ((f.vlan ^ p->vlan) & 0xfff))) diff |= 4u;
++  if ((f.dsfield ^ p->dsfield) & f.dsmask) diff |= 8u;
++  for (u32 i = 0; i < 6; i++) {
++   if (f.smac[i] != p->smac[i]) diff |= 16u;
++   if (f.dmac[i] != p->dmac[i]) diff |= 32u;
++  }
++  u32 type = f.type == KDP_FLOW_BRIDGE_IPV4 ? KDP_FLOW_IPV4 :
++             f.type == KDP_FLOW_BRIDGE_IPV6 ? KDP_FLOW_IPV6 : f.type;
++  if (type != p->type) diff |= 64u;
++  if (f.protocol != p->protocol) diff |= 128u;
++  if (f.ports != p->ports) diff |= 256u;
++  for (u32 i = 0; i < 4; i++) {
++   if (f.src[i] != p->src[i]) diff |= 512u;
++   if (f.dst[i] != p->dst[i]) diff |= 1024u;
++  }
++  if (!stable) diff |= 2048u;
++ }
++ dp_path_seq++; KDP_BARRIER();
++ v[0]=timer_raw_tick; v[1]=dp_session; v[2]=dp_epoch;
++ v[3]=dp->sta[wi].band; v[4]=wi; v[5]=request;
++ v[6]=dp->sta[wi].generation; v[7]=dp->sta[wi].key_generation;
++ v[8]=dp->sta[wi].tx_tag; v[9]=p->type; v[10]=p->protocol;
++ v[11]=p->ports; v[12]=p->vlan; v[13]=p->dsfield;
++ for (u32 i=0;i<4;i++) { v[14+i]=p->src[i]; v[18+i]=p->dst[i]; }
++ for (u32 i=0;i<3;i++) {
++  u32 a=0,b=0;
++  for (u32 j=0;j<4;j++) {
++   u32 k=i*4+j;
++   a|=(u32)(k<6?p->smac[k]:p->dmac[k-6])<<(j*8);
++   b|=(u32)(k<6?f.smac[k]:f.dmac[k-6])<<(j*8);
++  }
++  v[22+i]=a; v[47+i]=b;
++ }
++ v[25]=slot; v[26]=ver; v[27]=stable; v[28]=diff;
++ v[29]=f.session; v[30]=f.generation; v[31]=f.key_generation;
++ v[32]=req; v[33]=f.type; v[34]=f.protocol; v[35]=f.ports;
++ v[36]=f.vlan; v[37]=f.dsfield; v[38]=f.dsmask;
++ for (u32 i=0;i<4;i++) { v[39+i]=f.src[i]; v[43+i]=f.dst[i]; }
++ v[50]=f.hw_slot; v[51]=f.cookie_lo; v[52]=f.cookie_hi;
++ v[53]=f.band; v[54]=f.bss;
++ KDP_BARRIER(); dp_path_seq++;
++}
+ static __attribute__((noinline)) u32 dp_soft_miss(const struct kdp_packet *p,u32 wi,u32 request)
+ {
+  u32 base=kdp_flow_bucket(p->smac,p->dmac,p->vlan,wi),why=7;
+@@ -491,6 +579,7 @@
+  if (slot==KDP_SLOT_NONE) {
+   struct kdp_r63_band *v=&dp_r63.band[band];
+   v->soft_reason[dp_soft_miss(&packet,wi,request)]++;
++  dp_path_miss(&packet,wi,request);
+   v->soft_wcid=wi; v->soft_request=request; v->soft_type=packet.type;
+   v->soft_protocol=packet.protocol; v->soft_ports=packet.ports;
+   dp->r60.ps_policy_drop[band]++; return 0;
+@@ -506,7 +595,7 @@
+ void kite_dp_host_drain(void)
+ {
+  u32 b;
+- if (!dp_identity()) return;
++ if (!dp_identity() || kite_host_faulted()) return;
+  /* One request per band per pass: ordinary RX and the other band are fair. */
+  for (b = 0; b < 2; b++) {
+   u32 cons = dp_host_consume[b];
+@@ -515,12 +604,23 @@
+   if (cons == dp_host_tail[b]) continue;
+   KDP_BARRIER(); q = &dp_host[b][cons % DP_HOST_COUNT];
+   if (q->state != DP_HOST_PENDING) { dp->fault = 4; return; }
+-  if (q->request && (dp->r60.ps[q->wcid].active!=q->request ||
++  if (q->wcid >= KDP_WCIDS || q->token >= KDP_TOKENS ||
++      dp->token[q->token].state != KDP_TOKEN_HOST) { dp->fault = 4; return; }
++  KDP_BARRIER();
++  if (!dp->sta[q->wcid].enabled || !dp->sta[q->wcid].authorized ||
++      dp->sta[q->wcid].band != b || dp->sta[q->wcid].tx_tag != q->tag ||
++      dp->sta[q->wcid].generation != dp->token[q->token].generation ||
++      dp->sta[q->wcid].key_generation != dp->token[q->token].key_generation) {
++   kite_host_retry_cancel(b, 1); ret=-1;
++  } else if (q->request && (dp->r60.ps[q->wcid].active!=q->request ||
+       q->slot>=KDP_FLOWS || dp->r60.soft_request[q->slot]!=q->request ||
+-      dp->r60.soft[q->slot].version!=q->version)) ret=-1;
++      dp->r60.soft[q->slot].version!=q->version)) {
++   kite_host_retry_cancel(b, 1); ret=-1;
++  }
+   else ret = host_ring_submit(q->addr, q->len, b, q->wcid, 0,
+           KDP_HOST_FWD_WIFI_TX, q->len, 1,
+           KDP_HOST_FALLBACK_PACK(b, q->wcid) | KDP_HOST_FALLBACK_RECORD);
++  if (ret == KITE_HOST_BUSY) continue;
+   if (ret == KITE_HOST_HOLD) { dp->quality[b].host_hold++; continue; }
+   q->result = ret; KDP_BARRIER(); q->state = DP_HOST_DONE;
+   KDP_BARRIER(); dp_host_consume[b] = cons + 1;
+--- a/npu_wifi.c
++++ b/npu_wifi.c
+@@ -69,7 +69,7 @@
+ 	u32 page = msg[0] & 15, i;
+ 	u32 *d = msg + 2;
+ 
+-	if (cnt != 256 || page > 3)
++	if (cnt != 256 || page > 4)
+ 		return 0;
+ 	for (i = 0; i < 62; i++)
+ 		d[i] = 0;
+@@ -120,7 +120,11 @@
+ 		for (i = 0; i < 24; i++)
+ 			d[4 + i] = ndbg->cnt[NC_HOST_NOT_READY0 + i];
+ 		kite_host_failure_snapshot(d + 28);
+-		d[61] = 0x4b480001; /* KH cause/disposition ABI1 */
++		kite_host_retry_snapshot(d + 50);
++		d[61] = 0x4b480002; /* KH2: BUSY attempts are not rejects */
++	} else if (page == 4) {
++		kite_dp_path_snapshot(d + 4);
++		d[61] = 0x4b500001; /* KP1 last exact-policy miss, observational */
+ 	} else {
+ 		kite_wifi_ring_snapshot(d);
+ 	}

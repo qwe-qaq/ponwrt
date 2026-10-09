@@ -1,0 +1,53 @@
+From: ponwrt development <noreply@local>
+Subject: [PATCH] Kite: preserve firmware fault identity on host WA errors
+
+Keep host completion failure in its saturating counter. Both sides close
+admission on either error; stopping still evaluates the original firmware
+ownership fault. A late WA cannot turn quarantine into recoverable fault 9.
+
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -164,6 +164,14 @@
+ 	unsigned char payload[KDP_TOKENS][KDP_BUFFER_BYTES];
+ 	struct kdp_band_stats stats[2];
+ };
++
++/* Separate writers: firmware fault identity is never overwritten by a
++ * host WA parser. tx_bad_done is a saturating host error latch until a
++ * proved stop and fresh shared session initialization. */
++static inline int kdp_failed(const volatile struct kdp_shared *s)
++{
++	return s->fault || s->tx_bad_done;
++}
+ 
+ static inline unsigned int kdp_get_le32(const unsigned char *p)
+ {
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -33,7 +33,7 @@
+ }
+ volatile struct kdp_shared *kite_dp_shared(void)
+ {
+-	return dp_identity() && !dp->fault ? dp : 0;
++	return dp_identity() && !kdp_failed(dp) ? dp : 0;
+ }
+ /* Only protocol/accounting faults with intact buffer identity can use the
+  * normal physical-stop/abort contract. Never erase the recorded fault. */
+@@ -264,7 +264,7 @@
+ {
+ 	if (!kite_dp_shared() || band > 1 || dp_prepared[band] != token ||
+ 	    dp_replacement[band] >= KDP_TOKENS) {
+-		if (dp && !dp->fault)
++		if (dp && !kdp_failed(dp))
+ 			dp->fault = 6;
+ 		return;
+ 	}
+@@ -280,7 +280,7 @@
+ 	if (!kite_dp_shared() || token >= KDP_TOKENS ||
+ 	    dp->token[token].state != KDP_TOKEN_WIFI ||
+ 	    dp->token[token].dma_done) {
+-		if (dp && !dp->fault)
++		if (dp && !kdp_failed(dp))
+ 			dp->fault = 7;
+ 		return;
+ 	}

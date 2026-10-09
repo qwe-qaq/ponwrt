@@ -1,0 +1,73 @@
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -850,7 +850,9 @@
+ 	{
+ 		struct net_device_path_stack stack;
+ 		struct net_device *indev;
+-		unsigned char ingress_mac[ETH_ALEN], egress_mac[ETH_ALEN];
++		unsigned char ingress_mac[ETH_ALEN] = {}, egress_mac[ETH_ALEN] = {};
++		const struct flow_offload_tuple *route_tuple = tuple;
++		const void *daddr;
+ 		bool have_macs = false, kite = false;
+ 
+ 		/* A DIRECT tuple already carries both Ethernet addresses. */
+@@ -865,9 +867,8 @@
+ 			   is_valid_ether_addr(other_tuple->dst_cache->dev->dev_addr)) {
+ 			/* For a routed reply, dst_cache points at the Wi-Fi netdev.
+ 			 * Resolve the station neighbor exactly as the normal route
+-			 * action does, and use the reply device MAC as the ingress
+-			 * router destination seen by the original Wi-Fi packet. */
+-			const void *daddr;
++			 * action does. The current tuple still supplies the
++			 * original packet's routed egress neighbor. */
+ 			struct neighbour *n;
+ 
+ 			if (other_tuple->l3proto == AF_INET)
+@@ -881,18 +882,42 @@
+ 				if (n) {
+ 					read_lock_bh(&n->lock);
+ 					if ((n->nud_state & NUD_VALID) &&
+-					    is_valid_ether_addr(n->ha)) {
++					    is_valid_ether_addr(n->ha))
+ 						ether_addr_copy(ingress_mac, n->ha);
+-						ether_addr_copy(egress_mac,
+-							       other_tuple->dst_cache->dev->dev_addr);
+-						have_macs = true;
+-					}
+ 					read_unlock_bh(&n->lock);
+ 					neigh_release(n);
+ 				}
+ 			}
+ 		}
+ 
++		/* A routed original tuple needs the real upstream next-hop MAC.
++		 * Do not substitute the LAN device address from the reply route. */
++		if (other_tuple->xmit_type == FLOW_OFFLOAD_XMIT_NEIGH &&
++		    route_tuple->xmit_type == FLOW_OFFLOAD_XMIT_NEIGH &&
++		    route_tuple->dst_cache) {
++			if (route_tuple->l3proto == AF_INET)
++				daddr = &route_tuple->dst_v4;
++			else if (route_tuple->l3proto == AF_INET6)
++				daddr = &route_tuple->dst_v6;
++			else
++				daddr = NULL;
++			if (daddr) {
++				struct neighbour *n;
++
++				n = dst_neigh_lookup(route_tuple->dst_cache, daddr);
++				if (n) {
++					read_lock_bh(&n->lock);
++					if ((n->nud_state & NUD_VALID) &&
++					    is_valid_ether_addr(n->ha))
++						ether_addr_copy(egress_mac, n->ha);
++					read_unlock_bh(&n->lock);
++					neigh_release(n);
++				}
++			}
++		}
++		have_macs = is_valid_ether_addr(ingress_mac) &&
++			is_valid_ether_addr(egress_mac);
++
+ 		if (have_macs) {
+ 			rcu_read_lock();
+ 			indev = dev_get_by_index_rcu(net, tuple->iifidx);

@@ -1,0 +1,12 @@
+Subject: mt7915: mark Kite Ethernet fallback as a software-only path
+
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -1917,6 +1917,7 @@
+ 	 */
+ 	if (is_mt7916(&mt7915_hw_dev(hw)->mt76)) {
+ 		path->type = DEV_PATH_ETHERNET;
++		path->flags |= NET_DEVICE_PATH_F_SW_ONLY;
+ 		path->dev = ctx->dev;
+ 		ctx->dev = NULL;
+ 		return 0;

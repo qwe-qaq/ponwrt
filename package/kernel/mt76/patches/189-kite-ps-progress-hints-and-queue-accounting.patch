@@ -1,0 +1,115 @@
+From: ponwrt maintainers
+Subject: [PATCH] r78: Wake on candidate-empty progress while preserving stopped-worker proof.
+
+Native incremental patch on release77. Ownership and datapath ABI12 unchanged.
+
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -314,13 +314,16 @@
+  u32 probe_mask, probe_count, reason[10], dma_wait, fence_reset;
+  u64 probe_ns, probe_max_ns;
+  u32 progress_wakes, worker_runs, seen_consumed, seen_drained, seen_reaped, seen_staged;
+- u32 progress_coalesced;
++ u32 progress_coalesced, empty_hint_wakes;
++ u32 negative_request, worst_request, worst_tid;
++ u64 negative_since_ns, worst_wait_ns, worst_ns;
++ struct ieee80211_sta_txq_observation worst_backlog;
+  u32 negative_probes, confirm_probes, txq_nudges;
+  u32 backlog_request, backlog_staged, backlog_reaped, backlog_queue_flags;
+  u32 backlog_non_aql;
+  u64 backlog_ns;
+  struct ieee80211_sta_txq_observation backlog[IEEE80211_NUM_TIDS+1];
+- unsigned long queue_retry_at;
++ unsigned long queue_retry_at, empty_hint_at;
+  u64 queued_ns, queue_delay_ns, queue_delay_max_ns;
+  u64 awake_ns, drain_ns, revoke_ns, sleep_at_ns, sleep_ns;
+  unsigned long changed_at;
+--- a/mt7915/npu-ps.inc
++++ b/mt7915/npu-ps.inc
+@@ -27,6 +27,24 @@
+  spin_lock_irqsave(&dev->kite.dp_done_lock, flags);
+  mt7915_dp_ps_trace_locked(dev, wi, 0, raw);
+  spin_unlock_irqrestore(&dev->kite.dp_done_lock, flags);
++}
++/* RCU keeps the native station alive; no FQ lock under dp_done_lock.
++ * A stale zero can only cause a full worker probe, never admission. */
++static bool mt7915_dp_ps_empty_hint(struct mt7915_dev *dev, u32 wi)
++{
++ struct mt76_wcid *wcid;
++ struct mt7915_sta *msta;
++ struct ieee80211_sta *sta;
++ bool empty=false;
++ rcu_read_lock();
++ wcid=rcu_dereference(dev->mt76.wcid[wi]);
++ if (wcid && wcid->sta) {
++  msta=container_of(wcid,struct mt7915_sta,wcid);
++  sta=container_of((void *)msta,struct ieee80211_sta,drv_priv);
++  empty=ieee80211_sta_txq_maybe_empty(sta);
++ }
++ rcu_read_unlock();
++ return empty;
+ }
+ /* Existing NAPI/WA and TX-worker batch boundaries publish progress. A
+  * delayed fallback covers NPU drain completion with no following IRQ.
+@@ -61,7 +79,11 @@
+        READ_ONCE(s->r60.ps[wi].issued)-READ_ONCE(s->r60.ps[wi].failed)!=consumed) {
+    if (consumed==p->seen_consumed && drained==p->seen_drained) continue;
+   } else if (p->probe_mask && time_before(jiffies,p->queue_retry_at)) {
+-   p->progress_coalesced++; continue;
++   if (!(p->probe_mask & (IEEE80211_STA_TX_TXQ | IEEE80211_STA_TX_FRAG)) ||
++       p->empty_hint_at == jiffies || !mt7915_dp_ps_empty_hint(dev,wi)) {
++    p->progress_coalesced++; continue;
++   }
++   p->empty_hint_at=jiffies; p->empty_hint_wakes++;
+   } else if (consumed==p->seen_consumed && drained==p->seen_drained &&
+              reaped==p->seen_reaped) continue;
+   p->seen_consumed=consumed; p->seen_drained=drained;
+@@ -126,6 +148,17 @@
+   p->backlog_request=p->request; p->backlog_ns=ktime_get_ns();
+   p->backlog_non_aql=atomic_read(&wcid->non_aql_packets);
+   memcpy(p->backlog,obs,sizeof(obs));
++  if (p->negative_request != p->request) {
++   p->negative_request=p->request; p->negative_since_ns=p->backlog_ns;
++  }
++  if (!p->worst_request || p->backlog_ns-p->negative_since_ns >= p->worst_wait_ns) {
++   u32 largest=0;
++   for (i=1;i<ARRAY_SIZE(obs);i++)
++    if (obs[i].packets+obs[i].fragments > obs[largest].packets+obs[largest].fragments) largest=i;
++   p->worst_request=p->request; p->worst_tid=largest;
++   p->worst_ns=p->backlog_ns; p->worst_wait_ns=p->backlog_ns-p->negative_since_ns;
++   p->worst_backlog=obs[largest];
++  }
+   if (q) {
+    p->backlog_staged=READ_ONCE(q->kite_staged);
+    p->backlog_reaped=q->kite_tx?kite_tx_read(&q->kite_tx->reaped):0;
+--- a/mt7915/npu-r59-observe.inc
++++ b/mt7915/npu-r59-observe.inc
+@@ -195,13 +195,17 @@
+   seq_printf(m,"r66_ps%u negative=%u confirm=%u nudges=%u backlog_request=%u backlog_ns=%llu staged=%u reaped=%u queue_flags=%u non_aql=%u\n",
+    i,p.negative_probes,p.confirm_probes,p.txq_nudges,p.backlog_request,p.backlog_ns,
+    p.backlog_staged,p.backlog_reaped,p.backlog_queue_flags,p.backlog_non_aql);
+-  if (!detail) continue;
++  seq_printf(m,"r78_ps%u empty_hint_wakes=%u worst_request=%u worst_tid=%u worst_ns=%llu wait_ns=%llu packets=%u bytes=%u fragments=%u dequeued=%u flags=%u aql=%u\n",
++   i,p.empty_hint_wakes,p.worst_request,p.worst_tid,p.worst_ns,p.worst_wait_ns,
++   p.worst_backlog.packets,p.worst_backlog.bytes,p.worst_backlog.fragments,
++   p.worst_backlog.dequeued,p.worst_backlog.flags,p.worst_backlog.aql);
+   for (j=0;j<ARRAY_SIZE(p.backlog);j++) {
+    struct ieee80211_sta_txq_observation *v=&p.backlog[j];
+    if (v->packets || v->fragments || v->dequeued || v->flags || v->aql)
+     seq_printf(m,"r66_txq%u_%u packets=%u bytes=%u fragments=%u dequeued=%u flags=%u aql=%u\n",
+      i,j,v->packets,v->bytes,v->fragments,v->dequeued,v->flags,v->aql);
+   }
++  if (!detail) continue;
+   wcid = rcu_dereference_protected(dev->mt76.wcid[i], lockdep_is_held(&dev->mt76.mutex));
+   if (!wcid || !wcid->sta) continue;
+   msta = container_of(wcid, struct mt7915_sta, wcid);
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -445,6 +445,7 @@
+ 	ieee80211_hw_set(hw, SUPPORTS_TX_FRAG);
+ 
+ 	hw->max_tx_fragments = 4;
++	hw->txq_condense = mdev->mmio.npu_type == MT76_NPU_TYPE_KITE;
+ 
+ 	if (!phy->dev->dbdc_support)
+ 		wiphy->txq_memory_limit = 32 << 20; /* 32 MiB */

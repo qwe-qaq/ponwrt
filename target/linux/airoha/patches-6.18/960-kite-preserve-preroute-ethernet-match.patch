@@ -1,0 +1,226 @@
+Subject: netfilter: keep Kite ingress matches separate from routed output actions
+
+Handle DIRECT/NEIGH independently, use post-NAT neighbour addresses and the
+correct union member. A bridged AP receives Ethernet frames addressed to the
+L3 bridge MAC, which need not equal its BSSID. Preserve native Ethernet mangle
+actions for PPE egress, and retain all exact ingress policy restrictions.
+
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -814,6 +814,93 @@
+ }
+ EXPORT_SYMBOL_GPL(nf_flow_rule_bridge);
+ 
++/* Resolve an output route without confusing DIRECT's union with NEIGH.
++ * The opposite tuple's source is the post-NAT destination, as in the
++ * native flow_offload_eth_dst() action builder. */
++static bool nf_flow_kite_route_l2(const struct flow_offload_tuple *tuple,
++				  const struct flow_offload_tuple *other,
++				  u8 *local, u8 *peer, int *ifindex)
++{
++	struct neighbour *n;
++	const void *daddr;
++	bool valid;
++
++	switch (tuple->xmit_type) {
++	case FLOW_OFFLOAD_XMIT_DIRECT:
++		ether_addr_copy(local, tuple->out.h_source);
++		ether_addr_copy(peer, tuple->out.h_dest);
++		*ifindex = tuple->out.ifidx;
++		break;
++	case FLOW_OFFLOAD_XMIT_NEIGH:
++		if (!tuple->dst_cache || !tuple->dst_cache->dev ||
++		    tuple->dst_cache->dev->addr_len != ETH_ALEN)
++			return false;
++		if (tuple->l3proto == AF_INET)
++			daddr = &other->src_v4;
++		else if (tuple->l3proto == AF_INET6)
++			daddr = &other->src_v6;
++		else
++			return false;
++		n = dst_neigh_lookup(tuple->dst_cache, daddr);
++		if (!n)
++			return false;
++		read_lock_bh(&n->lock);
++		valid = n->nud_state & NUD_VALID;
++		ether_addr_copy(peer, n->ha);
++		read_unlock_bh(&n->lock);
++		neigh_release(n);
++		if (!valid)
++			return false;
++		ether_addr_copy(local, tuple->dst_cache->dev->dev_addr);
++		*ifindex = tuple->ifidx;
++		break;
++	default:
++		return false;
++	}
++	return *ifindex > 0 && is_valid_ether_addr(local) &&
++		is_valid_ether_addr(peer);
++}
++
++/* Matches describe the original ingress frame. Output Ethernet addresses
++ * remain in native MANGLE actions, never in this ingress match. In a routed
++ * bridge/AP topology the ingress DA is the L3 bridge MAC, not the BSSID. */
++static void nf_flow_rule_kite_match(struct net *net,
++				   const struct flow_offload_tuple *tuple,
++				   const struct flow_offload_tuple *other,
++				   struct nf_flow_match *match)
++{
++	struct net_device_path_stack stack;
++	struct net_device *dev;
++	u8 ingress_src[ETH_ALEN], ingress_dst[ETH_ALEN];
++	u8 egress_src[ETH_ALEN], egress_dst[ETH_ALEN];
++	int ingress_ifindex, egress_ifindex;
++	bool kite = false;
++
++	if (!nf_flow_kite_route_l2(other, tuple, ingress_dst, ingress_src,
++				   &ingress_ifindex) ||
++	    !nf_flow_kite_route_l2(tuple, other, egress_src, egress_dst,
++				   &egress_ifindex))
++		return;
++	rcu_read_lock();
++	dev = dev_get_by_index_rcu(net, tuple->iifidx);
++	if (dev && !dev_fill_forward_path(dev, ingress_src, &stack) &&
++	    stack.num_paths)
++		kite = stack.path[stack.num_paths - 1].type == DEV_PATH_AIROHA_NPU;
++	dev = dev_get_by_index_rcu(net, egress_ifindex);
++	if (dev && !dev_fill_forward_path(dev, egress_dst, &stack) &&
++	    stack.num_paths)
++		kite |= stack.path[stack.num_paths - 1].type == DEV_PATH_AIROHA_NPU;
++	rcu_read_unlock();
++	if (!kite)
++		return;
++
++	NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_ETH_ADDRS, eth);
++	ether_addr_copy(match->key.eth.src, ingress_src);
++	ether_addr_copy(match->key.eth.dst, ingress_dst);
++	memset(&match->mask.eth, 0xff, sizeof(match->mask.eth));
++	match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_ETH_ADDRS);
++}
++
+ static struct nf_flow_rule *
+ nf_flow_offload_rule_alloc(struct net *net,
+ 			   const struct flow_offload_work *offload,
+@@ -847,98 +934,7 @@
+ 	if (err < 0)
+ 		goto err_flow_match;
+ 
+-	{
+-		struct net_device_path_stack stack;
+-		struct net_device *indev, *outdev;
+-		unsigned char ingress_mac[ETH_ALEN] = {}, egress_mac[ETH_ALEN] = {};
+-		const struct flow_offload_tuple *route_tuple = tuple;
+-		const void *daddr;
+-		bool have_macs = false, kite = false;
+-		bool ingress_kite = false, egress_kite = false;
+-
+-		/* A DIRECT tuple already carries both Ethernet addresses. */
+-		if (other_tuple->xmit_type == FLOW_OFFLOAD_XMIT_DIRECT &&
+-		    is_valid_ether_addr(other_tuple->out.h_source) &&
+-		    is_valid_ether_addr(other_tuple->out.h_dest)) {
+-			ether_addr_copy(ingress_mac, other_tuple->out.h_dest);
+-			ether_addr_copy(egress_mac, other_tuple->out.h_source);
+-			have_macs = true;
+-		} else if (other_tuple->xmit_type == FLOW_OFFLOAD_XMIT_NEIGH &&
+-			   other_tuple->dst_cache) {
+-			/* The opposite route supplies this packet's L2 source. */
+-			struct neighbour *n;
+-
+-			if (other_tuple->l3proto == AF_INET)
+-				daddr = &other_tuple->dst_v4;
+-			else if (other_tuple->l3proto == AF_INET6)
+-				daddr = &other_tuple->dst_v6;
+-			else
+-				daddr = NULL;
+-			if (daddr) {
+-				n = dst_neigh_lookup(other_tuple->dst_cache, daddr);
+-				if (n) {
+-					read_lock_bh(&n->lock);
+-					if ((n->nud_state & NUD_VALID) &&
+-					    is_valid_ether_addr(n->ha))
+-						ether_addr_copy(ingress_mac, n->ha);
+-					read_unlock_bh(&n->lock);
+-					neigh_release(n);
+-				}
+-			}
+-		}
+-
+-		/* The current route supplies this packet's L2 destination. */
+-		if (other_tuple->xmit_type == FLOW_OFFLOAD_XMIT_NEIGH &&
+-		    route_tuple->xmit_type == FLOW_OFFLOAD_XMIT_NEIGH &&
+-		    route_tuple->dst_cache) {
+-			if (route_tuple->l3proto == AF_INET)
+-				daddr = &route_tuple->dst_v4;
+-			else if (route_tuple->l3proto == AF_INET6)
+-				daddr = &route_tuple->dst_v6;
+-			else
+-				daddr = NULL;
+-			if (daddr) {
+-				struct neighbour *n;
+-
+-				n = dst_neigh_lookup(route_tuple->dst_cache, daddr);
+-				if (n) {
+-					read_lock_bh(&n->lock);
+-					if ((n->nud_state & NUD_VALID) &&
+-					    is_valid_ether_addr(n->ha))
+-						ether_addr_copy(egress_mac, n->ha);
+-					read_unlock_bh(&n->lock);
+-					neigh_release(n);
+-				}
+-			}
+-		}
+-		have_macs = is_valid_ether_addr(ingress_mac) &&
+-			is_valid_ether_addr(egress_mac);
+-
+-		if (have_macs) {
+-			rcu_read_lock();
+-			indev = dev_get_by_index_rcu(net, tuple->iifidx);
+-			if (indev && !dev_fill_forward_path(indev, ingress_mac,
+-							    &stack) && stack.num_paths)
+-				ingress_kite = stack.path[stack.num_paths - 1].type ==
+-					DEV_PATH_AIROHA_NPU;
+-			outdev = dev_get_by_index_rcu(net, tuple->ifidx);
+-			if (outdev && !dev_fill_forward_path(outdev, egress_mac,
+-							     &stack) && stack.num_paths)
+-				egress_kite = stack.path[stack.num_paths - 1].type ==
+-					DEV_PATH_AIROHA_NPU;
+-			kite = ingress_kite || egress_kite;
+-			rcu_read_unlock();
+-		}
+-		if (kite) {
+-			struct nf_flow_match *match = &flow_rule->match;
+-
+-			NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_ETH_ADDRS, eth);
+-			ether_addr_copy(match->key.eth.src, ingress_mac);
+-			ether_addr_copy(match->key.eth.dst, egress_mac);
+-			memset(&match->mask.eth, 0xff, sizeof(match->mask.eth));
+-			match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_ETH_ADDRS);
+-		}
+-	}
++	nf_flow_rule_kite_match(net, tuple, other_tuple, &flow_rule->match);
+ 
+ 	flow_rule->rule->action.num_entries = 0;
+ 	if (flowtable->type->action(net, flow, dir, flow_rule) < 0)
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -291,15 +291,13 @@
+ 	} else {
+ 		k->type = KDP_FLOW_BRIDGE;
+ 	}
+-	/* mac.key is also used by the PPE FOE and therefore contains the
+-	 * post-route neighbour destination for routed rules.  Kite sees the
+-	 * original Wi-Fi frame before routing; its destination is the BSS MAC.
+-	 * Bridge policies retain their exact peer destination. */
++	/* The rule contains pre-route MACs. PPE egress MACs are supplied by
++	 * native Ethernet MANGLE actions; never substitute BSSID here. */
+ 	ether_addr_copy(k->dmac, mac.key->dst);
+-	if (k->type != KDP_FLOW_BRIDGE && idev->ieee80211_ptr) {
+-		ether_addr_copy(k->dmac, idev->dev_addr);
++	if (k->type != KDP_FLOW_BRIDGE) {
+ 		atomic64_inc(&ppe->kite_routed_ingress);
+-		atomic64_inc(&ppe->kite_routed_mac_rewrite);
++		if (!ether_addr_equal(k->dmac, eth->h_dest))
++			atomic64_inc(&ppe->kite_routed_mac_rewrite);
+ 	}
+ 	if (k->type != KDP_FLOW_BRIDGE) {
+ 		struct flow_match_ports ports;

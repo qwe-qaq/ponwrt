@@ -1,0 +1,106 @@
+Subject: [PATCH] fence bridge host fallback by Kite session and key generation
+
+--- a/kite-datapath-fw.h
++++ b/kite-datapath-fw.h
+@@ -20,6 +20,8 @@
+ int host_ring_submit(u32 buf_addr, u16 pkt_len, u32 band,
+ 			    u16 wcid, u8 amsdu, u8 fwd_type,
+ 			    u16 orig_len, u8 is_last, u32 info);
++int kite_dp_host_fallback_metadata(u32 buf_addr, u32 *session,
++					   u32 *generation, u32 *key_generation);
+ volatile struct kdp_shared *kite_dp_shared(void);
+ volatile struct kdp_shared *kite_dp_stopping_shared(void);
+ int kite_dp_rx(unsigned int token, unsigned int len, unsigned int band);
+--- a/npu_hostadpt.c
++++ b/npu_hostadpt.c
+@@ -210,12 +210,24 @@
+ #if defined(AN7581) && defined(MT7916)
+ 	{
+ 		u32 gen = 0, keygen = 0;
+-		if (buf_addr >= wifi_pkt_dma(0) &&
++		if (fwd_type == KDP_HOST_FWD_WIFI_TX) {
++			u32 session;
++			/* A bridge miss is a TDMA payload, not an RX-token buffer. Its
++			 * ownership generation must be copied explicitly; accepting zero
++			 * here would let a stale queued frame cross a STA rekey. */
++			if (!kite_dp_host_fallback_metadata(buf_addr, &session, &gen,
++							&keygen))
++				return 0;
++			d[4] = session;
++			d[5] = (gen & 0xffffu) | ((keygen & 0xffffu) << 16);
++		} else if (buf_addr >= wifi_pkt_dma(0) &&
+ 		    !((buf_addr - wifi_pkt_dma(0)) & 4095))
+ 			kite_dp_rx_metadata((buf_addr - wifi_pkt_dma(0)) >> 12,
+ 					    &gen, &keygen);
+-		d[4] = gen;
+-		d[5] = keygen;
++		if (fwd_type != KDP_HOST_FWD_WIFI_TX) {
++			d[4] = gen;
++			d[5] = keygen;
++		}
+ 	}
+ #endif
+ 	d[2] = info;
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -26,6 +26,27 @@
+ 	return dp_pa + __builtin_offsetof(struct kdp_shared, txwi) +
+ 	       token * KDP_TXWI_BYTES;
+ }
++int kite_dp_host_fallback_metadata(u32 buf_addr, u32 *session,
++					   u32 *generation, u32 *key_generation)
++{
++	u32 base, token;
++	volatile struct kdp_token *t;
++
++	if (!dp || !session || !generation || !key_generation)
++		return 0;
++	base = dp_payload_pa(0);
++	if (buf_addr < base || buf_addr - base >= KDP_TOKENS * KDP_BUFFER_BYTES ||
++	    (buf_addr - base) % KDP_BUFFER_BYTES)
++		return 0;
++	token = (buf_addr - base) / KDP_BUFFER_BYTES;
++	t = &dp->token[token];
++	if (t->state != KDP_TOKEN_TDMA || !t->generation || !t->key_generation)
++		return 0;
++	*session = dp->session;
++	*generation = t->generation;
++	*key_generation = t->key_generation;
++	return 1;
++}
+ static int dp_identity(void)
+ {
+ 	return dp && dp->magic == KDP_MAGIC && dp->bytes == sizeof(*dp) &&
+@@ -173,9 +194,21 @@
+ 	return 0;
+ }
+ 
+-static int dp_host_bridge_fallback(u32 band, u32 token, u32 addr, u32 len, u32 wcid)
++static int dp_host_bridge_fallback(u32 band, u32 token, u32 addr, u32 len,
++					  u32 wcid, volatile struct kdp_sta *sta)
+ {
+-	int ret = host_ring_submit(addr, len, band, wcid, 0,
++	volatile struct kdp_token *t = &dp->token[token];
++	int ret;
++
++	/* The TDMA token remains owned while the host adaptor copies the frame.
++	 * Publish the same STA incarnation that the fast path would use so a
++	 * revoke/rekey can reject the queued software fallback. */
++	t->generation = sta->generation;
++	t->key_generation = sta->key_generation;
++	t->wcid = wcid;
++	t->band = band;
++	KDP_BARRIER();
++	ret = host_ring_submit(addr, len, band, wcid, 0,
+ 		KDP_HOST_FWD_WIFI_TX, len, 1, KDP_HOST_FALLBACK_PACK(band, wcid));
+ 	if (ret == KITE_HOST_HOLD)
+ 		return ret;
+@@ -284,7 +317,7 @@
+ 		int parsed = kdp_parse_packet((const void *)dp->payload[token], len, &packet);
+ 		int policy = dp_bridge_policy(dp, sta, &packet, parsed, wcid, band);
+ 		if (policy == 0) {
+-			int fallback = dp_host_bridge_fallback(band, token, addr, len, wcid);
++			int fallback = dp_host_bridge_fallback(band, token, addr, len, wcid, sta);
+ 			if (fallback == KITE_HOST_HOLD)
+ 				return 0;
+ 			return 0;

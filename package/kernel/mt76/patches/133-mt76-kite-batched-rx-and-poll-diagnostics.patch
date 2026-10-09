@@ -1,0 +1,153 @@
+Subject: mt76: batch Kite RX delivery and expose host poll pressure
+
+--- a/mt76.h
++++ b/mt76.h
+@@ -252,6 +252,10 @@
+ 	bool kite_tx_active, kite_tx_blocked;
+ 	u32 kite_kicks, kite_full, kite_gated, kite_wa_freed;
+ 	u32 kite_last_progress, kite_pending, kite_aborted;
++	u32 kite_rx_polls, kite_rx_frames, kite_rx_batches, kite_rx_invalid;
++	u32 kite_rx_empty, kite_rx_budget, kite_rx_refill_short,
++		kite_rx_max_batch;
++	u32 kite_rx_irqs, kite_rx_irq_empty;
+ 	unsigned long kite_progress_at;
+ 	struct mt76_queue_regs __iomem *regs;
+ 
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -961,8 +961,41 @@
+ 	mutex_unlock(&dev->mt76.mutex);
+ 	return 0;
+ }
++/* Counters are per driver instance and wrap modulo 2^32. Read-only
++ * observation never changes IRQ affinity, ownership or firmware state. */
++static int mt7915_kite_rx_show(struct seq_file *seq, void *data)
++{
++	struct mt7915_dev *dev = seq->private;
++	int b;
++
++	mutex_lock(&dev->mt76.mutex);
++	seq_printf(seq, "rx_host_abi=1 batching=1 session=%u epoch=%u\n",
++		   dev->kite.session, dev->kite.host_epoch);
++	for (b = 0; b < 2; b++) {
++		struct mt76_queue *q = &dev->mt76.q_rx[MT_RXQ_NPU0 + b];
++
++		seq_printf(
++			seq,
++			"band%d polls=%u frames=%u batches=%u invalid=%u empty=%u budget=%u refill_short=%u max_batch=%u irqs=%u irq_empty=%u queued=%d ndesc=%d\n",
++			b, READ_ONCE(q->kite_rx_polls),
++			READ_ONCE(q->kite_rx_frames),
++			READ_ONCE(q->kite_rx_batches),
++			READ_ONCE(q->kite_rx_invalid),
++			READ_ONCE(q->kite_rx_empty),
++			READ_ONCE(q->kite_rx_budget),
++			READ_ONCE(q->kite_rx_refill_short),
++			READ_ONCE(q->kite_rx_max_batch),
++			READ_ONCE(q->kite_rx_irqs),
++			READ_ONCE(q->kite_rx_irq_empty), READ_ONCE(q->queued),
++			q->ndesc);
++	}
++	mutex_unlock(&dev->mt76.mutex);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mt7915_kite_rx);
+ DEFINE_SHOW_ATTRIBUTE(mt7915_kite_tx);
+ void mt7915_npu_tx_debugfs(struct mt7915_dev *dev, struct dentry *dir)
+ {
+ 	debugfs_create_file("kite_tx", 0400, dir, dev, &mt7915_kite_tx_fops);
+-}
++	debugfs_create_file("kite_rx", 0400, dir, dev, &mt7915_kite_rx_fops);
++}
+--- a/npu.c
++++ b/npu.c
+@@ -252,39 +252,64 @@
+ {
+ 	struct mt76_dev *dev = mt76_priv(napi->dev);
+ 	enum mt76_rxq_id qid = napi - dev->napi;
++	struct mt76_queue *q = &dev->q_rx[qid];
++	bool kite = dev->mmio.npu_type == MT76_NPU_TYPE_KITE;
+ 	struct airoha_npu *npu;
+-	int done = 0;
+-
++	int done = 0, frames = 0;
++
++	if (budget <= 0)
++		return 0;
+ 	rcu_read_lock();
+-
+ 	npu = rcu_dereference(dev->mmio.npu);
+ 	if (!npu)
+ 		goto out;
+ 
++	if (kite)
++		q->kite_rx_polls++;
+ 	while (done < budget) {
+ 		struct sk_buff *skb;
+ 		u32 info = 0;
+ 
+-		skb = mt76_npu_dequeue(dev, &dev->q_rx[qid], &info);
++		skb = mt76_npu_dequeue(dev, q, &info);
+ 		if (!skb)
+ 			break;
++		done++;
+ 		if (IS_ERR(skb)) {
+-			done++;
+-			continue;
++			if (kite)
++				q->kite_rx_invalid++;
++		} else {
++			dev->drv->rx_skb(dev, qid, skb, &info);
++			frames++;
++			if (!kite)
++				mt76_rx_poll_complete(dev, qid, napi);
+ 		}
+-
+-		dev->drv->rx_skb(dev, qid, skb, &info);
+-		mt76_rx_poll_complete(dev, qid, napi);
+-		done++;
+-	}
+-
+-	mt76_npu_fill_rx_queue(dev, &dev->q_rx[qid]);
++		/* Return buffers during a busy poll, before the slower host
++		 * reorder/PN/mac80211 delivery. Pages already attached to SKBs
++		 * remain owned by those SKBs; refill obtains fresh pool pages.
++		 */
++		if (kite && !(done & 15))
++			mt76_npu_fill_rx_queue(dev, q);
++	}
++
++	mt76_npu_fill_rx_queue(dev, q);
++	if (kite) {
++		q->kite_rx_frames += frames;
++		q->kite_rx_empty += !done;
++		q->kite_rx_budget += done == budget;
++		q->kite_rx_refill_short += q->queued < q->ndesc - 1;
++		q->kite_rx_max_batch = max_t(u32, q->kite_rx_max_batch, frames);
++		if (frames) {
++			/* Match the ordinary DMA path: one bounded delivery batch,
++			 * retaining the same per-frame BA and PN/security checks.
++			 */
++			mt76_rx_poll_complete(dev, qid, napi);
++			q->kite_rx_batches++;
++		}
++	}
+ out:
+ 	if (done < budget && napi_complete(napi))
+ 		dev->drv->rx_poll_complete(dev, qid);
+-
+ 	rcu_read_unlock();
+-
+ 	return done;
+ }
+ 
+@@ -304,6 +329,10 @@
+ 		goto out;
+ 
+ 	status = airoha_npu_wlan_get_irq_status(npu, index);
++	if (dev->mmio.npu_type == MT76_NPU_TYPE_KITE) {
++		q->kite_rx_irqs++;
++		q->kite_rx_irq_empty += !status;
++	}
+ 	airoha_npu_wlan_set_irq_status(npu, status);
+ 
+ 	airoha_npu_wlan_disable_irq(npu, index);

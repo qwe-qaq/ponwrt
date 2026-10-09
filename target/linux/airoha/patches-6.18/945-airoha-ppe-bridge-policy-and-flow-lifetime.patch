@@ -1,0 +1,207 @@
+Subject: [PATCH] Preserve exact bridge policy and flow lifetime, avoid unsupported refresh churn
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -739,6 +739,7 @@
+ 	atomic64_t destroy_fail;
+ 	atomic64_t learn_requests;
+ 	atomic64_t bind_ok;
++	atomic64_t bridge_policy_fallback;
+ 	atomic64_t bind_fail;
+ 	int setup_errno, replace_errno, bind_errno;
+ 	struct dentry *debugfs_dir;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -817,6 +817,8 @@
+ 	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
+ 
+ 	lockdep_assert_held(&ppe_lock);
++	if (hash >= airoha_ppe_get_total_num_entries(ppe))
++		return NULL;
+ 
+ 	if (hash < sram_num_entries) {
+ 		u32 *hwe = ppe->foe + hash * sizeof(struct airoha_foe_entry);
+@@ -899,18 +901,21 @@
+ 				       u32 hash, bool rx_wlan)
+ {
+ 	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
+-	struct airoha_foe_entry *hwe = ppe->foe + hash * sizeof(*hwe);
+-	u32 ts = airoha_ppe_get_timestamp(ppe);
++	struct airoha_foe_entry *hwe;
++	u32 ib1, ts = airoha_ppe_get_timestamp(ppe);
+ 	struct airoha_eth *eth = ppe->eth;
+ 	struct airoha_npu *npu;
+ 	int err = 0;
+ 
++	if (hash >= airoha_ppe_get_total_num_entries(ppe))
++		return -EINVAL;
++	hwe = ppe->foe + hash * sizeof(*hwe);
+ 	memcpy(&hwe->d, &e->d, sizeof(*hwe) - sizeof(hwe->ib1));
+ 	wmb();
+ 
+-	e->ib1 &= ~AIROHA_FOE_IB1_BIND_TIMESTAMP;
+-	e->ib1 |= FIELD_PREP(AIROHA_FOE_IB1_BIND_TIMESTAMP, ts);
+-	hwe->ib1 = e->ib1;
++	ib1 = (e->ib1 & ~AIROHA_FOE_IB1_BIND_TIMESTAMP) |
++	      FIELD_PREP(AIROHA_FOE_IB1_BIND_TIMESTAMP, ts);
++	hwe->ib1 = ib1;
+ 
+ 	rcu_read_lock();
+ 
+@@ -927,10 +932,17 @@
+ 		err = airoha_ppe_foe_commit_sram_entry(ppe, hash);
+ unlock:
+ 	rcu_read_unlock();
++	if (!err) {
++		hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
++		if (!hwe || ((READ_ONCE(hwe->ib1) ^ ib1) &
++		    (AIROHA_FOE_IB1_BIND_STATE | AIROHA_FOE_IB1_BIND_PACKET_TYPE |
++		     AIROHA_FOE_IB1_BIND_UDP)))
++			err = -EIO;
++	}
+ 	if (err) {
+ 		atomic64_inc(&ppe->bind_fail);
+ 		WRITE_ONCE(ppe->bind_errno, err);
+-	} else {
++	} else if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, ib1) == AIROHA_FOE_STATE_BIND) {
+ 		atomic64_inc(&ppe->bind_ok);
+ 	}
+ 
+@@ -1231,6 +1243,10 @@
+ 		u32 ib1, state;
+ 		int idle;
+ 
++		/* Successful siblings can already be invalidated when another
++		 * slot's revoke failed. Keep them inert until cleanup/retry. */
++		if (iter->hash == 0xffff)
++			continue;
+ 		hwe = airoha_ppe_foe_get_entry_locked(ppe, iter->hash);
+ 		if (!hwe)
+ 			continue;
+@@ -1278,7 +1294,10 @@
+ 		goto unlock;
+ 	}
+ 
+-	e->data.ib1 = hwe.ib1;
++	if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe.ib1) == AIROHA_FOE_STATE_BIND) {
++		e->data.ib1 &= ~AIROHA_FOE_IB1_BIND_TIMESTAMP;
++		e->data.ib1 |= hwe.ib1 & AIROHA_FOE_IB1_BIND_TIMESTAMP;
++	}
+ unlock:
+ 	spin_unlock_bh(&ppe_lock);
+ }
+@@ -1292,6 +1311,27 @@
+ }
+ 
+ #include "airoha_kite.c"
++
++/* Native L2B cannot express IP/port restrictions. Native L4 keys do not
++ * include the bridge ingress/L2 isolation domain. Admit only the exact
++ * MAC-only subset; all other bridge rules remain on the host path. */
++static int airoha_ppe_flow_check_bridge(const struct flow_rule *rule,
++				       struct netlink_ext_ack *extack)
++{
++	const struct flow_action_entry *act;
++	int i;
++
++	flow_action_for_each(i, act, &rule->action) {
++		if (act->id != FLOW_ACTION_BRIDGE)
++			continue;
++		if (airoha_kite_bridge_l2_rule(rule))
++			continue;
++		NL_SET_ERR_MSG_MOD(extack,
++			"PPE cannot represent exact bridge L4/domain policy; software forwarding retained");
++		return -EOPNOTSUPP;
++	}
++	return 0;
++}
+ 
+ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 					   struct flow_cls_offload *f)
+@@ -1306,6 +1344,12 @@
+ 	u8 dsfield = 0, l4proto = 0;
+ 	int err, i, offload_type;
+ 	u16 addr_type = 0;
++
++	err = airoha_ppe_flow_check_bridge(rule, f->common.extack);
++	if (err) {
++		atomic64_inc(&eth->ppe->bridge_policy_fallback);
++		return err;
++	}
+ 
+ 	if (rhashtable_lookup(&eth->flow_table, &f->cookie,
+ 			      airoha_flow_table_params))
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -225,6 +225,8 @@
+ 	seq_printf(m, "destroy_ok=%lld\n", atomic64_read(&ppe->destroy_ok));
+ 	seq_printf(m, "destroy_fail=%lld\n", atomic64_read(&ppe->destroy_fail));
+ 	seq_printf(m, "learn_requests=%lld\n", atomic64_read(&ppe->learn_requests));
++	seq_printf(m, "bridge_policy_fallback=%lld\n",
++		   atomic64_read(&ppe->bridge_policy_fallback));
+ 	seq_printf(m, "bind_ok=%lld\n", atomic64_read(&ppe->bind_ok));
+ 	seq_printf(m, "bind_fail=%lld\n", atomic64_read(&ppe->bind_fail));
+ 	seq_printf(m, "setup_errno=%d replace_errno=%d bind_errno=%d\n",
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@ -184,6 +184,9 @@
+ 	FLOW_ACTION_VLAN_PUSH_ETH,
+ 	FLOW_ACTION_VLAN_POP_ETH,
+ 	FLOW_ACTION_CONTINUE,
++	/* Preserve bridge L2/IP semantics with the original exact match.
++	 * Drivers lacking such a representation must reject the rule. */
++	FLOW_ACTION_BRIDGE,
+ 	NUM_FLOW_ACTIONS,
+ };
+ 
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -801,12 +801,16 @@
+ 			enum flow_offload_tuple_dir dir,
+ 			struct nf_flow_rule *flow_rule)
+ {
++	struct flow_action_entry *entry;
++
+ 	if (nf_flow_rule_route_common(net, flow, dir, flow_rule) < 0)
+ 		return -1;
+ 
+-	flow_offload_redirect(net, flow, dir, flow_rule);
+-
+-	return 0;
++	entry = flow_action_entry_next(flow_rule);
++	if (!entry)
++		return -E2BIG;
++	entry->id = FLOW_ACTION_BRIDGE;
++	return flow_offload_redirect(net, flow, dir, flow_rule);
+ }
+ EXPORT_SYMBOL_GPL(nf_flow_rule_bridge);
+ 
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -79,6 +79,7 @@
+ 
+ struct nft_forward_info {
+ 	bool sw_only;
++	bool bridge_sw_only;
+ 	const struct net_device *indev;
+ 	const struct net_device *outdev;
+ 	const struct net_device *hw_outdev;
+@@ -105,6 +106,9 @@
+ 	for (i = 0; i < stack->num_paths; i++) {
+ 		path = &stack->path[i];
+ 		info->sw_only |= !!(path->flags & NET_DEVICE_PATH_F_SW_ONLY);
++		/* Kite cannot express nft bridge L4+isolation-domain matches.
++		 * This restriction is bridge-only: routed NPU paths stay eligible. */
++		info->bridge_sw_only |= path->type == DEV_PATH_AIROHA_NPU;
+ 		switch (path->type) {
+ 		case DEV_PATH_ETHERNET:
+ 		case DEV_PATH_DSA:
+@@ -348,7 +352,7 @@
+ 	if (!info.indev || info.indev != dst_dev)
+ 		return -1;
+ 
+-	if (info.sw_only)
++	if (info.sw_only || info.bridge_sw_only)
+ 		__set_bit(NF_FLOW_HW_DISABLED, &flow->flags);
+ 
+ 	th[!dir].tuple.iifidx = info.indev->ifindex;

@@ -1,0 +1,81 @@
+Subject: net: airoha: commit mailbox requests with the doorbell last
+
+CTRL2 can dispatch the NPU immediately. A later CTRL3 store can erase its
+DONE and leave even a completed diagnostic request quarantined forever.
+Keep unknown-timeout DMA ownership intact and expose read-only registers.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -196,7 +196,7 @@
+ 	/* A timeout does not revoke NPU DMA ownership. Keep this buffer intact
+ 	 * until the firmware publishes DONE; a late reply is then discarded. */
+ 	if (core->pending_reply) {
+-		regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(3), &val);
++		regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(3) + offset, &val);
+ 		if (!(val & MBOX_MSG_DONE)) {
+ 			core->deferred++;
+ 			spin_unlock_bh(&core->lock);
+@@ -212,10 +212,16 @@
+ 
+ 	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(0) + offset, core->addr);
+ 	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(1) + offset, len);
++	/* CTRL2 is the doorbell. Publish every request field, including the
++	 * cleared DONE bit, before waking the NPU. A fast ISR can otherwise
++	 * finish between the CTRL2 and CTRL3 writes and have its DONE erased,
++	 * permanently quarantining an already completed mailbox buffer.
++	 * Ordered MMIO through this regmap also orders CTRL3 before CTRL2.
++	 */
++	val = FIELD_PREP(MBOX_MSG_FUNC_ID, func_id) | MBOX_MSG_WAIT_RSP;
++	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(3) + offset, val);
+ 	regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, &val);
+ 	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, val + 1);
+-	val = FIELD_PREP(MBOX_MSG_FUNC_ID, func_id) | MBOX_MSG_WAIT_RSP;
+-	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(3) + offset, val);
+ 
+ 	ret = regmap_read_poll_timeout_atomic(npu->regmap,
+ 					      REG_CR_MBQ0_CTRL(3) + offset,
+@@ -592,6 +598,8 @@
+ 	bool control_valid;
+ 	u32 samples, moving, quiet[8];
+ 	u32 requests, completed, timeouts, late_replies, deferred;
++	u32 mailbox_ctrl[4];
++	unsigned long pending_since;
+ 	unsigned long updated;
+ 	int error;
+ 	bool pending;
+@@ -605,6 +613,7 @@
+ 	case 0x4b525832: return "wifi-rx-core2";
+ 	case 0x4b504950: return "wifi-classifier";
+ 	case 0x4b4e4f44: return "host-delivery";
++	case 0x4b545834: return "wifi-tx-core4";
+ 	case 0x54554e4c: return "tunnel";
+ 	case 0x49444c45: return "idle";
+ 	default: return "startup-or-other";
+@@ -670,6 +679,11 @@
+ 		"mailbox requests=%u completed=%u timeouts=%u late=%u deferred=%u pending=%u\n",
+ 		d->requests, d->completed, d->timeouts, d->late_replies,
+ 		d->deferred, d->pending);
++	n += sysfs_emit_at(buf, n,
++		"mailbox_hw addr=%#x len=%u doorbell=%u ctrl=%#x pending_observed_ms=%u\n",
++		d->mailbox_ctrl[0], d->mailbox_ctrl[1], d->mailbox_ctrl[2],
++		d->mailbox_ctrl[3], d->pending ?
++		jiffies_to_msecs(jiffies - d->pending_since) : 0);
+ 	if (!d->samples) {
+ 		n += sysfs_emit_at(buf, n, "snapshot=unavailable\n");
+ 		goto out;
+@@ -824,7 +838,15 @@
+ 	d->timeouts = core->timeouts;
+ 	d->late_replies = core->late_replies;
+ 	d->deferred = core->deferred;
++	if (core->pending_reply && !d->pending)
++		d->pending_since = jiffies;
+ 	d->pending = core->pending_reply;
++	/* Read-only hardware evidence remains available if GET32/GET33 stop.
++	 * Do not touch the quarantined DMA buffer or retry an unknown command.
++	 */
++	for (i = 0; i < ARRAY_SIZE(d->mailbox_ctrl); i++)
++		regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(i),
++			    &d->mailbox_ctrl[i]);
+ 	spin_unlock_bh(&core->lock);
+ 	if (err) {
+ 		mutex_unlock(&d->lock);

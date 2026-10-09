@@ -1,0 +1,170 @@
+From: ponwrt development
+Subject: [PATCH] Observe RX early fallback and TX admission without changing packet ownership
+
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -170,7 +170,23 @@
+ #define KDP_STAT_BRIDGE_MISS      1u
+ #define KDP_STAT_HOST_FALLBACK    2u
+ #define KDP_STAT_HOST_FALLBACK_DROP 3u
+-#define KDP_STAT_BRIDGE_STALE     4u
++/* Optional telemetry v2: reuse previously unwritten reserved words.
++ * No shared layout, DMA address or ownership/packet ABI changes. */
++#define KDP_STAT_TX_ADMISSION_DROP 4u
++#define KDP_STAT_RX_ENTER         5u
++#define KDP_STAT_RX_EARLY         6u
++#define KDP_STAT_RX_LAST          7u /* wcid:16, tid:8, reason:8 */
++#define KDP_STAT_RX_WORD2         8u
++#define KDP_RX_EARLY_DISABLED     1u
++#define KDP_RX_EARLY_STA          2u
++#define KDP_RX_EARLY_BAND         3u
++#define KDP_RX_EARLY_BSS          4u
++#define KDP_RX_EARLY_BAR          5u
++#define KDP_RX_EARLY_TID          6u
++#define KDP_RX_EARLY_NON_QOS      7u
++#define KDP_RX_EARLY_UNSUPPORTED  8u
++#define KDP_RX_EARLY_NO_BA        9u
++
+ struct kdp_shared {
+ 	unsigned int magic, bytes, session, epoch;
+ 	unsigned int enabled, fault, gate, stopped;
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -341,11 +341,19 @@
+ 	KDP_BARRIER();
+ 	wcid = dp->route[tag & (KDP_ROUTES - 1)].wcid;
+ 	if (!wcid || wcid >= KDP_WCIDS || b != band ||
+-	    len < 14 || len > KDP_BUFFER_BYTES || !dp->enabled || dp->gate)
+-		goto drop;
++	    len < 14 || len > KDP_BUFFER_BYTES)
++		goto drop;
++	if (!dp->enabled || dp->gate) {
++		dp->stats[band].reserved[KDP_STAT_TX_ADMISSION_DROP]++;
++		goto drop;
++	}
+ 	sta = &dp->sta[wcid];
+ 	bss = sta->bss;
+-	if (sta->tx_tag != tag || bss > 63 || sta->tx_blocked || !sta->enabled || !sta->authorized || sta->band != b ||
++	if (sta->tx_blocked || !sta->enabled || !sta->authorized) {
++		dp->stats[band].reserved[KDP_STAT_TX_ADMISSION_DROP]++;
++		goto drop;
++	}
++	if (sta->tx_tag != tag || bss > 63 || sta->band != b ||
+ 	    sta->bss != bss || !sta->generation ||
+ 	    (sta->cipher && (sta->cipher != KDP_CIPHER_CCMP ||
+ 			    !sta->key_generation)))
+--- a/npu_kite_secure_rx.c
++++ b/npu_kite_secure_rx.c
+@@ -222,6 +222,21 @@
+ 		kite_dp_ba_set(wcid, tid, 0, 0);
+ }
+ 
++static int dp_rx_early(volatile struct kdp_shared *s, u32 band,
++		       u32 reason, u32 wcid, u32 tid, u32 word2)
++{
++	s->stats[band].reserved[KDP_STAT_RX_EARLY]++;
++	/* Background management/control traffic must not overwrite the last
++	 * identified data failure. Never export payload, keys or packet PN. */
++	if (reason) {
++		s->stats[band].reserved[KDP_STAT_RX_WORD2] = word2;
++		KDP_BARRIER();
++		s->stats[band].reserved[KDP_STAT_RX_LAST] =
++			(wcid << 16) | (tid << 8) | reason;
++	}
++	return 0;
++}
++
+ int kite_dp_rx(u32 token, u32 len, u32 band)
+ {
+ 	volatile struct kdp_shared *s = kite_dp_shared();
+@@ -231,9 +246,10 @@
+ 	struct kdp_rxd rx;
+ 	struct kdp_ba *ba;
+ 	const u8 *p;
+-	u32 wcid, tid;
++	u32 wcid, tid, word2, observe;
+ 	if (!s || token >= KDP_RX_TOKENS || band > 1)
+ 		return 0;
++	s->stats[band].reserved[KDP_STAT_RX_ENTER]++;
+ 	r = &s->rx[token];
+ 	r->flags = KDP_RX_MAGIC;
+ 	r->generation = r->key_generation = 0;
+@@ -242,42 +258,49 @@
+ 	r->offset = 0;
+ 	p = (void *)wifi_pkt_va(token);
+ 	if (len < 24 || (kdp_get_le32(p) >> 27) != 2)
+-		return 0;
++		return dp_rx_early(s, band, 0, 0, 0, 0);
+ 	wcid = kdp_get_le32(p + 4) & 0x3ff;
+-	tid = (kdp_get_le32(p + 8) >> 16) & 15;
++	word2 = kdp_get_le32(p + 8);
++	tid = (word2 >> 16) & 15;
+ 	if (!wcid || wcid >= KDP_WCIDS)
+-		return 0;
++		return dp_rx_early(s, band, 0, 0, 0, 0);
++	observe = !((kdp_get_le32(p + 4) & (1u << 14)) && len >= 40 &&
++		    (kdp_get_le32(p + 24) & 0xfcu) != 0x88u);
+ 	sta = &s->sta[wcid];
+ 	r->generation = sta->generation;
+ 	r->key_generation = sta->key_generation;
+ 	r->wcid = wcid;
+-	r->bss = kdp_get_le32(p + 8) & 63;
++	r->bss = word2 & 63;
+ 	r->tid = tid;
+-	if (!s->enabled || !sta->enabled || !sta->authorized ||
+-	    sta->band != band || r->bss != sta->bss)
+-		return 0;
++	if (!s->enabled)
++		return dp_rx_early(s, band, observe * KDP_RX_EARLY_DISABLED, wcid, tid, word2);
++	if (!sta->enabled || !sta->authorized)
++		return dp_rx_early(s, band, observe * KDP_RX_EARLY_STA, wcid, tid, word2);
++	if (sta->band != band)
++		return dp_rx_early(s, band, observe * KDP_RX_EARLY_BAND, wcid, tid, word2);
++	if (r->bss != sta->bss)
++		return dp_rx_early(s, band, observe * KDP_RX_EARLY_BSS, wcid, tid, word2);
+ 	ctx.s = s;
+ 	ctx.band = band;
+ 	{
+ 		u32 bar_tid, ssn;
+ 		int bar = kdp_parse_bar(p, len, band, sta, &bar_tid, &ssn);
+ 		if (bar < 0)
+-			return 0;
++			return dp_rx_early(s, band, observe * KDP_RX_EARLY_BAR, wcid, tid, word2);
+ 		if (bar > 0) {
+ 			ba = dp_ba_find(s, wcid, bar_tid);
+ 			if (ba && !(sta->host_tids & (1u << bar_tid)))
+ 				kdp_ba_bar(ba, ssn, &dp_rx_ops, &ctx);
+ 			/* Linux receives the same BAR for its fallback window. */
+-			return 0;
++			return dp_rx_early(s, band, 0, wcid, tid, word2);
+ 		}
+ 	}
+ 	if (tid > 7 || (sta->host_tids & (1u << tid)))
+-		return 0;
++		return dp_rx_early(s, band, observe * KDP_RX_EARLY_TID, wcid, tid, word2);
+ 	/* Non-QoS control/management traffic does not belong to the TID's BA
+ 	 * sequence space and must not permanently latch its data path to Linux. */
+-	if ((kdp_get_le32(p + 4) & (1u << 14)) && len >= 40 &&
+-	    (kdp_get_le32(p + 24) & 0xfcu) != 0x88u)
+-		return 0;
++	if (!observe)
++		return dp_rx_early(s, band, 0, wcid, tid, word2);
+ 	ctx.s = s;
+ 	ctx.band = band;
+ 	ba = dp_ba_find(s, wcid, tid);
+@@ -293,13 +316,13 @@
+ 			for (u32 i = 0; i < ba->window; i++)
+ 				kdp_ba_release(ba, &dp_rx_ops, &ctx);
+ 		s->rx_unsupported[band]++;
+-		return 0;
++		return dp_rx_early(s, band, KDP_RX_EARLY_UNSUPPORTED, wcid, tid, word2);
+ 	}
+ 	r->offset = rx.offset;
+ 	if (!ba || !ba->window) {
+ 		/* No BA means Linux also owns A-MSDU assembly. */
+ 		if (rx.format)
+-			return 0;
++			return dp_rx_early(s, band, KDP_RX_EARLY_NO_BA, wcid, tid, word2);
+ 		struct kdp_mpdu single = {
+ 			.head=token, .tail=token, .count=1, .sn=rx.sequence,
+ 			.complete=1, .encrypted=rx.encrypted,

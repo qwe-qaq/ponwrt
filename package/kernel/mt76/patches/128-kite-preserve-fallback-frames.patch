@@ -1,0 +1,67 @@
+Subject: [PATCH] mt76: keep fallback frames and validate reorder provenance
+
+--- a/kite-rx.h
++++ b/kite-rx.h
+@@ -13,7 +13,8 @@
+ 
+ /* Complete snapshots only. A pending chain is handled before calling this.
+  * Both families put segment count at 31:29, but Kite's low word1 fields
+- * are WCID/A-MSDU, and word2 is a boolean rate-limit indication, not PPE. */
++ * are WCID/A-MSDU. Word2 is advisory metadata, validated by mt7915 only
++ * after the complete RXD is available; it cannot invalidate packet storage. */
+ static inline bool mt76_kite_rx_valid(const struct mt76_kite_segment *s,
+ 				    unsigned int n)
+ {
+@@ -32,7 +33,7 @@
+ 
+ 		if (!(s[i].ctrl & 1) || !len || len > MT76_KITE_BUFFER_LEN ||
+ 		    ((s[i].ctrl >> 15) & 0x3fff) != total ||
+-		    (s[i].info >> 29) != count || s[i].data > 1 ||
++		    (s[i].info >> 29) != count ||
+ 		    (s[i].info & 0x03e00000) ||
+ 		    !!(s[i].ctrl & (1u << 29)) != (i == n - 1))
+ 			return false;
+--- a/npu.c
++++ b/npu.c
+@@ -169,7 +169,8 @@
+ 			 * word1 remains the chain/count record consumed above; passing
+ 			 * it to mt7915 would make the host interpret packet-count bits
+ 			 * as PPE metadata and would silently lose the reorder fence. */
+-			*info = is_kite ? desc[index].data : desc[index].info;
++			*info = is_kite ? (nframes == 1 ? desc[index].data : 0) :
++					  desc[index].info;
+ 		e->buf = NULL;
+ 		index = (index + 1) % q->ndesc;
+ 	}
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -14,14 +14,18 @@
+ 
+ static bool mt7915_kite_meta_reordered(struct mt7915_dev *dev,
+ 					       struct mt76_rx_status *status,
+-					       u32 info, __le16 fc, u16 seq_ctrl)
++					       enum mt76_rxq_id q, u32 info, __le16 fc, u16 seq_ctrl)
+ {
+ #if IS_ENABLED(CONFIG_MT7915_NPU)
+ 	u16 idx;
+ 
+ 	if (dev->mt76.mmio.npu_type != MT76_NPU_TYPE_KITE ||
++	    (q != MT_RXQ_NPU0 && q != MT_RXQ_NPU1) ||
++	    !dev->kite.active || dev->kite.failed ||
+ 	    !dev->kite.reorder || !KITE_HOST_META_VALID(info) ||
+-	    !(KITE_HOST_META_FLAGS(info) & KITE_HOST_META_REORDERED) ||
++	    KITE_HOST_META_FLAGS(info) != KITE_HOST_META_REORDERED ||
++	    !ieee80211_is_data_qos(fc) || ieee80211_is_qos_nullfunc(fc) ||
++	    ieee80211_has_protected(fc) || ieee80211_has_morefrags(fc) ||
+ 	    KITE_HOST_META_REASON(info) != KITE_HOST_META_RAW ||
+ 	    !status->wcid || (status->flag & RX_FLAG_DECRYPTED) ||
+ 	    status->amsdu || (seq_ctrl & IEEE80211_SCTL_FRAG))
+@@ -572,7 +576,7 @@
+ 		       !ieee80211_is_qos_nullfunc(fc);
+ 	status->qos_ctl = qos_ctl;
+ 	status->seqno = IEEE80211_SEQ_TO_SN(seq_ctrl);
+-	mt7915_kite_meta_reordered(dev, status, *info, fc, seq_ctrl);
++	mt7915_kite_meta_reordered(dev, status, q, *info, fc, seq_ctrl);
+ 
+ 	return 0;
+ }

@@ -1,0 +1,100 @@
+Subject: [PATCH] airoha: decode all Kite lifecycle states and security telemetry
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -617,6 +617,21 @@
+ 	case 2: return "parking";
+ 	case 3: return "parked";
+ 	case 4: return "faulted-dma-unconfirmed";
++	case 5: return "stopping";
++	case 6: return "stopped";
++	case 7: return "faulted-drain";
++	default: return "unknown";
++	}
++}
++
++static const char *airoha_clanker_control_mode(u32 state, u32 mode)
++{
++	if (!state)
++		return "none";
++	switch (mode) {
++	case 0: return "data-development";
++	case 1: return "control-only";
++	case 2: return "data-reorder";
+ 	default: return "unknown";
+ 	}
+ }
+@@ -641,7 +656,7 @@
+ 
+ 		n += sysfs_emit_at(buf, n,
+ 			"control mode=%s state=%s session=%u serial=%u result=%u ack=%#x accepted=%u rejected=%u stations=%u ba=%u key_fences=%u\n",
+-			!k[6] ? "none" : k[15] ? "control-only" : "data-development",
++			airoha_clanker_control_mode(k[6], k[15]),
+ 			airoha_clanker_control_state(k[6]), k[3], k[4], k[5],
+ 			k[7], k[10], k[11], k[12], k[13], k[14]);
+ 	}
+@@ -687,6 +702,12 @@
+ 			"host_dma session=%u epoch=%u bands=%#x inflight=%u fault=%u submitted=%u completed=%u timeouts=%u last_src=%#x last_dst=%#x last_len=%u\n",
+ 			c[39], c[32], c[33], c[34], c[35], c[36], c[37],
+ 			c[38], c[40], c[41], c[42]);
++	if (c[61] == 0x4b530001)
++		n += sysfs_emit_at(buf, n,
++			"security raw=%u/%u encrypted=%u/%u unknown_sta=%u/%u unsupported=%u/%u amsdu=%u/%u reordered=%u/%u unknown=%u/%u host_fallback=%u/%u reorder_active=%u reorder_fences=%u\n",
++			c[43], c[44], c[45], c[46], c[47], c[48], c[49], c[50],
++			c[51], c[52], c[53], c[54], c[55], c[56], c[57], c[58],
++			c[59], c[60]);
+ out:
+ 	mutex_unlock(&d->lock);
+ 	return n;
+@@ -732,8 +753,8 @@
+ 			(enum airoha_npu_wlan_get_cmd)33,
+ 			control, sizeof(control), GFP_KERNEL);
+ 		if (!control_error && (control[0] != CLANKER_CTL_MAGIC ||
+-		    control[1] != CLANKER_CTL_WORDS || control[6] > 3 ||
+-		    control[8] != 544 || control[15] > 1))
++		    control[1] != CLANKER_CTL_WORDS || control[6] > 7 ||
++		    control[8] != 544 || control[15] > 2))
+ 			control_error = -EPROTO;
+ 	}
+ 	mutex_lock(&d->lock);
+@@ -741,7 +762,7 @@
+ 		(!control_error && (!d->control_valid ||
+ 		control[3] != d->control[3] || control[6] != d->control[6] ||
+ 		control[12] != d->control[12] || control[13] != d->control[13] ||
+-		control[14] != d->control[14]));
++		control[14] != d->control[14] || control[15] != d->control[15]));
+ 	d->control_error = control_error;
+ 	if (!control_error) {
+ 		memcpy(d->control, control, sizeof(control));
+@@ -806,13 +827,21 @@
+ 		else
+ 			dev_info(npu->dev,
+ 				 "Clanker control: mode=%s state=%s session=%u serial=%u result=%u ack=%#x accepted=%u rejected=%u sta=%u ba=%u keys=%u; data=host PN=host\n",
+-				 !control[6] ? "none" : control[15] ? "control-only" : "data-development",
++				 airoha_clanker_control_mode(control[6], control[15]),
+ 				 airoha_clanker_control_state(control[6]), control[3],
+ 				 control[4], control[5], control[7], control[10],
+ 				 control[11], control[12], control[13], control[14]);
+ 		dev_info(npu->dev,
+ 			 "Clanker TDMA: outstanding=%u/%u invalid_returns=%u duplicate_submits=%u\n",
+ 			 data[1][27], data[1][28], data[1][29], data[1][30]);
++		if (data[1][61] == 0x4b530001)
++			dev_info(npu->dev,
++				 "Clanker security: raw=%u/%u encrypted=%u/%u unknown_sta=%u/%u unsupported=%u/%u amsdu=%u/%u reordered=%u/%u unknown=%u/%u host_fallback=%u/%u reorder_active=%u reorder_fences=%u\n",
++				 data[1][43], data[1][44], data[1][45], data[1][46],
++				 data[1][47], data[1][48], data[1][49], data[1][50],
++				 data[1][51], data[1][52], data[1][53], data[1][54],
++				 data[1][55], data[1][56], data[1][57], data[1][58],
++				 data[1][59], data[1][60]);
+ 		if (data[1][31] == 0x4b480001)
+ 			dev_info(npu->dev,
+ 				 "Clanker host DMA: session=%u epoch=%u bands=%#x inflight=%u fault=%u submitted=%u completed=%u timeouts=%u\n",
+@@ -852,7 +881,7 @@
+ 	if (err)
+ 		dev_warn(npu->dev, "Clanker status sysfs unavailable: %d\n", err);
+ 	dev_info(npu->dev,
+-		 "Clanker monitor: sample 10s, summary 30s, /sys/bus/platform/devices/%s/clanker_status; WiFi RX ownership disabled\n",
++		 "Clanker monitor: sample 10s, summary 30s, /sys/bus/platform/devices/%s/clanker_status; RX path is negotiated by mt7915\n",
+ 		 dev_name(npu->dev));
+ 	schedule_delayed_work(&d->work, HZ);
+ }

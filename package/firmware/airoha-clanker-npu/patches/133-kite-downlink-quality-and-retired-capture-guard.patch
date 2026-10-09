@@ -1,0 +1,202 @@
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -9,8 +9,8 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_ABI_VERSION 4u
+-#define KDP_MAGIC 0x4b440004u
++#define KDP_ABI_VERSION 5u
++#define KDP_MAGIC 0x4b440005u
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -111,6 +111,8 @@
+ #define KDP_FLOW_BRIDGE_IPV4 4u
+ #define KDP_FLOW_BRIDGE_IPV6 5u
+ #define KDP_FLOW_BRIDGE_CAPTURE 6u
++/* Last capture owner retired: queued bridge packets must not become routed. */
++#define KDP_FLOW_BRIDGE_GUARD 7u
+ #define KDP_SLOT_NONE 0xffffffffu
+ 
+ /* Host-adaptor record for a PPE bridge-policy miss. The Ethernet frame is
+@@ -187,6 +189,16 @@
+ #define KDP_RX_EARLY_UNSUPPORTED  8u
+ #define KDP_RX_EARLY_NO_BA        9u
+ 
++/* ABI5 appends diagnostics only. All existing DMA offsets stay unchanged.
++ * TX/bridge fields have hart4 as their sole writer; host_hold has hart3. */
++struct kdp_quality_stats {
++	unsigned int gate_drop, disabled_drop, sta_disabled_drop;
++	unsigned int unauthorized_drop, blocked_drop, identity_drop;
++	unsigned int format_drop, control_drop, bridge_parse_fallback;
++	unsigned int bridge_policy_fallback, bridge_retired_drop, host_hold;
++	unsigned int txwi_drop, reserved[3];
++};
++
+ struct kdp_shared {
+ 	unsigned int magic, bytes, session, epoch;
+ 	unsigned int enabled, fault, gate, stopped;
+@@ -204,10 +216,12 @@
+ 	unsigned char txwi[KDP_TOKENS][KDP_TXWI_BYTES];
+ 	unsigned char payload[KDP_TOKENS][KDP_BUFFER_BYTES];
+ 	struct kdp_band_stats stats[2];
++	struct kdp_quality_stats quality[2];
+ };
+ 
+-/* Counter extensions must never move hardware DMA regions. ABI4 rejects
+- * the incompatible ABI3 diagnostic layout, even when mixed by accident. */
++/* ABI5 extends the tail, never the header or DMA regions. Magic and bytes
++ * are both checked so a mixed driver/firmware fails before DMA admission. */
++_Static_assert(sizeof(struct kdp_quality_stats) == 64, "Kite quality cache line");
+ _Static_assert(sizeof(struct kdp_band_stats) == 64, "Kite statistics cache line");
+ _Static_assert(__builtin_offsetof(struct kdp_shared, sta) == 128, "Kite header");
+ _Static_assert(__builtin_offsetof(struct kdp_shared, tdma) % 64 == 0, "Kite TDMA alignment");
+--- a/kite-packet.h
++++ b/kite-packet.h
+@@ -185,7 +185,8 @@
+ 			if (f->src[i] != p->src[i] || f->dst[i] != p->dst[i])
+ 				return 0;
+ 	} else if (f->type != KDP_FLOW_BRIDGE &&
+-		   f->type != KDP_FLOW_BRIDGE_CAPTURE) {
++		   f->type != KDP_FLOW_BRIDGE_CAPTURE &&
++		   f->type != KDP_FLOW_BRIDGE_GUARD) {
+ 		if (f->type != p->type || f->ports != p->ports ||
+ 		    f->protocol != p->protocol)
+ 			return 0;
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -179,17 +179,25 @@
+ 		/* kdp_flow_matches samples version before and after the complete
+ 		 * record. Capture records are deliberately broad, so the helper
+ 		 * checks only MAC/VLAN/domain identity for this type. */
+-		if (f->type == KDP_FLOW_BRIDGE_CAPTURE &&
++		if ((f->type == KDP_FLOW_BRIDGE_CAPTURE ||
++		     f->type == KDP_FLOW_BRIDGE_GUARD) &&
+ 		    kdp_flow_matches(f, packet, s->session,
+ 			sta->generation, sta->key_generation, wcid, band, sta->bss)) {
+-			present = 1;
++			present = f->type == KDP_FLOW_BRIDGE_GUARD ? -1 : 1;
+ 			break;
+ 		}
+ 	}
+ 	if (!present)
+ 		return -1;
+-	if (!parsed)
++	if (present < 0) {
++		s->quality[band].bridge_retired_drop++;
++		return -2;
++	}
++	if (!parsed) {
++		s->quality[band].bridge_parse_fallback++;
++		s->stats[band].reserved[KDP_STAT_BRIDGE_MISS]++;
+ 		return 0;
++	}
+ 	base = kdp_flow_l4_bucket(base, packet->src, packet->dst,
+ 			packet->ports, packet->protocol, packet->type);
+ 	for (i = base; i < base + KDP_FLOW_WAYS; i++)
+@@ -200,6 +208,7 @@
+ 			s->stats[band].reserved[KDP_STAT_BRIDGE_HIT]++;
+ 			return 1;
+ 		}
++	s->quality[band].bridge_policy_fallback++;
+ 	s->stats[band].reserved[KDP_STAT_BRIDGE_MISS]++;
+ 	return 0;
+ }
+@@ -238,8 +247,10 @@
+ 		ret = host_ring_submit(dp_host[b].addr, dp_host[b].len, b,
+ 			dp_host[b].wcid, 0, KDP_HOST_FWD_WIFI_TX,
+ 			dp_host[b].len, 1, KDP_HOST_FALLBACK_PACK(b, dp_host[b].wcid));
+-		if (ret == KITE_HOST_HOLD)
++		if (ret == KITE_HOST_HOLD) {
++			dp->quality[b].host_hold++;
+ 			continue;
++		}
+ 		dp_host[b].result = ret;
+ 		KDP_BARRIER();
+ 		dp_host[b].state = DP_HOST_DONE;
+@@ -341,37 +352,57 @@
+ 	KDP_BARRIER();
+ 	wcid = dp->route[tag & (KDP_ROUTES - 1)].wcid;
+ 	if (!wcid || wcid >= KDP_WCIDS || b != band ||
+-	    len < 14 || len > KDP_BUFFER_BYTES)
++	    len < 14 || len > KDP_BUFFER_BYTES) {
++		dp->quality[band].format_drop++;
+ 		goto drop;
++	}
+ 	if (!dp->enabled || dp->gate) {
++		if (!dp->enabled)
++			dp->quality[band].disabled_drop++;
++		else
++			dp->quality[band].gate_drop++;
+ 		dp->stats[band].reserved[KDP_STAT_TX_ADMISSION_DROP]++;
+ 		goto drop;
+ 	}
+ 	sta = &dp->sta[wcid];
+ 	bss = sta->bss;
+ 	if (sta->tx_blocked || !sta->enabled || !sta->authorized) {
++		if (!sta->enabled)
++			dp->quality[band].sta_disabled_drop++;
++		else if (!sta->authorized)
++			dp->quality[band].unauthorized_drop++;
++		else
++			dp->quality[band].blocked_drop++;
+ 		dp->stats[band].reserved[KDP_STAT_TX_ADMISSION_DROP]++;
+ 		goto drop;
+ 	}
+ 	if (sta->tx_tag != tag || bss > 63 || sta->band != b ||
+ 	    sta->bss != bss || !sta->generation ||
+ 	    (sta->cipher && (sta->cipher != KDP_CIPHER_CCMP ||
+-			    !sta->key_generation)))
++			    !sta->key_generation))) {
++		dp->quality[band].identity_drop++;
+ 		goto drop;
++	}
+ 	for (i = 0; i < 6; i++)
+-		if (dp->payload[token][i] != sta->addr[i])
++		if (dp->payload[token][i] != sta->addr[i]) {
++			dp->quality[band].identity_drop++;
+ 			goto drop;
++		}
+ 	/* A bound bridge rule may also deliver ARP or TCP control packets.
+ 	 * Ethernet II frames use the same normal TXD; only the QoS classifier
+ 	 * needs an IP header. Local EAPOL remains exclusively host generated. */
+ 	if (kdp_be16((const void *)(dp->payload[token] + 12)) < 0x600 ||
+-	    kdp_be16((const void *)(dp->payload[token] + 12)) == 0x888e)
++	    kdp_be16((const void *)(dp->payload[token] + 12)) == 0x888e) {
++		dp->quality[band].control_drop++;
+ 		goto drop;
++	}
+ 	npu_memset(&packet, 0, sizeof(packet));
+ 	packet.vlan = KDP_SLOT_NONE;
+ 	{
+ 		int parsed = kdp_parse_packet((const void *)dp->payload[token], len, &packet);
+ 		int policy = dp_bridge_policy(dp, sta, &packet, parsed, wcid, band);
++		if (policy == -2)
++			goto drop;
+ 		if (policy == 0) {
+ 			dp_host_bridge_fallback(band, token, addr, len, wcid, sta);
+ 			return 0;
+@@ -395,6 +426,7 @@
+ 			 band, bss, sta->omac, sta->wmm,
+ 			 kdp_sta_tid(sta, &packet), !!sta->cipher,
+ 			 sta->wme, sta->amsdu)) {
++		dp->quality[band].txwi_drop++;
+ 		dp->token[replacement].state = KDP_TOKEN_FREE;
+ 		goto drop;
+ 	}
+--- a/npu_kite_secure_rx.c
++++ b/npu_kite_secure_rx.c
+@@ -48,7 +48,11 @@
+ 				  key.protocol, key.type);
+ 	for (pass = 0; pass < 2; pass++) {
+ 		for (i = bucket; i < bucket + KDP_FLOW_WAYS; i++)
+-			if (kdp_flow_matches(&s->flow[i], &key, s->session,
++			/* Downlink capture/deny records never authorize RX ingress. */
++			if ((s->flow[i].type == KDP_FLOW_IPV4 ||
++			     s->flow[i].type == KDP_FLOW_IPV6 ||
++			     s->flow[i].type == KDP_FLOW_BRIDGE) &&
++			    kdp_flow_matches(&s->flow[i], &key, s->session,
+ 					r->generation, r->key_generation, r->wcid,
+ 					r->band, r->bss))
+ 				return 1;

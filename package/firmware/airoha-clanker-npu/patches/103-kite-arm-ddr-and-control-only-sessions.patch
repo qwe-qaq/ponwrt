@@ -1,0 +1,140 @@
+--- a/kite-control.h
++++ b/kite-control.h
+@@ -6,7 +6,7 @@
+  * are little endian. SET33/GET33 carry exactly 64 bytes after WLAN header.
+  * A mailbox DONE acknowledges delivery; GET33 reports the command result.
+  */
+-#define KITE_CTL_MAGIC 0x4b430001u
++#define KITE_CTL_MAGIC 0x4b430002u
+ #define KITE_CTL_WORDS 16u
+ #define KITE_CTL_WCIDS 544u
+ #define KITE_CTL_TIDS 8u
+@@ -20,14 +20,33 @@
+ #define KITE_CTL_CAP_GENERATION 2u
+ #define KITE_CTL_CAP_PARK 4u
+ #define KITE_CTL_CAP_KEY_FENCE 8u
+-#define KITE_CTL_CAPS 15u
++#define KITE_CTL_CAP_CONTROL_ONLY 16u
++#define KITE_CTL_CAP_ARM_PA 32u
++#define KITE_CTL_CAPS 63u
++#define KITE_CTL_MODE_DATA 0u
++#define KITE_CTL_MODE_CONTROL_ONLY 1u
++
++/* ARM physical DDR: 0x80000000..0xbfffffff. Never accept a bare
++ * offset or the NPU uncached alias as an ARM address. No wrap allowed. */
++static inline int kite_ctl_pool_valid(unsigned long long addr,
++				      unsigned long long size)
++{
++	return addr >= 0x80000000ull && addr < 0xc0000000ull &&
++	       !(addr & 4095) && size == 0x200000 &&
++	       size <= 0xc0000000ull - addr;
++}
++
++static inline unsigned int kite_ctl_pool_alias(unsigned int addr)
++{
++	return (addr & 0x3fffffffu) | 0x40000000u;
++}
+ #define KITE_CTL_WORKERS 0x0eu /* AN7581 MT7916 harts 1, 2, 3 */
+ 
+ /* Request words: magic, words, command, session, serial, then args.
+  * All unused words must be zero. Session and serial never wrap.
+  */
+ enum kite_ctl_op {
+-	KITE_CTL_OPEN = 1, /* new session; arg0=BA DRAM address, arg1=size */
++	KITE_CTL_OPEN = 1, /* new session; arg0=ARM BA physical address, arg1=size, arg2=mode */
+ 	KITE_CTL_PARK, /* async cooperative park; no DMA drain claim */
+ 	KITE_CTL_RESUME,
+ 	KITE_CTL_STA_ADD, /* wcid, generation, band, bss */
+@@ -53,7 +72,9 @@
+ };
+ /* Reply: magic, words, capabilities, session, last serial, result, state,
+  * ack mask, WCID count, required DRAM bytes, accepted commands, rejected
+- * commands, live STAs, active BA sessions, key fences, reserved zero.
++ * commands, live STAs, active BA sessions, key fences, OPEN mode.
++ * CONTROL_ONLY cannot initialize/enable RX rings or classify packets.
++ * MODE_DATA remains development-only: GET31 ownership capabilities are 0.
+  */
+ 
+ #ifndef __KERNEL__
+--- a/npu_kite_control.c
++++ b/npu_kite_control.c
+@@ -21,7 +21,7 @@
+ _Static_assert(sizeof(struct kite_ctl_sta) == 32, "STA storage ABI");
+ 
+ static struct {
+-	u32 session, serial, result, base;
++	u32 session, serial, result, base, mode;
+ 	volatile u32 park_cookie;
+ 	u32 accepted, rejected, stations, bas, keys;
+ 	u32 last[KITE_CTL_WORDS];
+@@ -85,7 +85,8 @@
+ {
+ 	int ready;
+ 
+-	if (!kite_ctl_parked() || band > 1)
++	if (ctl.mode == KITE_CTL_MODE_CONTROL_ONLY ||
++	    !kite_ctl_parked() || band > 1)
+ 		return 0;
+ 	ready = band ? rxd_5g_init_done : rxd_2g_init_done;
+ 	return ((cmd == 0 || cmd == 1) && !ready) || (cmd == 13 && ready);
+@@ -118,7 +119,8 @@
+ 	sta = kite_ctl_sta(wcid);
+ 	/* Protected-frame replay remains host-owned. KEY records fencing
+ 	 * state, not a promise that NPU PN validation has been implemented. */
+-	return sta->bss == bss && sta->authorized && !sta->cipher;
++	return ctl.mode == KITE_CTL_MODE_DATA &&
++	       sta->bss == bss && sta->authorized && !sta->cipher;
+ }
+ 
+ static void kite_ctl_discard(u32 wcid)
+@@ -155,11 +157,12 @@
+ 		/* The DRAM pool must already be installed through SET7. It is
+ 		 * owned by the NPU driver until CLOSE, never an arbitrary pointer.
+ 		 * Only the documented 2 MiB pool is accepted. */
+-		if (!wcid || (wcid & 4095) || gen != 0x200000 ||
+-		    wcid >= 0x40000000u || gen > 0x40000000u - wcid ||
++		if (!kite_ctl_pool_valid(wcid, gen) ||
++		    d[7] > KITE_CTL_MODE_CONTROL_ONLY ||
+ 		    !wifi_dram_ba_node_addr ||
+-		    ((wifi_dram_ba_node_addr & 0x3fffffffu) != wcid))
+-			return KITE_CTL_INVALID;
++		    wifi_dram_ba_node_addr != kite_ctl_pool_alias(wcid))
++			return KITE_CTL_INVALID;
++		ctl.mode = d[7];
+ 		ctl.base = wifi_dram_ba_node_addr + KITE_CTL_BA_OFFSET;
+ 		npu_memset((void *)ctl.base, 0, KITE_CTL_STORAGE_BYTES);
+ 		ctl.session = d[3];
+@@ -197,6 +200,7 @@
+ 			kite_ctl_discard(i);
+ 		ctl.stations = 0;
+ 		ctl.base = 0;
++		ctl.mode = KITE_CTL_MODE_DATA;
+ 		ctl_fence();
+ 		ctl.state = KITE_CTL_CLOSED;
+ 		return KITE_CTL_OK;
+@@ -207,7 +211,7 @@
+ 	if (op == KITE_CTL_STA_ADD) {
+ 		if (sta->live || gen <= sta->generation)
+ 			return KITE_CTL_STALE;
+-		if (d[7] > 1 || d[8] > 15)
++		if (d[7] > 1 || d[8] > 63)
+ 			return KITE_CTL_INVALID;
+ 		kite_ctl_discard(wcid);
+ 		npu_memset(sta, 0, sizeof(*sta));
+@@ -284,7 +288,7 @@
+ 	    d[0] != KITE_CTL_MAGIC || d[1] != KITE_CTL_WORDS ||
+ 	    d[2] < KITE_CTL_OPEN || d[2] > KITE_CTL_CLOSE)
+ 		return 0;
+-	used = d[2] == KITE_CTL_OPEN || d[2] == KITE_CTL_STA_DEL ? 7 :
++	used = d[2] == KITE_CTL_OPEN ? 8 : d[2] == KITE_CTL_STA_DEL ? 7 :
+ 	       d[2] == KITE_CTL_STA_ADD ? 9 : d[2] == KITE_CTL_PORT ? 8 :
+ 	       d[2] == KITE_CTL_KEY || d[2] == KITE_CTL_BA ? 10 : 5;
+ 	for (i = used; i < KITE_CTL_WORDS; i++)
+@@ -344,6 +348,7 @@
+ 	d[12] = ctl.stations;
+ 	d[13] = ctl.bas;
+ 	d[14] = ctl.keys;
++	d[15] = ctl.mode;
+ 	return 1;
+ }
+ #endif

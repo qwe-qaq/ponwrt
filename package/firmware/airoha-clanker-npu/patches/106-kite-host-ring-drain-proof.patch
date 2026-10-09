@@ -1,0 +1,64 @@
+--- a/npu_hostadpt.c	2026-09-30 08:00:46.886663186 +0800
++++ b/npu_hostadpt.c	2026-09-30 08:00:46.886757865 +0800
+@@ -30,6 +30,30 @@
+ 	return kite_host_bands;
+ }
+ 
++/* The producer index alone cannot prove that Linux consumed descriptors
++ * already published to the ARM.  The own bit is written last by the
++ * producer and cleared by the host RX poller, so scan both bound rings
++ * before acknowledging a data stop. */
++int kite_host_dma_rings_empty(void)
++{
++	u32 band, i, base;
++
++	if (!kite_host_bands)
++		return 1;
++	for (band = 0; band < 2; band++) {
++		if (!(kite_host_bands & (1u << band)))
++			continue;
++		base = band ? hostadpt_rx_ring_base : hostadpt_tx_ring_base;
++		if (!base)
++			return 0;
++		for (i = 0; i < KITE_HOST_RING_COUNT; i++)
++			if (*(volatile u32 *)(base + i * 24) & 1)
++				return 0;
++	}
++	__asm__ volatile("fence iorw,iorw" ::: "memory");
++	return kite_host_dma_idle();
++}
++
+ /* Core 0 calls only after fresh ACKs from all three workers. Ring MMIO
+  * pointers are not authority: explicit session/serial binds the bases. */
+ int kite_host_bind(u32 session, u32 epoch, u32 bandmask, u32 pa0, u32 pa1)
+--- a/npu_wifi_fwd.c	2026-09-30 08:00:46.886935306 +0800
++++ b/npu_wifi_fwd.c	2026-09-30 08:00:46.887004442 +0800
+@@ -389,7 +389,7 @@
+ 			if (pipeline[i * 2] != (u32)-1)
+ 				return 0;
+ 	}
+-	return 1;
++	return kite_host_dma_rings_empty();
+ }
+ 
+ int kite_wifi_ba_empty(void)
+--- a/kite-host.h	2026-09-30 08:00:46.887131207 +0800
++++ b/kite-host.h	2026-09-30 08:00:46.887199076 +0800
+@@ -24,6 +24,7 @@
+ int kite_host_unbind(u32 session, u32 epoch);
+ u32 kite_host_bound(void);
+ void kite_host_snapshot(u32 *out);
++int kite_host_dma_rings_empty(void);
+ int kite_host_rings_empty(void);
+ int kite_host_stop_ready(void);
+ int kite_host_prepare_recover(void);
+--- a/kite-host.h	2026-09-30 08:01:20.222925385 +0800
++++ b/kite-host.h	2026-09-30 08:01:20.223277224 +0800
+@@ -30,6 +30,7 @@
+ int kite_host_prepare_recover(void);
+ #else
+ static inline int kite_host_faulted(void) { return 0; }
++static inline int kite_host_dma_rings_empty(void) { return 1; }
+ static inline int kite_host_stop_ready(void) { return 1; }
+ #endif
+ #endif

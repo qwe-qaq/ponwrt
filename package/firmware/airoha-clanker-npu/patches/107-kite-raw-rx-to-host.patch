@@ -1,0 +1,15 @@
+--- a/npu_wifi_rx.c	2026-09-30 07:59:53.272948481 +0800
++++ b/npu_wifi_rx.c	2026-09-30 07:59:53.273043083 +0800
+@@ -90,6 +90,12 @@
+ #if defined(AN7581) && defined(MT7916)
+ 	struct kite_rxd rx;
+ 
++	/* First data-lifecycle round deliberately hands every frame to Linux.
++	 * The host remains the sole owner of BA/reorder, PN and security
++	 * decisions; NPU only moves the RX buffer through the host ring. */
++	if (kite_ctl_active())
++		return -1;
++
+ 	if (kite_parse_mt7916((const u8 *)wifi_pkt_va(buf_id), len, band, &rx) ||
+ 	    (!kite_ctl_active() &&
+ 	     !kite_legacy_wcid_valid(rx.wcid, wifi_dbdc_mode)))

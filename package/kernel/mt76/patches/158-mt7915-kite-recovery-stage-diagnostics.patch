@@ -1,0 +1,218 @@
+Subject: mt7915: add Kite recovery stage diagnostics
+
+Record the radio intents, Kite ownership state, each stop transaction and
+full-reset attempt.  A radio can be held disabled after an ownership proof
+failure; these messages distinguish a transient firmware restart failure from
+an unproven DMA stop without changing the ownership contract.
+
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1544,6 +1544,7 @@
+ 	struct mt76_phy *ext_phy;
+ 	struct mt76_dev *mdev = &dev->mt76;
+ 	bool run_main = false, run_ext = false;
++	const char *stage = "begin";
+ 	int ret;
+ 
+ 	ext_phy = dev->mt76.phys[MT_BAND1];
+@@ -1552,6 +1553,11 @@
+ 	run_ext = ext_phy &&
+ 		  test_and_clear_bit(MT76_STATE_RUNNING, &ext_phy->state);
+ 
++	dev_info(dev->mt76.dev,
++		 "Kite recovery restart begin: run_main=%u run_ext=%u tx_bound=%u dp_bound=%u quarantine=%u failed=%u\n",
++		 run_main, run_ext, dev->kite.tx_bound, dev->kite.dp_bound,
++		 dev->mt76.npu_quarantine, dev->recovery.failed);
++
+ 	if (dev->hif2) {
+ 		mt76_wr(dev, MT_INT1_MASK_CSR, 0x0);
+ 		mt76_wr(dev, MT_INT1_SOURCE_CSR, ~0);
+@@ -1586,8 +1592,14 @@
+ 		mdev->tx_napi_disabled = true;
+ 	}
+ 
++	stage = "dma_reset";
++	dev_info(dev->mt76.dev, "Kite recovery stage=%s begin\n", stage);
+ 	ret = mt7915_dma_reset(dev, true);
+ 	if (ret) {
++		dev_err(dev->mt76.dev,
++			"Kite recovery stage=%s failed ret=%d tx_bound=%u dp_bound=%u quarantine=%u\n",
++			stage, ret, dev->kite.tx_bound, dev->kite.dp_bound,
++			dev->mt76.npu_quarantine);
+ 		if (run_main)
+ 			set_bit(MT76_STATE_RUNNING, &dev->mphy.state);
+ 		if (run_ext && ext_phy)
+@@ -1625,35 +1637,46 @@
+ 	}
+ 
+ 	/* load firmware */
++	stage = "mcu_init_firmware";
+ 	ret = mt7915_mcu_init_firmware(dev);
+ 	if (ret)
+ 		goto out;
+ 
+ 	/* set the necessary init items */
++	stage = "mcu_set_eeprom";
+ 	ret = mt7915_mcu_set_eeprom(dev);
+ 	if (ret)
+ 		goto out;
+ 
++	stage = "mac_init";
+ 	mt7915_mac_init(dev);
+ 	mt7915_init_txpower(&dev->phy);
+ 	mt7915_init_txpower(phy2);
++	stage = "txbf_init";
+ 	ret = mt7915_txbf_init(dev);
+ 	if (ret)
+ 		goto out;
+ 
+ 	if (run_main) {
++		stage = "run_main";
+ 		ret = mt7915_run(dev->mphy.hw);
+ 		if (ret)
+ 			goto out;
+ 	}
+ 
+ 	if (run_ext) {
++		stage = "run_ext";
+ 		ret = mt7915_run(ext_phy->hw);
+ 		if (ret)
+ 			goto out;
+ 	}
+ 
+ out:
++	if (ret)
++		dev_err(dev->mt76.dev,
++			"Kite recovery restart stage=%s ret=%d active=%u tx_bound=%u dp_bound=%u quarantine=%u failed=%u\n",
++			stage, ret, mt76_npu_device_active(mdev), dev->kite.tx_bound,
++			dev->kite.dp_bound, dev->mt76.npu_quarantine, dev->recovery.failed);
+ 	if (ret && !mt76_npu_device_active(mdev)) {
+ 		if (run_main)
+ 			set_bit(MT76_STATE_RUNNING, &dev->mphy.state);
+@@ -1693,6 +1716,9 @@
+ 
+ 	mt76_worker_enable(&dev->mt76.tx_worker);
+ 
++	if (!ret)
++		dev_info(dev->mt76.dev, "Kite recovery restart complete: run_main=%u run_ext=%u\n",
++			run_main, run_ext);
+ 	return ret;
+ }
+ 
+@@ -1722,7 +1748,15 @@
+ 
+ 	mutex_lock(&dev->mt76.mutex);
+ 	for (i = 0; i < 10; i++) {
++		dev_info(dev->mt76.dev,
++			"Kite full reset attempt=%d/10 quarantine=%u failed=%u tx_bound=%u dp_bound=%u\n",
++			i + 1, dev->mt76.npu_quarantine, dev->recovery.failed,
++			dev->kite.tx_bound, dev->kite.dp_bound);
+ 		ret = mt7915_mac_restart(dev);
++		dev_info(dev->mt76.dev,
++			"Kite full reset attempt=%d/10 result=%d quarantine=%u failed=%u tx_bound=%u dp_bound=%u\n",
++			i + 1, ret, dev->mt76.npu_quarantine, dev->recovery.failed,
++			dev->kite.tx_bound, dev->kite.dp_bound);
+ 		if (!ret || dev->recovery.failed)
+ 			break;
+ 	}
+@@ -1730,7 +1764,9 @@
+ 	if (ret) {
+ 		dev->recovery.failed = true;
+ 		dev_err(dev->mt76.dev,
+-			"chip full reset failed: %d; queues held, reboot required\n", ret);
++			"chip full reset failed after %d attempts: %d; queues held, reboot required; quarantine=%u tx_bound=%u dp_bound=%u\n",
++			i + 1, ret, dev->mt76.npu_quarantine, dev->kite.tx_bound,
++			dev->kite.dp_bound);
+ 		mutex_unlock(&dev->mt76.mutex);
+ 		return ret;
+ 	}
+
+--- a/mt7915/dma.c
++++ b/mt7915/dma.c
+@@ -667,10 +667,18 @@
+ 	if (dev->mt76.npu_quarantine)
+ 		dev_info(dev->mt76.dev,
+ 			 "retrying Kite DMA stop after a previous unproven attempt\n");
++	dev_info(dev->mt76.dev,
++		"Kite DMA quiesce begin: tx_bound=%u dp_bound=%u quarantine=%u\n",
++		dev->kite.tx_bound, dev->kite.dp_bound, dev->mt76.npu_quarantine);
+ 	mt76_npu_disable_irqs(&dev->mt76);
+ 	ret = -EIO;
+ 	for (attempt = 0; attempt < 3; attempt++) {
++		dev_info(dev->mt76.dev, "Kite DMA quiesce TX_HALT attempt=%d/3\n", attempt + 1);
+ 		ret = mt7915_npu_tx_halt(dev);
++		if (ret)
++			dev_info(dev->mt76.dev,
++				"Kite DMA quiesce TX_HALT attempt=%d/3 ret=%d tx_bound=%u dp_bound=%u\n",
++				attempt + 1, ret, dev->kite.tx_bound, dev->kite.dp_bound);
+ 		if (!ret)
+ 			break;
+ 		/* A failed proof never releases ownership. Give a firmware
+@@ -685,7 +693,12 @@
+ 		ret = mt7915_dma_disable(dev, false);
+ 	if (!ret) {
+ 		for (attempt = 0; attempt < 3; attempt++) {
++			dev_info(dev->mt76.dev, "Kite DMA quiesce DATA_STOP attempt=%d/3\n", attempt + 1);
+ 			ret = mt7915_npu_data_stop(dev);
++			if (ret)
++				dev_info(dev->mt76.dev,
++					"Kite DMA quiesce DATA_STOP attempt=%d/3 ret=%d tx_bound=%u dp_bound=%u\n",
++					attempt + 1, ret, dev->kite.tx_bound, dev->kite.dp_bound);
+ 			if (!ret)
+ 				break;
+ 			if (!mt76_npu_device_active(&dev->mt76) ||
+@@ -698,8 +711,12 @@
+ 		if (mt76_npu_device_active(&dev->mt76))
+ 			dev->mt76.npu_quarantine = true;
+ 		dev_err(dev->mt76.dev,
+-			"DMA stop failed: %d; TX tokens and RX buffers retained\n", ret);
++			"Kite DMA quiesce failed: %d; TX tokens and RX buffers retained; tx_bound=%u dp_bound=%u quarantine=%u\n",
++			ret, dev->kite.tx_bound, dev->kite.dp_bound, dev->mt76.npu_quarantine);
+ 	} else {
++		dev_info(dev->mt76.dev,
++			"Kite DMA quiesce complete: tx_bound=%u dp_bound=%u\n",
++			dev->kite.tx_bound, dev->kite.dp_bound);
+ 		/* DATA_STOP/host-unbind is the ownership proof that permits a
+ 		 * subsequent ring reset. */
+ 		dev->mt76.npu_quarantine = false;
+
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -973,11 +973,17 @@
+ 	int ret, b;
+ 	if (!dev->kite.tx_bound)
+ 		return 0;
++	dev_info(dev->mt76.dev,
++		"Kite TX halt begin: session=%u failed=%u dp_attached=%u dp_bound=%u\n",
++		dev->kite.session, dev->kite.failed, dev->kite.dp_attached,
++		dev->kite.dp_bound);
+ 	if (dev->kite.dp_attached) {
+ 		dev->kite.dp_changing = true;
+ 		ret = airoha_kite_detach(rcu_access_pointer(dev->mt76.mmio.ppe_dev));
+-		if (ret)
++		if (ret) {
++			dev_err(dev->mt76.dev, "Kite TX halt stage=dp_detach ret=%d\n", ret);
+ 			return ret;
++		}
+ 		dev->kite.dp_attached = false;
+ 	}
+ 	mt7915_kite_tx_gate(dev, true);
+@@ -1040,8 +1046,17 @@
+ 				ret = mt7915_kite_command(dev, KITE_CTL_RESUME, NULL, 0);
+ 		}
+ 	}
+-	if (ret)
++	if (ret) {
++		dev_err(dev->mt76.dev,
++			"Kite TX halt failed: ret=%d session=%u tx_bound=%u dp_bound=%u failed=%u\n",
++			ret, dev->kite.session, dev->kite.tx_bound, dev->kite.dp_bound,
++			dev->kite.failed);
+ 		mt7915_kite_fault(dev, ret);
++	} else {
++		dev_info(dev->mt76.dev,
++			"Kite TX halt complete: stopped=%u tx_bound=%u dp_bound=%u\n",
++			stopped, dev->kite.tx_bound, dev->kite.dp_bound);
++	}
+ 	mutex_unlock(&dev->kite.lock);
+ 	return ret;
+ }

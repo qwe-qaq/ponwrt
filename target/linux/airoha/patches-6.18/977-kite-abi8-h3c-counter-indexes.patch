@@ -1,0 +1,21 @@
+--- a/include/linux/soc/airoha/kite-datapath.h
++++ b/include/linux/soc/airoha/kite-datapath.h
+@@ -224,6 +224,18 @@ struct kdp_perf_band {
+ 	unsigned int hint_miss, tx_amsdu, tx_single, retry;
+ 	unsigned int reserved[8];
+ };
++/* ABI8 performance tail. These words were reserved in r55 and therefore do
++ * not move any shared/DMA field. Hart4 is the only writer; ARM reads them as
++ * a cumulative snapshot. The counters mirror the useful H3C stages without
++ * importing its descriptor or host ABI. */
++#define KDP_PERF_TDMA_READY   0u
++#define KDP_PERF_TDMA_EMPTY   1u
++#define KDP_PERF_TDMA_REARM   2u
++#define KDP_PERF_TX_RING_FULL 3u
++#define KDP_PERF_TX_PUBLISH   4u
++#define KDP_PERF_DMA_DONE     5u
++#define KDP_PERF_TX_READY     6u
++#define KDP_PERF_FALLBACK_HOLD 7u
+ /* A-MSDU publication is one aligned word: peer max length and BA TID mask.
+  * No key/PN or authorization is granted by this optional TX capability. */
+ static inline unsigned int kdp_amsdu_contract(unsigned int enabled,

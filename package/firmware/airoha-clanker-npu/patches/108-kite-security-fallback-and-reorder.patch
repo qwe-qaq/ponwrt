@@ -1,0 +1,368 @@
+--- a/kite-control.h
++++ b/kite-control.h
+@@ -22,11 +22,17 @@
+ #define KITE_CTL_CAP_KEY_FENCE 8u
+ #define KITE_CTL_CAP_CONTROL_ONLY 16u
+ #define KITE_CTL_CAP_ARM_PA 32u
+-#define KITE_CTL_CAPS 63u
+ #define KITE_CTL_CAP_HOST_RING 64u /* optional explicit bind/unbind, not DMA ownership */
+ #define KITE_CTL_CAP_DATA_LIFECYCLE 128u
++#define KITE_CTL_CAP_SECURITY_FALLBACK 256u
++#define KITE_CTL_CAP_RX_REORDER 512u /* candidate only; PN remains host-owned */
++#define KITE_CTL_CAP_META 1024u
++#define KITE_CTL_CAPS 2047u
+ #define KITE_CTL_MODE_DATA 0u
+ #define KITE_CTL_MODE_CONTROL_ONLY 1u
++#define KITE_CTL_MODE_DATA_REORDER 2u
++#define KITE_CTL_DATA_MODE(m) ((m) == KITE_CTL_MODE_DATA || \
++				    (m) == KITE_CTL_MODE_DATA_REORDER)
+ 
+ /* ARM physical DDR: 0x80000000..0xbfffffff. Never accept a bare
+  * offset or the NPU uncached alias as an ARM address. No wrap allowed. */
+@@ -95,6 +101,8 @@
+ u32 kite_ctl_ba_address(u32 band, u32 wcid, u32 tid);
+ int kite_ctl_active(void);
+ int kite_ctl_sta_matches(u32 band, u32 wcid, u32 bss);
++int kite_ctl_rx_meta(u32 band, u32 wcid, u32 bss, u32 *generation,
++			    u32 *key_generation);
+ int kite_ctl_rx_held(void);
+ int kite_ctl_legacy_setup(u32 cmd, u32 band);
+ void ba_discard_entry(u32 *entry);
+--- a/kite-host.h
++++ b/kite-host.h
+@@ -9,6 +9,28 @@
+ #define KITE_HOST_RING_COUNT 512u
+ #define KITE_HOST_RING_BYTES (KITE_HOST_RING_COUNT * 24u)
+ 
++/* word2 of a Kite host descriptor is an explicit security/fallback record.
++ * It is advisory metadata: Linux remains the PN, authorization and firewall
++ * authority.  The generation is truncated only for diagnostics; a reordered
++ * record is accepted by Linux only after it matches its current full epoch. */
++#define KITE_HOST_META_MAGIC 0xA5u
++#define KITE_HOST_META_REORDERED 0x1u /* bit 0 of the packed flags nibble */
++#define KITE_HOST_META_RAW 0x01u
++#define KITE_HOST_META_ENCRYPTED 0x02u
++#define KITE_HOST_META_UNAUTHORIZED 0x03u
++#define KITE_HOST_META_MALFORMED 0x04u
++#define KITE_HOST_META_AMSDU 0x05u
++#define KITE_HOST_META_FRAGMENT 0x06u
++#define KITE_HOST_META_UNKNOWN 0x0fu
++#define KITE_HOST_CLASSIFY_REORDERED (-3)
++#define KITE_HOST_META_PACK(gen, flags, reason) \
++	((KITE_HOST_META_MAGIC << 24) | (((gen) & 0xffffu) << 8) | \
++	 (((flags) & 0xfu) << 4) | ((reason) & 0xfu))
++#define KITE_HOST_META_VALID(v) (((v) >> 24) == KITE_HOST_META_MAGIC)
++#define KITE_HOST_META_GENERATION(v) (((v) >> 8) & 0xffffu)
++#define KITE_HOST_META_FLAGS(v) (((v) >> 4) & 0xfu)
++#define KITE_HOST_META_REASON(v) ((v) & 0xfu)
++
+ static inline int kite_host_ring_valid(unsigned long long addr)
+ {
+ 	return addr >= 0x80000000ull && addr < 0xc0000000ull &&
+--- a/npu_kite_control.c
++++ b/npu_kite_control.c
+@@ -23,6 +23,7 @@
+ 
+ static struct {
+ 	u32 session, serial, result, base, mode;
++	u32 reorder;
+ 	volatile u32 park_cookie;
+ 	u32 accepted, rejected, stations, bas, keys;
+ 	u32 last[KITE_CTL_WORDS];
+@@ -153,8 +154,25 @@
+ 	sta = kite_ctl_sta(wcid);
+ 	/* Protected-frame replay remains host-owned. KEY records fencing
+ 	 * state, not a promise that NPU PN validation has been implemented. */
+-	return ctl.mode == KITE_CTL_MODE_DATA &&
+-	       sta->bss == bss && sta->authorized && !sta->cipher;
++	return ctl.mode == KITE_CTL_MODE_DATA_REORDER && ctl.reorder &&
++	       sta->generation <= 0xffffu && sta->bss == bss &&
++	       sta->authorized && !sta->cipher;
++}
++
++int kite_ctl_rx_meta(u32 band, u32 wcid, u32 bss, u32 *generation,
++			    u32 *key_generation)
++{
++	struct kite_ctl_sta *sta;
++
++	if (!generation || !key_generation || !kite_ctl_active() ||
++	    band > 1 || !wcid || wcid >= KITE_CTL_WCIDS)
++		return 0;
++	sta = kite_ctl_sta(wcid);
++	if (!sta->live || sta->band != band || sta->bss != bss)
++		return 0;
++	*generation = sta->generation;
++	*key_generation = sta->key_generation;
++	return 1;
+ }
+ 
+ static void kite_ctl_discard(u32 wcid)
+@@ -194,11 +212,12 @@
+ 		 * owned by the NPU driver until CLOSE, never an arbitrary pointer.
+ 		 * Only the documented 2 MiB pool is accepted. */
+ 		if (!kite_ctl_pool_valid(wcid, gen) ||
+-		    d[7] > KITE_CTL_MODE_CONTROL_ONLY ||
++		    d[7] > KITE_CTL_MODE_DATA_REORDER ||
+ 		    !wifi_dram_ba_node_addr ||
+ 		    wifi_dram_ba_node_addr != kite_ctl_pool_alias(wcid))
+ 			return KITE_CTL_INVALID;
+ 		ctl.mode = d[7];
++		ctl.reorder = d[7] == KITE_CTL_MODE_DATA_REORDER;
+ 		ctl.base = wifi_dram_ba_node_addr + KITE_CTL_BA_OFFSET;
+ 		npu_memset((void *)ctl.base, 0, KITE_CTL_STORAGE_BYTES);
+ 		ctl.session = d[3];
+@@ -224,7 +243,7 @@
+ 		return KITE_CTL_OK;
+ 	}
+ 	if (op == KITE_CTL_DATA_STOP) {
+-		if (ctl.mode != KITE_CTL_MODE_DATA || kite_host_faulted() ||
++		if (!KITE_CTL_DATA_MODE(ctl.mode) || kite_host_faulted() ||
+ 		    !kite_host_bound() || ctl.state != KITE_CTL_RUNNING)
+ 			return KITE_CTL_BUSY;
+ 		ctl.stop_requested = 1;
+@@ -236,7 +255,7 @@
+ 		return KITE_CTL_OK;
+ 	}
+ 	if (op == KITE_CTL_DATA_RECOVER) {
+-		if (ctl.mode != KITE_CTL_MODE_DATA || ctl.state != KITE_CTL_STOPPED ||
++		if (!KITE_CTL_DATA_MODE(ctl.mode) || ctl.state != KITE_CTL_STOPPED ||
+ 		    kite_host_bound() || !kite_host_prepare_recover())
+ 			return KITE_CTL_BUSY;
+ 		if (!kite_wifi_prepare_recover())
+@@ -255,7 +274,7 @@
+ 		u32 ba = (wifi_dram_ba_node_addr & 0x3fffffff) | 0x80000000;
+ 		u32 bands = d[7];
+ 
+-		if (ctl.mode != KITE_CTL_MODE_DATA || kite_ctl_rings_live() ||
++		if (!KITE_CTL_DATA_MODE(ctl.mode) || kite_ctl_rings_live() ||
+ 		    kite_host_bound())
+ 			return KITE_CTL_BUSY;
+ 		if ((bands != 1 && bands != 3) || d[8] != KITE_HOST_RING_COUNT ||
+@@ -269,13 +288,13 @@
+ 			KITE_CTL_OK : KITE_CTL_INVALID;
+ 	}
+ 	if (op == KITE_CTL_HOST_UNBIND) {
+-		if (ctl.mode != KITE_CTL_MODE_DATA)
++		if (!KITE_CTL_DATA_MODE(ctl.mode))
+ 			return KITE_CTL_BUSY;
+ 		return kite_host_unbind(ctl.session, d[5]) ? KITE_CTL_OK : KITE_CTL_STALE;
+ 	}
+ 	if (op == KITE_CTL_RESUME) {
+ 		if (ctl.state != KITE_CTL_PARKED || ctl.stop_requested ||
+-		    (ctl.mode == KITE_CTL_MODE_DATA && kite_ctl_rings_live() &&
++		    (KITE_CTL_DATA_MODE(ctl.mode) && kite_ctl_rings_live() &&
+ 		    !kite_host_bound())
+ 		    )
+ 			return KITE_CTL_BUSY;
+@@ -283,7 +302,11 @@
+ 		ctl.state = KITE_CTL_RUNNING;
+ 		return KITE_CTL_OK;
+ 	}
+-	if (op != KITE_CTL_BA && kite_ctl_rings_live())
++	/* PARK has stopped all NPU consumers.  STA/key/port updates are then
++	 * safe to publish even while the Wi-Fi DMA rings remain allocated: each
++	 * parsed frame carries a generation fence and stale frames fall back to
++	 * Linux.  CLOSE still requires the explicit DATA_STOP drain below. */
++	if (op == KITE_CTL_CLOSE && kite_ctl_rings_live())
+ 		return KITE_CTL_BUSY;
+ 	if (op == KITE_CTL_CLOSE) {
+ 		if (kite_host_bound())
+@@ -293,6 +316,7 @@
+ 		ctl.stations = 0;
+ 		ctl.base = 0;
+ 		ctl.mode = KITE_CTL_MODE_DATA;
++		ctl.reorder = 0;
+ 		ctl.stop_requested = 0;
+ 		ctl_fence();
+ 		ctl.state = KITE_CTL_CLOSED;
+--- a/npu_wifi_ba.c
++++ b/npu_wifi_ba.c
+@@ -5,6 +5,7 @@
+ 
+ #include "npu_internal.h"
+ #include "npu_wifi.h"
++#include "kite-host.h"
+ #include "kite_rxd.h"
+ 
+ #ifdef WIFI_KITE
+@@ -91,7 +92,7 @@
+ 	 * any packet may bypass mac80211/bridge/firewall policy. */
+ 	if (kite_ctl_active()) {
+ 		ret = pkt_forward((s16)buf_id, pkt_len, 0, 0, band, 2,
+-				  pkt_len, 0, 0);
++				  pkt_len, KITE_HOST_CLASSIFY_REORDERED, 0);
+ 		if (ret != 0)
+ 			buf_id_free(0, band, buf_id);
+ 		return ret;
+--- a/npu_wifi_fwd.c
++++ b/npu_wifi_fwd.c
+@@ -7,6 +7,7 @@
+ #include "npu_wifi.h"
+ #include "kite-control.h"
+ #include "kite-host.h"
++#include "kite_rxd.h"
+ 
+ 
+ /* per-band per-queue stats: 16 queues x u64 */
+@@ -17,6 +18,40 @@
+ 
+ #ifdef WIFI_KITE
+ 
++/* Build a bounded, non-authoritative security record for every data frame
++ * handed to Linux.  A zero/invalid record always means host fallback; it can
++ * never grant PN or firewall authority. */
++static u32 kite_host_rx_meta(u32 buf_id, u32 len, u32 band, u16 *wcid,
++				     u8 *amsdu, int classify_result)
++{
++	struct kite_rxd rx;
++	const u8 *p = (const u8 *)wifi_pkt_va(buf_id);
++	u32 w1 = len >= 8 ? kite_get_le32(p + 4) : 0;
++	u32 w2 = len >= 12 ? kite_get_le32(p + 8) : 0;
++	u32 generation = 0, key_generation = 0;
++	u32 reason = KITE_HOST_META_MALFORMED;
++
++	if (len >= 12 && (w1 & ((31u << 16) | (31u << 23))) )
++		reason = KITE_HOST_META_ENCRYPTED;
++	else if (len >= 12 && (w2 & ((1u << 21) | (0xffu << 23))))
++		reason = KITE_HOST_META_ENCRYPTED;
++	else if (!kite_parse_mt7916(p, len, band, &rx)) {
++		*wcid = rx.wcid;
++		*amsdu = rx.amsdu;
++		if (rx.amsdu)
++			reason = KITE_HOST_META_AMSDU;
++		else if (kite_ctl_rx_meta(band, rx.wcid, rx.bss,
++					  &generation, &key_generation))
++			reason = key_generation ? KITE_HOST_META_ENCRYPTED :
++							 KITE_HOST_META_RAW;
++		else
++			reason = KITE_HOST_META_UNAUTHORIZED;
++	}
++	return KITE_HOST_META_PACK(generation,
++				   classify_result == KITE_HOST_CLASSIFY_REORDERED ?
++				   KITE_HOST_META_REORDERED : 0, reason);
++}
++
+ #define PINODE_RING_SIZE_2G  256
+ #define PINODE_RING_SIZE_5G  512
+ #define RXNODE_RING_SIZE     128
+@@ -87,7 +122,19 @@
+ 		u32 band, u8 fwd_type, u32 orig_len,
+ 		int classify_result, u8 tunnel)
+ {
+-	u32 node, widx, info, q;
++	u32 node, widx, info, q, host_meta = 0;
++	u16 meta_wcid = wcid < 0 ? 0 : wcid;
++	u8 meta_amsdu = amsdu;
++
++	if (kite_ctl_active() && band <= 1) {
++		host_meta = kite_host_rx_meta(buf_id, pkt_len, band,
++					       &meta_wcid, &meta_amsdu,
++					       classify_result);
++		if (wcid <= 0)
++			wcid = meta_wcid;
++		if (!amsdu)
++			amsdu = meta_amsdu;
++	}
+ 
+ 	/* Snapshot before publication: core 3 can immediately recycle buf_id. */
+ 	info = *(u32 *)(wifi_pkt_va(buf_id) + 0x88);
+@@ -132,7 +179,8 @@
+ 			return 1;
+ 		}
+ 
+-		*(u8 *)(node + 12) = (classify_result == -2);
++		*(u32 *)(node + 12) = host_meta ? host_meta :
++			(classify_result == -2);
+ 		*(u16 *)(node + 6) = (u16)pkt_len;
+ 		*(u16 *)(node + 8) = (u16)orig_len;
+ 		*(u32 *)node = buf_id;
+--- a/npu_wifi_rx.c
++++ b/npu_wifi_rx.c
+@@ -37,6 +37,11 @@
+ 	u8 amsdu;
+ 	u8 pool;
+ 	u16 pad1;
++	/* Captured control-plane epochs fence a frame against STA/key updates
++	 * made while the NPU workers are parked.  Zero means legacy/raw-host
++	 * classification and never authorizes the reorder fast path. */
++	u32 generation;
++	u32 key_generation;
+ 	u32 tick;
+ };
+ 
+@@ -84,26 +89,30 @@
+  * Rx descriptor parser
+  * ================================================================ */
+ 
+-/* -1: untranslated, errored or non-QoS data frames go to the host */
++	/* -1: untranslated, protected, unauthorized or non-QoS frames go to the
++	 * host.  Only an explicitly negotiated mode-2 session may classify the
++	 * plaintext subset; Linux still owns PN and authorization. */
+ static NPU_HOT NPU_INLINE int kite_rx_parse(u32 buf_id, struct kite_node *n, u32 len, u32 band)
+ {
+ #if defined(AN7581) && defined(MT7916)
+ 	struct kite_rxd rx;
+ 
+-	/* First data-lifecycle round deliberately hands every frame to Linux.
+-	 * The host remains the sole owner of BA/reorder, PN and security
+-	 * decisions; NPU only moves the RX buffer through the host ring. */
+-	if (kite_ctl_active())
+-		return -1;
+-
+ 	if (kite_parse_mt7916((const u8 *)wifi_pkt_va(buf_id), len, band, &rx) ||
+ 	    (!kite_ctl_active() &&
+ 	     !kite_legacy_wcid_valid(rx.wcid, wifi_dbdc_mode)))
+ 		return -1;
+ 	/* Do not interleave split A-MSDUs with host replay/reorder state. */
+-	if (kite_ctl_active() &&
+-	    (rx.amsdu || !kite_ctl_sta_matches(band, rx.wcid, rx.bss)))
+-		return -1;
++	if (kite_ctl_active()) {
++		if (rx.amsdu || !kite_ctl_sta_matches(band, rx.wcid, rx.bss))
++			return -1;
++		if (!kite_ctl_rx_meta(band, rx.wcid, rx.bss,
++				       &n->generation, &n->key_generation) ||
++		    n->key_generation)
++			return -1;
++	} else {
++		n->generation = 0;
++		n->key_generation = 0;
++	}
+ 	n->tid = rx.tid;
+ 	n->wcid = rx.wcid;
+ 	n->sn = rx.sequence;
+@@ -254,6 +263,17 @@
+ 		wifi_cnt_inc(band, 232);
+ 		return -1;
+ 	}
++	/* A PARKed worker may resume after a STA/key/port transaction.  Do not
++	 * attach a frame parsed under the old epoch to a new BA window. */
++	if (pn.generation) {
++		u32 generation, key_generation;
++
++		if (!kite_ctl_rx_meta(band, pn.wcid, pn.bss, &generation,
++				       &key_generation) ||
++		    generation != pn.generation || key_generation != pn.key_generation ||
++		    key_generation)
++			return pn.buf_id;
++	}
+ 
+ 	e = kite_rx_ba_address(band, pn.wcid, pn.tid, wifi_dbdc_mode,
+ 			    ba_table_a, ba_table_b);
+--- a/npu_hostadpt.c
++++ b/npu_hostadpt.c
+@@ -359,9 +359,13 @@
+ 		return -1;
+ 	__asm__ volatile("fence iorw,iorw" ::: "memory");
+ 	for (i = 0; i < n; i++) {
++		/* A segmented RX frame has no complete MT7916 header at any one
++		 * source buffer.  Publish an explicit malformed/fallback record so
++		 * Linux can never mistake the chain for a reordered plaintext frame. */
+ 		ctrl[i] = host_ring_prepare_desc(slots[i],
+ 			wifi_pkt_dma(*(u32 *)nodes[i]), total, 0, 0,
+-			(n << 3) | (i + 1), *(u16 *)(nodes[i] + 6), i == n - 1, 0);
++			(n << 3) | (i + 1), *(u16 *)(nodes[i] + 6), i == n - 1,
++			KITE_HOST_META_PACK(0, 0, KITE_HOST_META_MALFORMED));
+ 		if (!ctrl[i])
+ 			return KITE_HOST_HOLD;
+ 	}

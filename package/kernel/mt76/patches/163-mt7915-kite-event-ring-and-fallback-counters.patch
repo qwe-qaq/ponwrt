@@ -1,0 +1,312 @@
+Subject: mt7915: retain bounded Kite transition history and fallback counters
+
+Add a bounded debugfs event ring and host fallback counters for post-drop
+analysis. Events are recorded only at control, lifecycle and recovery
+transitions; packet fallback uses counters and never emits per-packet printk
+output.
+
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -257,6 +257,21 @@
+ #endif
+ };
+ 
++#ifdef CONFIG_MT7915_NPU
++#define MT7915_KITE_TRACE_RING 64
++
++struct mt7915_kite_trace_event {
++	u32 seq;
++	u32 event;
++	u32 band;
++	u32 state;
++	s32 error;
++	u32 session;
++	u32 epoch;
++	unsigned long at;
++};
++#endif
++
+ struct mt7915_dev {
+ 	union { /* must be first */
+ 		struct mt76_dev mt76;
+@@ -302,6 +317,10 @@
+ 		u32 trace_full_attempts;
+ 		u32 trace_last_event, trace_last_op, trace_last_state;
+ 		int trace_last_error;
++		spinlock_t trace_lock;
++		u32 trace_head;
++		struct mt7915_kite_trace_event trace_ring[MT7915_KITE_TRACE_RING];
++		u64 trace_host_fallback, trace_host_sent, trace_host_drop;
+ 		struct mt76_queue *txq[2];
+ 		bool live[MT7916_WTBL_SIZE];
+ 	} kite;
+@@ -538,6 +557,8 @@
+ int mt7915_npu_tx_fence(struct mt7915_dev *dev);
+ void mt7915_npu_tx_unfence(struct mt7915_dev *dev);
+ void mt7915_npu_tx_watchdog(struct mt7915_dev *dev);
++void mt7915_kite_trace_event(struct mt7915_dev *dev, u32 event, u32 band,
++			     u32 state, int error);
+ void mt7915_npu_tx_debugfs(struct mt7915_dev *dev, struct dentry *dir);
+ int mt7915_npu_host_bind(struct mt7915_dev *dev, u64 pa0, u64 pa1, u32 bands);
+ int mt7915_npu_host_unbind(struct mt7915_dev *dev);
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -135,6 +135,7 @@
+ {
+ 	mutex_init(&dev->kite.lock);
+ 	spin_lock_init(&dev->kite.dp_done_lock);
++	spin_lock_init(&dev->kite.trace_lock);
+ 	mt7915_npu_dp_work_init(dev);
+ 	dev->kite.reorder = npu_reorder;
+ 	dev->kite.tx_requested = npu_tx;
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -9,6 +9,33 @@
+ #include "../dma.h"
+ #include <linux/soc/airoha/airoha_kite.h>
+ 
++/* A bounded transition history makes a drop/recovery diagnosable after
++ * printk rotation without adding a printk to the packet path.  The writer is
++ * used from control, workqueue and radio callbacks, so the ring has its own
++ * short IRQ-safe lock.  Readers hold the same lock while formatting it. */
++void mt7915_kite_trace_event(struct mt7915_dev *dev, u32 event, u32 band,
++			     u32 state, int error)
++{
++	struct mt7915_kite_trace_event *entry;
++	unsigned long flags;
++	u32 seq, index;
++
++	spin_lock_irqsave(&dev->kite.trace_lock, flags);
++	seq = ++dev->kite.trace_head;
++	index = (seq - 1) & (MT7915_KITE_TRACE_RING - 1);
++	entry = &dev->kite.trace_ring[index];
++	entry->event = event;
++	entry->band = band;
++	entry->state = state;
++	entry->error = error;
++	entry->session = dev->kite.session;
++	entry->epoch = dev->kite.dp_epoch;
++	entry->at = jiffies;
++	/* Publish the sequence last. */
++	WRITE_ONCE(entry->seq, seq);
++	spin_unlock_irqrestore(&dev->kite.trace_lock, flags);
++}
++
+ /* Protected by kite.lock or probe/remove serialization. control_npu owns
+  * one supplier reference and never implies packet/DMA ownership. */
+ static struct airoha_npu *mt7915_kite_npu(struct mt7915_dev *dev)
+@@ -78,6 +105,7 @@
+ 	wire[2] = cpu_to_le32(op);
+ 	wire[3] = cpu_to_le32(dev->kite.session);
+ 	wire[4] = cpu_to_le32(++dev->kite.serial);
++	mt7915_kite_trace_event(dev, 11, U32_MAX, op, 0);
+ 	for (i = 0; i < nargs; i++)
+ 		wire[5 + i] = cpu_to_le32(args[i]);
+ 	ret = airoha_npu_wlan_send_msg(npu, 0,
+@@ -107,6 +135,7 @@
+ 				dev->kite.trace_last_error = send_ret;
+ 				dev->kite.trace_last_state = s[6];
+ 				dev->kite.trace_last_at = jiffies;
++				mt7915_kite_trace_event(dev, 1, U32_MAX, s[6], send_ret);
+ 				dev_info(dev->mt76.dev,
+ 					 "Kite control timeout resolved: op=%u serial=%u attempt=%u\n",
+ 					 op, dev->kite.serial, attempt + 1);
+@@ -121,6 +150,7 @@
+ 			dev->kite.trace_last_error = send_ret;
+ 			dev->kite.trace_last_state = s[6];
+ 			dev->kite.trace_last_at = jiffies;
++			mt7915_kite_trace_event(dev, 2, U32_MAX, s[6], send_ret);
+ 			dev_warn(dev->mt76.dev,
+ 				 "Kite control timeout unresolved: op=%u serial=%u send_ret=%d status_ret=%d status_valid=%u status_session=%u status_serial=%u state=%u result=%u\n",
+ 				 op, dev->kite.serial, send_ret, ret, status_valid,
+@@ -139,7 +169,9 @@
+ 		       (dev->kite.reorder ? KITE_CTL_MODE_DATA_REORDER :
+ 				     KITE_CTL_MODE_DATA))))
+ 		return -EPROTO;
+-	return mt7915_kite_result(s[5]);
++	ret = mt7915_kite_result(s[5]);
++	mt7915_kite_trace_event(dev, 12, U32_MAX, s[6], ret);
++	return ret;
+ }
+ 
+ static int mt7915_kite_command(struct mt7915_dev *dev, u32 op,
+@@ -253,6 +285,7 @@
+ 	dev->kite.trace_last_error = ret;
+ 	dev->kite.trace_last_state = dev->recovery.state;
+ 	dev->kite.trace_last_at = jiffies;
++	mt7915_kite_trace_event(dev, 3, U32_MAX, dev->recovery.state, ret);
+ 	dev_err(dev->mt76.dev,
+ 		"Kite control failed (%d), session %u serial %u dp_bound=%u dp_gate=%u dp_fault=%u tx_reset=%u recovery=%08x tokens=%u; %s\n",
+ 		ret, dev->kite.session, dev->kite.serial,
+@@ -954,6 +987,7 @@
+ 		dev->kite.trace_last_event = 4;
+ 		dev->kite.trace_last_state = stop;
+ 		dev->kite.trace_last_at = jiffies;
++		mt7915_kite_trace_event(dev, 4, U32_MAX, stop, 0);
+ 		dev_info(dev->mt76.dev,
+ 			 "Kite TX gate transition: gate=%u session=%u tx_bound=%u dp_bound=%u dp_gate=%u tx_reset=%u recovery=%08x\n",
+ 			 stop, dev->kite.session, dev->kite.tx_bound,
+@@ -1216,6 +1250,8 @@
+ 		pending.wa_wait, pending.ready, pending.quarantine);
+ 	dev->kite.tx_reset_requested = true;
+ 	dev->recovery.state |= MT_MCU_CMD_WDT_MASK;
++	mt7915_kite_trace_event(dev, 15, U32_MAX, dev->recovery.state,
++				-ETIMEDOUT);
+ 	mt7915_reset(dev);
+ 	return -ETIMEDOUT;
+ }
+@@ -1319,6 +1355,8 @@
+ 			dev->kite.trace_last_error = -ETIMEDOUT;
+ 			dev->kite.trace_last_state = b;
+ 			dev->kite.trace_last_at = jiffies;
++			mt7915_kite_trace_event(dev, 5, b, dp ? READ_ONCE(dp->fault) : 0,
++					       -ETIMEDOUT);
+ 			dev_err(dev->mt76.dev,
+ 				"Kite DP band%d stalled: pending=%u dma_wait=%u wa_wait=%u ready=%u quarantine=%u hw_submitted=%u hw_reaped=%u\n",
+ 				b, pending.wifi, pending.dma_wait, pending.wa_wait,
+@@ -1512,6 +1550,10 @@
+ 		dev->kite.trace_radio_stops, dev->kite.trace_recovery_workers,
+ 		dev->kite.trace_recovery_failures, dev->kite.trace_reset_requests,
+ 		dev->kite.trace_full_attempts);
++	seq_printf(m, "telemetry_abi=1 host_fallback=%llu host_sent=%llu host_drop=%llu\n",
++		(unsigned long long)dev->kite.trace_host_fallback,
++		(unsigned long long)dev->kite.trace_host_sent,
++		(unsigned long long)dev->kite.trace_host_drop);
+ 	seq_printf(m, "last_event=%u last_op=%u last_error=%d last_state=%u age_ms=%lu\n",
+ 		dev->kite.trace_last_event, dev->kite.trace_last_op,
+ 		dev->kite.trace_last_error, dev->kite.trace_last_state,
+@@ -1521,12 +1563,39 @@
+ }
+ DEFINE_SHOW_ATTRIBUTE(mt7915_kite_trace);
+ 
++static int mt7915_kite_events_show(struct seq_file *m, void *unused)
++{
++	struct mt7915_dev *dev = m->private;
++	unsigned long flags;
++	u32 head, count, i;
++
++	spin_lock_irqsave(&dev->kite.trace_lock, flags);
++	head = dev->kite.trace_head;
++	count = min_t(u32, head, MT7915_KITE_TRACE_RING);
++	seq_printf(m, "events_abi=1 head=%u count=%u capacity=%u\n", head,
++		   count, MT7915_KITE_TRACE_RING);
++	for (i = 0; i < count; i++) {
++		u32 index = (head - count + i) & (MT7915_KITE_TRACE_RING - 1);
++		struct mt7915_kite_trace_event *entry = &dev->kite.trace_ring[index];
++
++		seq_printf(m,
++			"event seq=%u type=%u band=%u state=%u error=%d session=%u epoch=%u age_ms=%lu\n",
++			READ_ONCE(entry->seq), entry->event, entry->band, entry->state,
++			entry->error, entry->session, entry->epoch,
++			entry->at ? jiffies_to_msecs(jiffies - entry->at) : 0UL);
++	}
++	spin_unlock_irqrestore(&dev->kite.trace_lock, flags);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mt7915_kite_events);
++
+ void mt7915_npu_tx_debugfs(struct mt7915_dev *dev, struct dentry *dir)
+ {
+ 	debugfs_create_file("kite_datapath", 0400, dir, dev, &mt7915_kite_datapath_fops);
+ 	debugfs_create_file("kite_tx", 0400, dir, dev, &mt7915_kite_tx_fops);
+ 	debugfs_create_file("kite_rx", 0400, dir, dev, &mt7915_kite_rx_fops);
+ 	debugfs_create_file("kite_trace", 0400, dir, dev, &mt7915_kite_trace_fops);
++	debugfs_create_file("kite_events", 0400, dir, dev, &mt7915_kite_events_fops);
+ }
+ 
+ /* Shared lifetime uses the NPU allocator's existing DMA quarantine. Never
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1282,8 +1282,12 @@
+ 	ctx.vif = msta->vif;
+ 	ieee80211_iterate_active_interfaces_atomic(dev->mt76.hw,
+ 		IEEE80211_IFACE_ITER_NORMAL, mt7915_kite_host_tx_iter, &ctx);
+-	if (!ctx.sent)
++	if (ctx.sent)
++		dev->kite.trace_host_sent++;
++	else {
++		dev->kite.trace_host_drop++;
+ 		dev_kfree_skb(skb);
++	}
+ 	return true;
+ }
+ 
+@@ -1297,8 +1301,14 @@
+ 	 * the selected AP interface so mac80211 performs normal station lookup,
+ 	 * encryption and software TX. It must never be parsed as an MT7916 RXD. */
+ 	if (info && KDP_HOST_FALLBACK_VALID(info[0])) {
+-		if (!mt7915_kite_host_tx(dev, skb, info[0], info[1], info[2]))
++		bool host_sent;
++
++		dev->kite.trace_host_fallback++;
++		host_sent = mt7915_kite_host_tx(dev, skb, info[0], info[1], info[2]);
++		if (!host_sent) {
++			dev->kite.trace_host_drop++;
+ 			dev_kfree_skb(skb);
++		}
+ 		return;
+ 	}
+ 
+@@ -1792,6 +1802,7 @@
+ 		dev->kite.trace_last_event = 9;
+ 		dev->kite.trace_last_error = ret;
+ 		dev->kite.trace_last_at = jiffies;
++		mt7915_kite_trace_event(dev, 9, U32_MAX, dev->recovery.state, ret);
+ 		dev_err(dev->mt76.dev,
+ 			"chip full reset quarantined after %d attempts: %d; queues held, reboot required; quarantine=%u tx_bound=%u dp_bound=%u retry=%u\n",
+ 			i + 1, ret, dev->mt76.npu_quarantine, dev->kite.tx_bound,
+@@ -1844,6 +1855,7 @@
+ 	dev->kite.trace_last_event = 8;
+ 	dev->kite.trace_last_state = dev->recovery.state;
+ 	dev->kite.trace_last_at = jiffies;
++	mt7915_kite_trace_event(dev, 8, U32_MAX, dev->recovery.state, 0);
+ 	dev_warn(dev->mt76.dev,
+ 		 "Kite recovery worker: state=%08x restart=%u failed=%u full=%u retry=%u tx_reset=%u tx_bound=%u dp_bound=%u quarantine=%u\n",
+ 		 dev->recovery.state, dev->recovery.restart, dev->recovery.failed,
+@@ -1992,6 +2004,7 @@
+ 	dev->kite.trace_last_event = 9;
+ 	dev->kite.trace_last_error = ret;
+ 	dev->kite.trace_last_at = jiffies;
++	mt7915_kite_trace_event(dev, 9, U32_MAX, dev->recovery.state, ret);
+ 	dev_err(dev->mt76.dev,
+ 		"chip partial reset quarantined: %d; queues held, reboot required; retry=%u\n",
+ 		ret, dev->recovery.retry_count);
+@@ -2075,6 +2088,7 @@
+ 	dev->kite.trace_last_event = 10;
+ 	dev->kite.trace_last_state = dev->recovery.state;
+ 	dev->kite.trace_last_at = jiffies;
++	mt7915_kite_trace_event(dev, 10, U32_MAX, dev->recovery.state, 0);
+ 	dev_warn(dev->mt76.dev,
+ 		 "Kite reset requested: state=%08x restart=%u failed=%u full=%u tx_reset=%u tx_bound=%u dp_bound=%u quarantine=%u\n",
+ 		 dev->recovery.state, dev->recovery.restart, dev->recovery.failed,
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -102,6 +102,8 @@
+ 	dev->kite.trace_radio_starts++;
+ 	dev->kite.trace_last_event = 6;
+ 	dev->kite.trace_last_at = jiffies;
++	mt7915_kite_trace_event(dev, 6, mt7915_hw_phy(hw)->mt76->band_idx,
++				dev->recovery.state, 0);
+ 	dev_info(dev->mt76.dev,
+ 		 "Kite radio start begin: band=%u session=%u tx_bound=%u dp_bound=%u failed=%u recovery=%08x quarantine=%u\n",
+ 		 mt7915_hw_phy(hw)->mt76->band_idx, dev->kite.session,
+@@ -115,6 +117,10 @@
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+ 	if (ret)
++		mt7915_kite_trace_event(dev, 16,
++				mt7915_hw_phy(hw)->mt76->band_idx,
++				dev->recovery.state, ret);
++	if (ret)
+ 		dev_err(dev->mt76.dev, "Wi-Fi radio start failed: band=%u error=%d\n",
+ 			mt7915_hw_phy(hw)->mt76->band_idx, ret);
+ 	else
+@@ -134,6 +140,8 @@
+ 	dev->kite.trace_radio_stops++;
+ 	dev->kite.trace_last_event = 7;
+ 	dev->kite.trace_last_at = jiffies;
++	mt7915_kite_trace_event(dev, 7, phy->mt76->band_idx,
++				dev->recovery.state, 0);
+ 	dev_warn(dev->mt76.dev,
+ 		 "Kite radio stop begin: band=%u suspend=%u session=%u tx_bound=%u dp_bound=%u failed=%u recovery=%08x quarantine=%u\n",
+ 		 phy->mt76->band_idx, suspend, dev->kite.session,

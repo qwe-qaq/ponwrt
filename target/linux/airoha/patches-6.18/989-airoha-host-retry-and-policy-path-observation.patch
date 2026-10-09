@@ -1,0 +1,134 @@
+From: ponwrt maintainers
+Subject: [PATCH] r72: Expose cached host retry and complete last exact-policy miss.
+
+Native incremental patch on release71; no datapath ABI or DMA layout change.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -596,6 +596,10 @@
+ 	int host_error;
+ 	unsigned long host_updated;
+ 	bool host_valid;
++	u32 path[CLANKER_DIAG_WORDS];
++	int path_error;
++	unsigned long path_updated;
++	bool path_valid;
+ 	u32 control[CLANKER_CTL_WORDS];
+ 	unsigned long control_updated;
+ 	int control_error;
+@@ -749,8 +753,8 @@
+ 	unsigned int b, i;
+ 
+ 	mutex_lock(&d->lock);
+-	n = sysfs_emit(buf, "host_abi=1 available=%u last_error=%d age_ms=%u seq=%u tick=%u\n",
+-		d->host_valid, d->host_error,
++	n = sysfs_emit(buf, "host_abi=%u available=%u last_error=%d age_ms=%u seq=%u tick=%u\n",
++		d->host[61] == 0x4b480002 ? 2 : 1, d->host_valid, d->host_error,
+ 		d->host_valid ? jiffies_to_msecs(jiffies - d->host_updated) : 0,
+ 		d->host[2], d->host[3]);
+ 	if (!d->host_valid)
+@@ -767,12 +771,53 @@
+ 			b, v[10], v[0], v[1], v[2], v[3], v[4] & 0xff,
+ 			!!(v[4] & 0x100), v[5], v[6], v[7], v[8], v[9]);
+ 	}
++	if (d->host[61] == 0x4b480002)
++		for (b = 0; b < 2; b++)
++			n += sysfs_emit_at(buf, n, "host_retry%u rx_busy=%u tx_busy=%u chain_busy=%u expired=%u recovered=%u max_wait_ticks_global=%u deadline_ticks=200\n",
++				b, d->host[50+b], d->host[52+b], d->host[54+b],
++				d->host[56+b], d->host[58+b], d->host[60]);
+ 	n += sysfs_emit_at(buf, n, "scope=nonzero_calls origin_0_rx_1_tx_fallback_2_chain hold_retains_ownership; counters_not_atomic\n");
+ out:
+ 	mutex_unlock(&d->lock);
+ 	return n;
+ }
+ static DEVICE_ATTR_RO(clanker_host_status);
++
++/* Cached GET32 page4: one exceptional PS miss, no mailbox IO on read. */
++static ssize_t clanker_path_status_show(struct device *dev,
++				      struct device_attribute *attr, char *buf)
++{
++	struct airoha_clanker_diag *d = ((struct airoha_npu *)dev_get_drvdata(dev))->clanker;
++	static const char * const fields[] = {
++		"event_tick", "session", "epoch", "band", "wcid", "request",
++		"generation", "key_generation", "route_tag", "type", "protocol",
++		"ports", "vlan", "dsfield", "src0", "src1", "src2", "src3",
++		"dst0", "dst1", "dst2", "dst3", "mac0", "mac1", "mac2",
++		"candidate_slot", "candidate_version", "candidate_stable", "diff_mask",
++		"candidate_session", "candidate_generation", "candidate_key_generation",
++		"candidate_request", "candidate_type", "candidate_protocol", "candidate_ports",
++		"candidate_vlan", "candidate_dsfield", "candidate_dsmask",
++		"candidate_src0", "candidate_src1", "candidate_src2", "candidate_src3",
++		"candidate_dst0", "candidate_dst1", "candidate_dst2", "candidate_dst3",
++		"candidate_mac0", "candidate_mac1", "candidate_mac2", "candidate_hw_slot",
++		"candidate_cookie_lo", "candidate_cookie_hi", "candidate_band", "candidate_bss",
++	};
++	ssize_t n;
++	unsigned int i;
++
++	mutex_lock(&d->lock);
++	n = sysfs_emit(buf, "path_abi=1 available=%u last_error=%d age_ms=%u seq=%u event_valid=%u snapshot_tick=%u\n",
++		d->path_valid, d->path_error,
++		d->path_valid ? jiffies_to_msecs(jiffies - d->path_updated) : 0,
++		d->path[4], d->path[5], d->path[3]);
++	if (d->path_valid && d->path[5])
++		for (i = 0; i < ARRAY_SIZE(fields); i++)
++			n += sysfs_emit_at(buf, n, "%s=0x%08x\n", fields[i], d->path[6+i]);
++	n += sysfs_emit_at(buf, n, "scope=last_PS_exact_miss_only not_all_traffic packet_before_wifi canonical_ip_ports little_endian_packed_mac candidate_hw_slot_is_policy_metadata_not_observed_ingress\n");
++	mutex_unlock(&d->lock);
++	return n;
++}
++static DEVICE_ATTR_RO(clanker_path_status);
+ 
+ static ssize_t clanker_rx_status_show(struct device *dev,
+ 				      struct device_attribute *attr, char *buf)
+@@ -808,6 +853,7 @@
+ 	&dev_attr_clanker_status.attr,
+ 	&dev_attr_clanker_rx_status.attr,
+ 	&dev_attr_clanker_host_status.attr,
++	&dev_attr_clanker_path_status.attr,
+ 	NULL,
+ };
+ static const struct attribute_group airoha_clanker_group = {
+@@ -825,7 +871,8 @@
+ 	u32 control[CLANKER_CTL_WORDS] = {};
+ 	u32 rings[CLANKER_DIAG_WORDS] = {};
+ 	u32 host[CLANKER_DIAG_WORDS] = {};
+-	int host_error;
++	u32 path[CLANKER_DIAG_WORDS] = {};
++	int host_error, path_error;
+ 	int ring_error;
+ 	int i, err = 0, previous_error, control_error;
+ 	bool report, control_changed;
+@@ -870,10 +917,23 @@
+ 			(enum airoha_npu_wlan_get_cmd)32,
+ 			host, sizeof(host), GFP_KERNEL);
+ 		if (!host_error && (host[0] != CLANKER_DIAG_MAGIC ||
+-		    host[1] != 3 || host[61] != 0x4b480001))
++		    host[1] != 3 || (host[61] != 0x4b480001 && host[61] != 0x4b480002)))
+ 			host_error = -EPROTO;
+ 	}
++	path_error = err;
++	if (!err) {
++		path_error = airoha_npu_wlan_msg_get(npu, 4,
++			(enum airoha_npu_wlan_get_cmd)32, path, sizeof(path), GFP_KERNEL);
++		if (!path_error && (path[0] != CLANKER_DIAG_MAGIC ||
++		    path[1] != 4 || path[61] != 0x4b500001)) path_error = -EPROTO;
++	}
+ 	mutex_lock(&d->lock);
++	d->path_error = path_error;
++	if (!path_error) {
++		memcpy(d->path, path, sizeof(path));
++		d->path_updated = jiffies;
++		d->path_valid = true;
++	}
+ 	d->host_error = host_error;
+ 	if (!host_error) {
+ 		memcpy(d->host, host, sizeof(host));
+@@ -1021,6 +1081,7 @@
+ 	d->npu = npu;
+ 	d->control_error = -EAGAIN;
+ 	d->host_error = -EAGAIN;
++	d->path_error = -EAGAIN;
+ 	mutex_init(&d->lock);
+ 	INIT_DELAYED_WORK(&d->work, airoha_clanker_poll);
+ 	npu->clanker = d;

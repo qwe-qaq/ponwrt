@@ -1,0 +1,491 @@
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -9,8 +9,8 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_ABI_VERSION 5u
+-#define KDP_MAGIC 0x4b440005u
++#define KDP_ABI_VERSION 6u
++#define KDP_MAGIC 0x4b440006u
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -199,6 +199,37 @@
+ 	unsigned int txwi_drop, reserved[3];
+ };
+ 
++/* ABI6: boot-only optimization flags, and single hart4 performance counters.
++ * The old DMA regions do not move. The host writes flags only before BIND. */
++#define KDP_PERF_FAST 1u
++#define KDP_PERF_TOKENQ 2u
++struct kdp_perf_control {
++	unsigned int flags, free_count, pending_count, alloc_probe;
++	unsigned int alloc_empty, reap_probe, reap_ready, cache_flush;
++	unsigned int reserved[8];
++};
++struct kdp_perf_band {
++	unsigned int parse_fast, parse_slow, parse_reuse, hint_hit;
++	unsigned int hint_miss, tx_amsdu, tx_single, retry;
++	unsigned int reserved[8];
++};
++/* A-MSDU publication is one aligned word: peer max length and BA TID mask.
++ * No key/PN or authorization is granted by this optional TX capability. */
++static inline unsigned int kdp_amsdu_contract(unsigned int enabled,
++	unsigned int native, unsigned int wme, unsigned int max_len,
++	unsigned int tids)
++{
++	if (!enabled || !native || !wme || max_len < 3839 || max_len > 11454)
++		return 0;
++	return (max_len << 16) | (tids & 0xffu);
++}
++static inline int kdp_amsdu_allowed(unsigned int contract, unsigned int tid,
++	unsigned int len)
++{
++	return tid < 8 && (contract & (1u << tid)) && len <= 1514 &&
++	       len + 64 <= (contract >> 16);
++}
++
+ struct kdp_shared {
+ 	unsigned int magic, bytes, session, epoch;
+ 	unsigned int enabled, fault, gate, stopped;
+@@ -217,10 +248,14 @@
+ 	unsigned char payload[KDP_TOKENS][KDP_BUFFER_BYTES];
+ 	struct kdp_band_stats stats[2];
+ 	struct kdp_quality_stats quality[2];
+-};
+-
+-/* ABI5 extends the tail, never the header or DMA regions. Magic and bytes
++	struct kdp_perf_control perf;
++	struct kdp_perf_band performance[2];
++};
++
++/* ABI6 extends the tail, never the header or DMA regions. Magic and bytes
+  * are both checked so a mixed driver/firmware fails before DMA admission. */
++_Static_assert(sizeof(struct kdp_perf_control) == 64, "Kite perf control");
++_Static_assert(sizeof(struct kdp_perf_band) == 64, "Kite perf counters");
+ _Static_assert(sizeof(struct kdp_quality_stats) == 64, "Kite quality cache line");
+ _Static_assert(sizeof(struct kdp_band_stats) == 64, "Kite statistics cache line");
+ _Static_assert(__builtin_offsetof(struct kdp_shared, sta) == 128, "Kite header");
+--- a/kite-packet.h
++++ b/kite-packet.h
+@@ -85,6 +85,44 @@
+ 		return 0;
+ 	}
+ 	out->ports = kdp_be32(p + l4);
++	return 1;
++}
++
++/* Common downlink: Ethernet II, no VLAN, IPv4 with default QoS, no
++ * options/fragments, complete TCP/UDP and MTU <= 1500. A rejection only
++ * selects the original parser; it never grants an offload policy. */
++static inline int kdp_parse_ipv4_fast(const unsigned char *p, unsigned int len,
++	struct kdp_packet *out)
++{
++	unsigned int end, proto, i;
++	if (len < 42 || len > 1514 || (p[0] & 1) || (p[6] & 1) ||
++	    p[12] != 8 || p[13] || p[14] != 0x45 || p[15] ||
++	    (kdp_be16(p + 20) & 0xbfff))
++		return 0;
++	end = 14 + kdp_be16(p + 16);
++	proto = p[23];
++	if (end > len || end < 42)
++		return 0;
++	if (proto == 6) {
++		if (end < 54 || (p[47] & 7) || (p[46] >> 4) < 5 ||
++		    (unsigned int)(p[46] >> 4) * 4 > end - 34)
++			return 0;
++	} else if (proto != 17 || kdp_be16(p + 38) != end - 34) {
++		return 0;
++	}
++	out->src[0] = kdp_be32(p + 26);
++	out->dst[0] = kdp_be32(p + 30);
++	out->src[1] = out->src[2] = out->src[3] = 0;
++	out->dst[1] = out->dst[2] = out->dst[3] = 0;
++	out->ports = kdp_be32(p + 34);
++	out->protocol = proto;
++	out->type = KDP_FLOW_IPV4;
++	out->vlan = KDP_SLOT_NONE;
++	out->dsfield = 0;
++	for (i = 0; i < 6; i++) {
++		out->dmac[i] = p[i];
++		out->smac[i] = p[i + 6];
++	}
+ 	return 1;
+ }
+ 
+--- a/kite-datapath-fw.h
++++ b/kite-datapath-fw.h
+@@ -17,6 +17,7 @@
+ void kite_dp_tx_commit(unsigned int band, unsigned short token);
+ void kite_dp_tx_dma_done(unsigned short token);
+ void kite_dp_tx_reap(void);
++void kite_dp_cache_invalidate(void);
+ void kite_dp_host_drain(void);
+ int kite_dp_host_idle(void);
+ int host_ring_submit(u32 buf_addr, u16 pkt_len, u32 band,
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -15,6 +15,30 @@
+ static volatile struct kdp_shared *dp;
+ static u32 dp_pa, dp_session, dp_epoch, dp_ring, dp_idx[2], dp_alloc, dp_reap;
+ static u16 dp_prepared[2], dp_replacement[2];
++/* All queue/cache writers are hart4, except initialization with workers
++ * parked. The ARM WA consumer writes only completion sequence numbers. */
++static u16 dp_freeq[KDP_TOKENS], dp_waitq[KDP_TOKENS];
++static u32 dp_free_head, dp_free_tail, dp_free_count;
++static u32 dp_wait_head, dp_wait_tail, dp_wait_count;
++struct dp_parse_cache {
++	u32 valid, token, len, tag;
++	int parsed, fast;
++	struct kdp_packet packet;
++};
++static struct dp_parse_cache dp_parse[2];
++struct dp_policy_hint { u32 capture, exact, cap_version, exact_version; };
++static struct dp_policy_hint dp_hint[2];
++
++void kite_dp_cache_invalidate(void)
++{
++	u32 used = dp_parse[0].valid | dp_parse[1].valid |
++		dp_hint[0].cap_version | dp_hint[1].cap_version;
++	dp_parse[0].valid = dp_parse[1].valid = 0;
++	dp_hint[0].cap_version = dp_hint[1].cap_version = 0;
++	if (dp && used)
++		dp->perf.cache_flush++;
++}
++
+ 
+ /* One outstanding request per TDMA ring. Hart 4 publishes PENDING and owns
+  * the source/TDMA consumer; hart 3 alone writes the host ring and copy channel.
+@@ -92,15 +116,54 @@
+ static int dp_alloc_token(void)
+ {
+ 	u32 i;
++	if (dp->perf.flags & KDP_PERF_TOKENQ) {
++		u32 t;
++		if (!dp_free_count) {
++			dp->perf.alloc_empty++;
++			return -1;
++		}
++		dp->perf.alloc_probe++;
++		t = dp_freeq[dp_free_head];
++		if (t >= KDP_TOKENS || dp->token[t].state != KDP_TOKEN_FREE) {
++			dp->fault = 4;
++			return -1;
++		}
++		dp_free_head = (dp_free_head + 1) % KDP_TOKENS;
++		dp->perf.free_count = --dp_free_count;
++		dp->token[t].state = KDP_TOKEN_TDMA;
++		return t;
++	}
+ 	for (i = 0; i < KDP_TOKENS; i++) {
+ 		u32 t = dp_alloc;
++		dp->perf.alloc_probe++;
+ 		dp_alloc = (dp_alloc + 1) % KDP_TOKENS;
+ 		if (dp->token[t].state == KDP_TOKEN_FREE) {
+ 			dp->token[t].state = KDP_TOKEN_TDMA;
+ 			return t;
+ 		}
+ 	}
++	dp->perf.alloc_empty++;
+ 	return -1;
++}
++
++static void dp_free_token(u32 id)
++{
++	/* Only a held replacement or a proved double-completed token may
++	 * reach this helper. FREE and quarantine are never valid returns. */
++	if (id >= KDP_TOKENS ||
++	    (dp->token[id].state != KDP_TOKEN_TDMA &&
++	     dp->token[id].state != KDP_TOKEN_WIFI) ||
++	    ((dp->perf.flags & KDP_PERF_TOKENQ) && dp_free_count >= KDP_TOKENS)) {
++		dp->fault = 4;
++		return;
++	}
++	KDP_BARRIER();
++	dp->token[id].state = KDP_TOKEN_FREE;
++	if (dp->perf.flags & KDP_PERF_TOKENQ) {
++		dp_freeq[dp_free_tail] = id;
++		dp_free_tail = (dp_free_tail + 1) % KDP_TOKENS;
++		dp->perf.free_count = ++dp_free_count;
++	}
+ }
+ 
+ int kite_dp_bind(u32 pa, u32 bytes, u32 session, u32 epoch)
+@@ -114,7 +177,8 @@
+ 	s = (void *)kite_ctl_pool_alias(pa);
+ 	KDP_BARRIER();
+ 	if (s->magic != KDP_MAGIC || s->bytes != bytes || s->session != session ||
+-	    s->epoch != epoch || s->enabled || !s->gate || s->fault)
++	    s->epoch != epoch || s->enabled || !s->gate || s->fault ||
++	    (s->perf.flags & ~(KDP_PERF_FAST | KDP_PERF_TOKENQ)))
+ 		return 0;
+ 	for (i = 0; i < KDP_TOKENS; i++)
+ 		if (s->token[i].state || s->token[i].submitted ||
+@@ -129,6 +193,13 @@
+ 	dp_epoch = epoch;
+ 	dp_ring = ring;
+ 	dp_alloc = dp_reap = 0;
++	dp_free_head = dp_free_tail = dp_wait_head = dp_wait_tail = dp_wait_count = 0;
++	dp_free_count = KDP_TOKENS;
++	dp->perf.free_count = dp_free_count;
++	dp->perf.pending_count = 0;
++	for (i = 0; i < KDP_TOKENS; i++)
++		dp_freeq[i] = i;
++	kite_dp_cache_invalidate();
+ 	npu_memset((void *)dp_host, 0, sizeof(dp_host));
+ 	npu_memset((void *)ring, 0, DP_TDMA_BYTES * 2);
+ 	for (b = 0; b < 2; b++) {
+@@ -167,7 +238,7 @@
+ 	volatile struct kdp_sta *sta, const struct kdp_packet *packet,
+ 	int parsed, u32 wcid, u32 band)
+ {
+-	u32 base, i;
++	u32 base, i, capture = 0;
+ 	int present = 0;
+ 
+ 	/* First establish that this route has an explicitly installed bridge
+@@ -183,6 +254,7 @@
+ 		     f->type == KDP_FLOW_BRIDGE_GUARD) &&
+ 		    kdp_flow_matches(f, packet, s->session,
+ 			sta->generation, sta->key_generation, wcid, band, sta->bss)) {
++			capture = i;
+ 			present = f->type == KDP_FLOW_BRIDGE_GUARD ? -1 : 1;
+ 			break;
+ 		}
+@@ -205,12 +277,40 @@
+ 			sta->generation, sta->key_generation, wcid, band, sta->bss) &&
+ 			(s->flow[i].type == KDP_FLOW_BRIDGE_IPV4 ||
+ 			 s->flow[i].type == KDP_FLOW_BRIDGE_IPV6)) {
++			dp_hint[band].capture = capture;
++			dp_hint[band].exact = i;
++			dp_hint[band].cap_version = s->flow[capture].version;
++			dp_hint[band].exact_version = s->flow[i].version;
+ 			s->stats[band].reserved[KDP_STAT_BRIDGE_HIT]++;
+ 			return 1;
+ 		}
+ 	s->quality[band].bridge_policy_fallback++;
+ 	s->stats[band].reserved[KDP_STAT_BRIDGE_MISS]++;
+ 	return 0;
++}
++
++/* Positive hints only: every hit still checks both complete match records
++ * and their versions. Never cache absence of capture as routed authority. */
++static int dp_hint_matches(volatile struct kdp_shared *s,
++	volatile struct kdp_sta *sta, const struct kdp_packet *p, u32 wcid, u32 band)
++{
++	struct dp_policy_hint *h = &dp_hint[band];
++	volatile struct kdp_flow *cap, *exact;
++	if (!h->cap_version || !h->exact_version ||
++	    h->capture >= KDP_FLOWS || h->exact >= KDP_FLOWS)
++		return 0;
++	cap = &s->flow[h->capture];
++	exact = &s->flow[h->exact];
++	if (cap->version != h->cap_version || cap->type != KDP_FLOW_BRIDGE_CAPTURE ||
++	    exact->version != h->exact_version || exact->type != KDP_FLOW_BRIDGE_IPV4 ||
++	    !kdp_flow_matches(cap, p, s->session, sta->generation,
++		sta->key_generation, wcid, band, sta->bss) ||
++	    !kdp_flow_matches(exact, p, s->session, sta->generation,
++		sta->key_generation, wcid, band, sta->bss) ||
++	    cap->version != h->cap_version || exact->version != h->exact_version)
++		return 0;
++	s->stats[band].reserved[KDP_STAT_BRIDGE_HIT]++;
++	return 1;
+ }
+ 
+ static void dp_host_bridge_fallback(u32 band, u32 token, u32 addr, u32 len,
+@@ -267,6 +367,7 @@
+ static void dp_rearm(u32 band, u32 token)
+ {
+ 	u32 idx = dp_idx[band];
++	dp_parse[band].valid = 0;
+ 	u32 desc = dp_ring + band * DP_TDMA_BYTES + idx * 32;
+ 	REG32(desc + 8) = dp_payload_pa(token);
+ 	KDP_BARRIER();
+@@ -278,19 +379,43 @@
+ 
+ void kite_dp_tx_reap(void)
+ {
+-	u32 i;
++	u32 i, count;
+ 	if (!kite_dp_shared())
+ 		return;
+ 	KDP_BARRIER();
+-	for (i = 0; i < 32; i++) {
+-		volatile struct kdp_token *t = &dp->token[dp_reap];
+-		dp_reap = (dp_reap + 1) % KDP_TOKENS;
+-		if (!kdp_token_reusable(t))
++	count = (dp->perf.flags & KDP_PERF_TOKENQ) ? dp_wait_count : 32;
++	if (count > 32)
++		count = 32;
++	for (i = 0; i < count; i++) {
++		u32 id;
++		volatile struct kdp_token *t;
++		if (dp->perf.flags & KDP_PERF_TOKENQ) {
++			id = dp_waitq[dp_wait_head];
++			dp_wait_head = (dp_wait_head + 1) % KDP_TOKENS;
++			dp_wait_count--;
++			if (id >= KDP_TOKENS || dp->token[id].state != KDP_TOKEN_WIFI) {
++				dp->fault = 4;
++				return;
++			}
++		} else {
++			id = dp_reap;
++			dp_reap = (dp_reap + 1) % KDP_TOKENS;
++		}
++		t = &dp->token[id];
++		dp->perf.reap_probe++;
++		if (!kdp_token_reusable(t)) {
++			if (dp->perf.flags & KDP_PERF_TOKENQ) {
++				dp_waitq[dp_wait_tail] = id;
++				dp_wait_tail = (dp_wait_tail + 1) % KDP_TOKENS;
++				dp_wait_count++;
++			}
+ 			continue;
++		}
+ 		dp->tx_freed[t->band]++;
+-		KDP_BARRIER();
+-		t->state = KDP_TOKEN_FREE;
+-	}
++		dp->perf.reap_ready++;
++		dp_free_token(id);
++	}
++	dp->perf.pending_count = dp_wait_count;
+ }
+ 
+ int kite_dp_tx_next(u32 band, struct kite_tx_desc *out, u16 *id)
+@@ -298,7 +423,9 @@
+ 	volatile struct kdp_sta *sta;
+ 	volatile struct kdp_token *t;
+ 	u32 desc, len, addr, token, info, wcid, bss, b, i, tag;
+-	int replacement;
++	int replacement, parsed, fast, amsdu;
++	u32 tid;
++	struct dp_parse_cache *cache;
+ 	struct kdp_packet packet;
+ 	if (band > 1 || !kite_dp_shared())
+ 		return 0;
+@@ -396,11 +523,34 @@
+ 		dp->quality[band].control_drop++;
+ 		goto drop;
+ 	}
+-	npu_memset(&packet, 0, sizeof(packet));
+-	packet.vlan = KDP_SLOT_NONE;
++	cache = &dp_parse[band];
++	if ((dp->perf.flags & KDP_PERF_FAST) && cache->valid &&
++	    cache->token == token && cache->len == len && cache->tag == tag) {
++		npu_memcpy(&packet, &cache->packet, sizeof(packet));
++		parsed = cache->parsed;
++		fast = cache->fast;
++		dp->performance[band].parse_reuse++;
++	} else {
++		npu_memset(&packet, 0, sizeof(packet));
++		packet.vlan = KDP_SLOT_NONE;
++		fast = (dp->perf.flags & KDP_PERF_FAST) && !sta->qos_valid &&
++			kdp_parse_ipv4_fast((const void *)dp->payload[token], len, &packet);
++		parsed = fast || kdp_parse_packet((const void *)dp->payload[token], len, &packet);
++		if (fast)
++			dp->performance[band].parse_fast++;
++		else
++			dp->performance[band].parse_slow++;
++	}
+ 	{
+-		int parsed = kdp_parse_packet((const void *)dp->payload[token], len, &packet);
+-		int policy = dp_bridge_policy(dp, sta, &packet, parsed, wcid, band);
++		int policy;
++		if (fast && dp_hint_matches(dp, sta, &packet, wcid, band)) {
++			dp->performance[band].hint_hit++;
++			policy = 1;
++		} else {
++			if (fast)
++				dp->performance[band].hint_miss++;
++			policy = dp_bridge_policy(dp, sta, &packet, parsed, wcid, band);
++		}
+ 		if (policy == -2)
+ 			goto drop;
+ 		if (policy == 0) {
+@@ -415,21 +565,40 @@
+ 	}
+ 	replacement = dp_alloc_token();
+ 	if (replacement < 0) {
++		/* Cache only a held packet. The common successful submission
++		 * pays no packet-key copy or cache-line writes. */
++		if ((dp->perf.flags & KDP_PERF_FAST) && !cache->valid) {
++			cache->token = token;
++			cache->len = len;
++			cache->tag = tag;
++			cache->parsed = parsed;
++			cache->fast = fast;
++			npu_memcpy(&cache->packet, &packet, sizeof(packet));
++			cache->valid = 1;
++		}
+ 		dp->stats[band].tx_full++;
++		dp->performance[band].retry++;
+ 		return 0;
+ 	} /* keep TDMA ownership until a spare buffer exists */
+ 	/* No checksum offload requested: PPE supplied the final wire packet.
+ 	 * Short parse-prefix padding belongs to this exclusive token buffer. */
+ 	for (i = len; i < 72; i++)
+ 		dp->payload[token][i] = 0;
++	tid = kdp_sta_tid(sta, &packet);
++	amsdu = parsed && packet.vlan == KDP_SLOT_NONE && sta->wme &&
++		kdp_amsdu_allowed(sta->amsdu, tid, len);
+ 	if (!kdp_make_txwi((void *)dp->txwi[token], addr, len, token, wcid,
+ 			 band, bss, sta->omac, sta->wmm,
+-			 kdp_sta_tid(sta, &packet), !!sta->cipher,
+-			 sta->wme, sta->amsdu)) {
++			 tid, !!sta->cipher,
++			 sta->wme, amsdu)) {
+ 		dp->quality[band].txwi_drop++;
+-		dp->token[replacement].state = KDP_TOKEN_FREE;
++		dp_free_token(replacement);
+ 		goto drop;
+ 	}
++	if (amsdu)
++		dp->performance[band].tx_amsdu++;
++	else
++		dp->performance[band].tx_single++;
+ 	t->generation = sta->generation;
+ 	t->key_generation = sta->key_generation;
+ 	t->wcid = wcid;
+@@ -460,6 +629,15 @@
+ 			dp->fault = 6;
+ 		return;
+ 	}
++	if (dp->perf.flags & KDP_PERF_TOKENQ) {
++		if (dp_wait_count >= KDP_TOKENS) {
++			dp->fault = 4;
++			return;
++		}
++		dp_waitq[dp_wait_tail] = token;
++		dp_wait_tail = (dp_wait_tail + 1) % KDP_TOKENS;
++		dp->perf.pending_count = ++dp_wait_count;
++	}
+ 	dp->tx_sent[band]++;
+ 	dp->stats[band].tx_bytes += kdp_get_le32((const void *)dp->txwi[token]) & 0xffff;
+ 	dp->stats[band].tx_bytes -= 32; /* exclude hardware TXD */
+--- a/npu_kite_tx.c
++++ b/npu_kite_tx.c
+@@ -248,11 +248,20 @@
+ }
+ void kite_tx_loop(void)
+ {
++	u32 parked = 1;
+ 	npu_dbg_loop(NDBG_TAG('K', 'T', 'X', '4'));
+ 	for (;;) {
+ 		npu_dbg_poll();
+-		if (kite_ctl_pausepoint(4))
+-			continue;
++		if (kite_ctl_pausepoint(4)) {
++			parked = 1;
++			continue;
++		}
++		/* No cached parse/policy may cross a PARK/resume transaction.
++		 * This runs before the first descriptor after the acquire fence. */
++		if (parked) {
++			kite_dp_cache_invalidate();
++			parked = 0;
++		}
+ 		kite_dp_tx_reap();
+ 		kite_tx_step(0);
+ 		kite_tx_step(1);

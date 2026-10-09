@@ -1,0 +1,129 @@
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -758,6 +758,9 @@
+ 	spinlock_t kite_scan_lock;
+ 	u32 kite_scan_slot, kite_version;
+ 	unsigned long kite_scan_next;
++ u32 kite_scan_rx[2];
++ unsigned long kite_scan_idle_until;
++ atomic64_t kite_scan_idle, kite_scan_rx_wakes;
+  unsigned long kite_health_at, kite_stall_at[2];
+  u32 kite_health_ready[2];
+  u64 kite_health_packets[2];
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -1068,6 +1068,27 @@
+  return needed;
+ }
+ 
++/* Called under flow_offload_mutex, never in NAPI. Missing ingress rules
++ * alone cannot create a hardware UNBIND slot. Actual NPU RX immediately
++ * reopens the bounded scan; otherwise retain a slow rotating fallback. */
++static bool airoha_kite_scan_active(struct airoha_ppe *ppe)
++{
++ u32 a=READ_ONCE(ppe->kite_dp->rx_ppe[0]);
++ u32 b=READ_ONCE(ppe->kite_dp->rx_ppe[1]);
++ if (a!=ppe->kite_scan_rx[0] || b!=ppe->kite_scan_rx[1]) {
++  ppe->kite_scan_rx[0]=a; ppe->kite_scan_rx[1]=b;
++  ppe->kite_scan_idle_until=jiffies+30*HZ;
++  atomic64_inc(&ppe->kite_scan_rx_wakes);
++  return true;
++ }
++ if (time_before(jiffies,ppe->kite_scan_idle_until)) {
++  atomic64_inc(&ppe->kite_scan_idle);
++  return false;
++ }
++ ppe->kite_scan_idle_until=jiffies+30*HZ;
++ return true;
++}
++
+ static void airoha_kite_learn_work(struct work_struct *work)
+ {
+ 	struct airoha_ppe *ppe = container_of(to_delayed_work(work),
+@@ -1081,6 +1102,11 @@
+      !airoha_kite_learn_needed(ppe)) {
+   atomic_set(&ppe->kite_scan_budget, 0);
+   atomic64_inc(&ppe->kite_scan_stopped);
++  goto out;
++ }
++ if (atomic_read(&ppe->kite_scan_budget) == min_t(u32,total,256) &&
++     !airoha_kite_scan_active(ppe)) {
++  atomic_set(&ppe->kite_scan_budget,0);
+   goto out;
+  }
+ 	/* Read actual physical SRAM/DRAM entries. The software tuple hash only
+@@ -1211,6 +1237,8 @@
+ 		ppe->kite_ops = ops;
+ 		ppe->kite_priv = priv;
+ 		WRITE_ONCE(ppe->kite_dp, shared);
++  ppe->kite_scan_rx[0]=ppe->kite_scan_rx[1]=0;
++  ppe->kite_scan_idle_until=jiffies;
+ 	}
+ 	mutex_unlock(&flow_offload_mutex);
+ 	return ret;
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -213,6 +213,10 @@
+ 			ppe->kite_dp->session, ppe->kite_dp->gate, ppe->kite_dp->fault,
+ 			in, out, bound);
+ 	}
++ seq_printf(m,"r66_scan idle_skips=%lld rx_wakes=%lld rx0=%u rx1=%u idle_remaining_jiffies=%lu\n",
++  atomic64_read(&ppe->kite_scan_idle),atomic64_read(&ppe->kite_scan_rx_wakes),
++  ppe->kite_scan_rx[0],ppe->kite_scan_rx[1],
++  time_before(jiffies,ppe->kite_scan_idle_until)?ppe->kite_scan_idle_until-jiffies:0);
+ 	seq_printf(m, "kite_scanned=%lld kite_learned=%lld kite_revoked=%lld\n",
+ 		atomic64_read(&ppe->kite_scanned), atomic64_read(&ppe->kite_learned),
+ 		atomic64_read(&ppe->kite_revoked));
+--- a/include/linux/soc/airoha/kite-datapath.h
++++ b/include/linux/soc/airoha/kite-datapath.h
+@@ -26,6 +26,7 @@
+ #define KDP_TOKEN_BASE (KDP_TOKEN_LIMIT - KDP_TOKENS)
+ #define KDP_BUFFER_BYTES 2048u
+ #define KDP_TXWI_BYTES 128u
++#define KDP_TXWI_DMA_BYTES 76u /* connac2 TXD32 + firmware TXP44 */
+ #define KDP_PN_SPINS 4096u
+ #define KDP_CIPHER_CCMP 0x000fac04u
+ 
+@@ -196,6 +197,10 @@
+ 
+ /* ABI5 appends diagnostics only. All existing DMA offsets stay unchanged.
+  * TX/bridge fields have hart4 as their sole writer; host_hold has hart3. */
++/* r66 observation extension, unchanged layout: service.seq protects
++ * quality[0].reserved={pressure_requests,coalesced,cycles},
++ * quality[1].reserved={pressure_max_cycles,snapshot_cycles,snapshot_max_cycles}.
++ * Available only when perf.reserved[5] (service revision) >= 3. */
+ struct kdp_quality_stats {
+ 	unsigned int gate_drop, disabled_drop, sta_disabled_drop;
+ 	unsigned int unauthorized_drop, blocked_drop, identity_drop;
+@@ -472,12 +477,12 @@
+  t->queue = wmm * 4;
+  return 1;
+ }
+-static inline void kdp_write_txwi_validated(unsigned char *p, const struct kdp_txwi_template *t,
++static inline void kdp_write_txwi_dma(unsigned char *p, const struct kdp_txwi_template *t,
+  unsigned int pa, unsigned int len, unsigned int token, unsigned int tid, unsigned int amsdu)
+ {
+  static const unsigned char queue[8] = {1, 0, 0, 1, 2, 2, 3, 3};
+  volatile kdp_word *d = (void *)p;
+- /* Full overwrite, including reserved words: no DMA-mutation assumption. */
++ /* Overwrite every DMA-visible word, including all reserved TXP slots. */
+  d[0] = (len + 32) | ((t->queue + queue[tid]) << 25);
+  d[1] = t->w1 | (tid << 20); d[2] = t->w2; d[3] = t->w3;
+  d[4] = 0; d[5] = 1; d[6] = 0; /* native NO_SKB, not NO_ACK/WED */
+@@ -486,7 +491,15 @@
+  d[9] = t->w9; d[10] = pa;
+  d[11] = 0; d[12] = 0; d[13] = 0; d[14] = 0; d[15] = 0;
+  d[16] = len;
+- d[17] = 0; d[18] = 0; d[19] = 0; d[20] = 0; d[21] = 0;
++ d[17] = 0; d[18] = 0;
++}
++/* Checked/public callers retain the full 128-byte buffer contract. */
++static inline void kdp_write_txwi_validated(unsigned char *p, const struct kdp_txwi_template *t,
++ unsigned int pa, unsigned int len, unsigned int token, unsigned int tid, unsigned int amsdu)
++{
++ volatile kdp_word *d = (void *)p;
++ kdp_write_txwi_dma(p,t,pa,len,token,tid,amsdu);
++ d[19] = 0; d[20] = 0; d[21] = 0;
+  d[22] = 0; d[23] = 0; d[24] = 0; d[25] = 0; d[26] = 0;
+  d[27] = 0; d[28] = 0; d[29] = 0; d[30] = 0; d[31] = 0;
+ }

@@ -1,0 +1,334 @@
+Subject: mt7915: keep proven-stop recovery alive and trace the NPU path
+
+Keep recovery alive after a proven DMA stop with bounded exponential backoff,
+reserve the permanent failure latch for NPU quarantine, and add low-rate
+snapshots for control, radio, recovery, PPE and TX datapath transitions.
+
+--- a/mt7915/mt7915.h	2026-10-03 23:16:54.921985540 +0800
++++ b/mt7915/mt7915.h	2026-10-03 23:45:39.520722693 +0800
+@@ -294,6 +294,7 @@
+ 		bool tx_requested, tx_enabled, tx_bound, tx_reset_requested;
+ 		u32 tx_unknown;
+ 		unsigned long tx_log_at;
++		unsigned long trace_log_at;
+ 		struct mt76_queue *txq[2];
+ 		bool live[MT7916_WTBL_SIZE];
+ 	} kite;
+--- a/mt7915/npu-control.c	2026-10-03 23:16:54.922108650 +0800
++++ b/mt7915/npu-control.c	2026-10-03 23:45:39.551524654 +0800
+@@ -65,7 +65,7 @@
+ {
+ 	struct airoha_npu *npu = mt7915_kite_npu(dev);
+ 	__le32 wire[KITE_CTL_WORDS] = {};
+-	u32 s[KITE_CTL_WORDS];
++	u32 s[KITE_CTL_WORDS] = {};
+ 	int i, ret;
+ 
+ 	lockdep_assert_held(&dev->kite.lock);
+@@ -87,6 +87,7 @@
+ 	if (ret) {
+ 		int send_ret = ret;
+ 		unsigned int attempt;
++		bool status_valid = false;
+ 
+ 		/* A timeout only says that the SET response was not observed.  The
+ 		 * firmware may have committed the command already.  GET33 is the
+@@ -97,6 +98,7 @@
+ 		for (attempt = 0; attempt < 16; attempt++) {
+ 			usleep_range(5000, 10000);
+ 			ret = mt7915_kite_status(dev, s);
++			status_valid = !ret;
+ 			if (!ret && s[3] == dev->kite.session &&
+ 			    s[4] == dev->kite.serial) {
+ 				dev_info(dev->mt76.dev,
+@@ -106,8 +108,13 @@
+ 			}
+ 		}
+ 		if (ret || s[3] != dev->kite.session ||
+-		    s[4] != dev->kite.serial)
++		    s[4] != dev->kite.serial) {
++			dev_warn(dev->mt76.dev,
++				 "Kite control timeout unresolved: op=%u serial=%u send_ret=%d status_ret=%d status_valid=%u status_session=%u status_serial=%u state=%u result=%u\n",
++				 op, dev->kite.serial, send_ret, ret, status_valid,
++				 s[3], s[4], s[6], s[5]);
+ 			return send_ret;
++		}
+ 	} else {
+ 		ret = mt7915_kite_status(dev, s);
+ 	}
+@@ -230,8 +237,13 @@
+ 		return ret;
+ 	dev->kite.failed = true;
+ 	dev_err(dev->mt76.dev,
+-		"Kite control failed (%d), session %u serial %u; %s\n",
++		"Kite control failed (%d), session %u serial %u dp_bound=%u dp_gate=%u dp_fault=%u tx_reset=%u recovery=%08x tokens=%u; %s\n",
+ 		ret, dev->kite.session, dev->kite.serial,
++		dev->kite.dp_bound,
++		dev->mt76.kite_dp ? READ_ONCE(dev->mt76.kite_dp->gate) : 0,
++		dev->mt76.kite_dp ? READ_ONCE(dev->mt76.kite_dp->fault) : 0,
++		dev->kite.tx_reset_requested, dev->recovery.state,
++		READ_ONCE(dev->mt76.token_count),
+ 		dev->kite.control_only ?
+ 		"mirror halted; WiFi RX/PN remain host-owned" :
+ 		"control halted, DMA drain unconfirmed");
+@@ -910,14 +922,23 @@
+ static void mt7915_kite_tx_gate(struct mt7915_dev *dev, bool stop)
+ {
+ 	int b;
++	bool changed = false;
+ 	for (b = 0; b < 2; b++) {
+ 		struct mt76_queue *q = dev->kite.txq[b];
+ 		if (!q || !q->kite_tx)
+ 			continue;
+ 		spin_lock_bh(&q->lock);
++		changed |= q->kite_tx_blocked != stop;
+ 		q->kite_tx_blocked = stop;
+ 		spin_unlock_bh(&q->lock);
+ 	}
++	if (changed)
++		dev_info(dev->mt76.dev,
++			 "Kite TX gate transition: gate=%u session=%u tx_bound=%u dp_bound=%u dp_gate=%u tx_reset=%u recovery=%08x\n",
++			 stop, dev->kite.session, dev->kite.tx_bound,
++			 dev->kite.dp_bound,
++			 dev->mt76.kite_dp ? READ_ONCE(dev->mt76.kite_dp->gate) : 0,
++			 dev->kite.tx_reset_requested, dev->recovery.state);
+ 	if (!stop)
+ 		mt76_worker_schedule(&dev->mt76.tx_worker);
+ }
+@@ -1192,10 +1213,27 @@
+ void mt7915_npu_tx_watchdog(struct mt7915_dev *dev)
+ {
+ 	int b;
+-	bool report;
++	bool report, trace;
++
++	/* Keep the field trace low rate; per-packet logging would hide the fault
++	 * under test load and itself raise CPU usage. */
++	trace = time_after_eq(jiffies, dev->kite.trace_log_at + 5 * HZ);
+ 	if (!dev->kite.tx_bound || dev->kite.tx_reset_requested ||
+-	    dev->kite.failed)
++	    dev->kite.failed) {
++		if (trace) {
++			dev_warn(dev->mt76.dev,
++				 "Kite path inactive: tx_bound=%u tx_reset=%u failed=%u session=%u dp_bound=%u dp_attached=%u dp_gate=%u dp_fault=%u recovery=%08x quarantine=%u tokens=%u\n",
++				 dev->kite.tx_bound, dev->kite.tx_reset_requested,
++				 dev->kite.failed, dev->kite.session, dev->kite.dp_bound,
++				 dev->kite.dp_attached,
++				 dev->mt76.kite_dp ? READ_ONCE(dev->mt76.kite_dp->gate) : 0,
++				 dev->mt76.kite_dp ? READ_ONCE(dev->mt76.kite_dp->fault) : 0,
++				 dev->recovery.state, dev->mt76.npu_quarantine,
++				 READ_ONCE(dev->mt76.token_count));
++			dev->kite.trace_log_at = jiffies;
++		}
+ 		return;
++	}
+ 	report = time_after_eq(jiffies, dev->kite.tx_log_at + 30 * HZ);
+ 	for (b = 0; b < 2; b++) {
+ 		struct mt76_queue *q = dev->kite.txq[b];
+@@ -1220,12 +1258,15 @@
+ 				dev->kite.dp_last_freed[b] = freed;
+ 			}
+ 			dp_pending = READ_ONCE(dp->tx_sent[b]) - READ_ONCE(dp->tx_freed[b]);
+-			if (report)
++			if (trace)
+ 				dev_info(dev->mt76.dev,
+-					 "Kite DP band%d: gate=%u fault=%u RX_ppe=%u RX_return=%u RX_free=%u replay=%u stale=%u TX_sent=%u TX_freed=%u TX_drop=%u pending=%u WA_bad=%u\n",
+-					 b, dp->gate, dp->fault, dp->rx_ppe[b], dp->rx_miss[b],
++					 "Kite DP band%d: session=%u epoch=%u gate=%u fault=%u RX_ppe=%u RX_host=%u RX_return=%u RX_free=%u replay=%u stale=%u policy_hit=%u policy_miss=%u TX_sent=%u TX_freed=%u TX_drop=%u pending=%u WA_bad=%u tokens=%u\n",
++					 b, dev->kite.session, kite_tx_read(&s->epoch), dp->gate,
++					 dp->fault, dp->rx_ppe[b], dp->rx_host[b], dp->rx_miss[b],
+ 					 dp->rx_free[b], dp->rx_replay[b], dp->rx_stale[b],
+-					 dp->tx_sent[b], dp->tx_freed[b], dp->tx_drop[b], dp_pending, dp->tx_bad_done);
++					 dp->stats[b].rx_policy_hit, dp->stats[b].rx_policy_miss,
++					 dp->tx_sent[b], dp->tx_freed[b], dp->tx_drop[b], dp_pending,
++					 dp->tx_bad_done, READ_ONCE(dev->mt76.token_count));
+ 		}
+ 		if (progress != q->kite_last_progress ||
+ 		    (!READ_ONCE(q->queued) && !READ_ONCE(q->kite_pending))) {
+@@ -1266,6 +1307,8 @@
+ 			break;
+ 		}
+ 	}
++	if (trace)
++		dev->kite.trace_log_at = jiffies;
+ 	if (report)
+ 		dev->kite.tx_log_at = jiffies;
+ }
+--- a/mt7915/main.c	2026-10-03 23:16:54.922126531 +0800
++++ b/mt7915/main.c	2026-10-03 23:45:39.521825110 +0800
+@@ -99,6 +99,12 @@
+ 	struct mt7915_dev *dev = mt7915_hw_dev(hw);
+ 	int ret;
+ 
++	dev_info(dev->mt76.dev,
++		 "Kite radio start begin: band=%u session=%u tx_bound=%u dp_bound=%u failed=%u recovery=%08x quarantine=%u\n",
++		 mt7915_hw_phy(hw)->mt76->band_idx, dev->kite.session,
++		 dev->kite.tx_bound, dev->kite.dp_bound, dev->recovery.failed,
++		 dev->recovery.state, dev->mt76.npu_quarantine);
++
+ 	flush_work(&dev->init_work);
+ 
+ 	mutex_lock(&dev->mt76.mutex);
+@@ -108,6 +114,11 @@
+ 	if (ret)
+ 		dev_err(dev->mt76.dev, "Wi-Fi radio start failed: band=%u error=%d\n",
+ 			mt7915_hw_phy(hw)->mt76->band_idx, ret);
++	else
++		dev_info(dev->mt76.dev,
++			 "Kite radio start complete: band=%u session=%u tx_bound=%u dp_bound=%u\n",
++			 mt7915_hw_phy(hw)->mt76->band_idx, dev->kite.session,
++			 dev->kite.tx_bound, dev->kite.dp_bound);
+ 
+ 	return ret;
+ }
+@@ -117,6 +128,12 @@
+ 	struct mt7915_dev *dev = mt7915_hw_dev(hw);
+ 	struct mt7915_phy *phy = mt7915_hw_phy(hw);
+ 
++	dev_warn(dev->mt76.dev,
++		 "Kite radio stop begin: band=%u suspend=%u session=%u tx_bound=%u dp_bound=%u failed=%u recovery=%08x quarantine=%u\n",
++		 phy->mt76->band_idx, suspend, dev->kite.session,
++		 dev->kite.tx_bound, dev->kite.dp_bound, dev->kite.failed,
++		 dev->recovery.state, dev->mt76.npu_quarantine);
++
+ 	cancel_delayed_work_sync(&phy->mt76->mac_work);
+ 
+ 	mutex_lock(&dev->mt76.mutex);
+@@ -136,6 +153,10 @@
+ 	}
+ 
+ 	mutex_unlock(&dev->mt76.mutex);
++	dev_warn(dev->mt76.dev,
++		 "Kite radio stop complete: band=%u session=%u tx_bound=%u dp_bound=%u failed=%u\n",
++		 phy->mt76->band_idx, dev->kite.session, dev->kite.tx_bound,
++		 dev->kite.dp_bound, dev->kite.failed);
+ }
+ 
+ static inline int get_free_idx(u32 mask, u8 start, u8 end)
+--- a/mt7915/mac.c	2026-10-03 23:16:54.922414082 +0800
++++ b/mt7915/mac.c	2026-10-03 23:45:39.522147915 +0800
+@@ -1722,6 +1722,13 @@
+ 	return ret;
+ }
+ 
++static u32 mt7915_kite_recovery_delay_ms(struct mt7915_dev *dev)
++{
++	u32 shift = min_t(u32, dev->recovery.retry_count, 5);
++
++	return min_t(u32, 100U << shift, 3000U);
++}
++
+ static int
+ mt7915_mac_full_reset(struct mt7915_dev *dev)
+ {
+@@ -1762,26 +1769,26 @@
+ 	}
+ 
+ 	if (ret) {
+-		/* A proven stop with a transient firmware/MAC restart error is
+-		 * recoverable.  The old path logged this as retryable but returned
+-		 * without queueing reset_work again; the next invocation then saw
+-		 * recovery.failed and left the radio disabled.  Retry a bounded
+-		 * number of times.  An unproven DMA stop still quarantines and
+-		 * remains a hard failure. */
+-		if (!dev->mt76.npu_quarantine && dev->recovery.retry_count < 3) {
+-			dev->recovery.retry_count++;
++		/* A proven stop remains recoverable.  Keep retrying with a bounded
++		 * exponential delay; only the explicit NPU quarantine proof may latch
++		 * the radio disabled. */
++		if (!dev->mt76.npu_quarantine) {
++			u32 delay_ms = mt7915_kite_recovery_delay_ms(dev);
++
++			if (dev->recovery.retry_count != U8_MAX)
++				dev->recovery.retry_count++;
+ 			dev->recovery.failed = false;
+-			dev_info(dev->mt76.dev,
+-				 "Kite full reset retry queued=%u/3 after ret=%d\n",
+-				 dev->recovery.retry_count, ret);
++			dev_warn(dev->mt76.dev,
++				 "Kite full reset retry queued=%u delay_ms=%u after ret=%d\n",
++				 dev->recovery.retry_count, delay_ms, ret);
+ 			mutex_unlock(&dev->mt76.mutex);
+-			msleep(100);
++			msleep(delay_ms);
+ 			queue_work(dev->mt76.wq, &dev->reset_work);
+ 			return ret;
+ 		}
+ 		dev->recovery.failed = true;
+ 		dev_err(dev->mt76.dev,
+-			"chip full reset failed after %d attempts: %d; queues held, reboot required; quarantine=%u tx_bound=%u dp_bound=%u retry=%u\n",
++			"chip full reset quarantined after %d attempts: %d; queues held, reboot required; quarantine=%u tx_bound=%u dp_bound=%u retry=%u\n",
+ 			i + 1, ret, dev->mt76.npu_quarantine, dev->kite.tx_bound,
+ 			dev->kite.dp_bound, dev->recovery.retry_count);
+ 		mutex_unlock(&dev->mt76.mutex);
+@@ -1828,9 +1835,18 @@
+ 	dev = container_of(work, struct mt7915_dev, reset_work);
+ 	ext_phy = dev->mt76.phys[MT_BAND1];
+ 	phy2 = ext_phy ? ext_phy->priv : NULL;
+-
+-	if (dev->recovery.failed)
++	dev_warn(dev->mt76.dev,
++		 "Kite recovery worker: state=%08x restart=%u failed=%u full=%u retry=%u tx_reset=%u tx_bound=%u dp_bound=%u quarantine=%u\n",
++		 dev->recovery.state, dev->recovery.restart, dev->recovery.failed,
++		 dev->recovery.hw_full_reset, dev->recovery.retry_count,
++		 dev->kite.tx_reset_requested, dev->kite.tx_bound, dev->kite.dp_bound,
++		 dev->mt76.npu_quarantine);
++
++	if (dev->recovery.failed) {
++		dev_warn(dev->mt76.dev,
++			 "Kite recovery worker skipped: quarantine failure latched\n");
+ 		return;
++	}
+ 
+ 	/* chip full reset */
+ 	if (dev->recovery.restart) {
+@@ -1947,24 +1963,25 @@
+ 
+ failed:
+ 	mt7915_dma_quiesce(dev);
+-	if (!dev->mt76.npu_quarantine && dev->recovery.retry_count < 3) {
+-		dev->recovery.retry_count++;
++	if (!dev->mt76.npu_quarantine) {
++		u32 delay_ms = mt7915_kite_recovery_delay_ms(dev);
++
++		if (dev->recovery.retry_count != U8_MAX)
++			dev->recovery.retry_count++;
+ 		dev->recovery.restart = true;
+ 		dev->recovery.failed = false;
+-		dev_info(dev->mt76.dev,
+-			 "Kite partial reset retry queued=%u/3 after ret=%d\n",
+-			 dev->recovery.retry_count, ret);
++		dev_warn(dev->mt76.dev,
++			 "Kite partial reset retry queued=%u delay_ms=%u after ret=%d\n",
++			 dev->recovery.retry_count, delay_ms, ret);
+ 		mutex_unlock(&dev->mt76.mutex);
+-		msleep(100);
++		msleep(delay_ms);
+ 		queue_work(dev->mt76.wq, &dev->reset_work);
+ 		return;
+ 	}
+-	if (dev->mt76.npu_quarantine)
+-		dev->recovery.failed = true;
++	dev->recovery.failed = true;
+ 	dev_err(dev->mt76.dev,
+-		"chip partial reset failed: %d; %s retry=%u\n", ret,
+-		dev->recovery.failed ? "queues held, reboot required" :
+-		"NPU stop proof remains retryable", dev->recovery.retry_count);
++		"chip partial reset quarantined: %d; queues held, reboot required; retry=%u\n",
++		ret, dev->recovery.retry_count);
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+ }
+@@ -2041,6 +2058,12 @@
+ 
+ void mt7915_reset(struct mt7915_dev *dev)
+ {
++	dev_warn(dev->mt76.dev,
++		 "Kite reset requested: state=%08x restart=%u failed=%u full=%u tx_reset=%u tx_bound=%u dp_bound=%u quarantine=%u\n",
++		 dev->recovery.state, dev->recovery.restart, dev->recovery.failed,
++		 dev->recovery.hw_full_reset, dev->kite.tx_reset_requested,
++		 dev->kite.tx_bound, dev->kite.dp_bound, dev->mt76.npu_quarantine);
++
+ 	if (!dev->recovery.hw_init_done)
+ 		return;
+ 

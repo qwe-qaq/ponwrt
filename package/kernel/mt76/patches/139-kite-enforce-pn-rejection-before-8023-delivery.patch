@@ -1,0 +1,50 @@
+Subject: [PATCH] Fix full Wi-Fi offload review safety and lifecycle findings
+
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1540,8 +1540,17 @@
+ 	spin_lock(&dev->rx_lock);
+ 	while ((skb = __skb_dequeue(frames)) != NULL) {
+ 		struct sk_buff *nskb = skb_shinfo(skb)->frag_list;
++		struct mt76_rx_status *status = (void *)skb->cb;
++		bool monitor_only;
+ 
+ 		mt76_check_ccmp_pn(dev, skb);
++		monitor_only = status->flag & RX_FLAG_ONLY_MONITOR;
++		/* mac80211's 802.3 fast RX skips the monitor/drop handler.
++		 * Free the whole MPDU while frag_list still owns its children. */
++		if (monitor_only && (status->flag & RX_FLAG_8023)) {
++			dev_kfree_skb(skb);
++			continue;
++		}
+ 		skb_shinfo(skb)->frag_list = NULL;
+ 		mt76_rx_convert(dev, skb, &hw, &sta);
+ 		ieee80211_rx_list(hw, sta, skb, &list);
+@@ -1551,6 +1560,14 @@
+ 			skb = nskb;
+ 			nskb = nskb->next;
+ 			skb->next = NULL;
++			status = (void *)skb->cb;
++			if (monitor_only)
++				status->flag |= RX_FLAG_ONLY_MONITOR;
++			if ((status->flag & (RX_FLAG_8023 | RX_FLAG_ONLY_MONITOR)) ==
++			    (RX_FLAG_8023 | RX_FLAG_ONLY_MONITOR)) {
++				dev_kfree_skb(skb);
++				continue;
++			}
+ 
+ 			mt76_rx_convert(dev, skb, &hw, &sta);
+ 			ieee80211_rx_list(hw, sta, skb, &list);
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1022,8 +1022,8 @@
+ 			mt7915_kite_tx_gate(dev, true);
+ 			dev->kite.tx_reset_requested = true;
+ 			dev_err(dev->mt76.dev,
+-				"Kite TX band%d fault/stall: code=%u; requesting full recovery, mappings retained\n",
+-				b, kite_tx_read(&s->fault));
++				"Kite TX band%d fault/stall: code=%u dp_fault=%u; requesting full recovery, mappings retained\n",
++				b, kite_tx_read(&s->fault), dp ? READ_ONCE(dp->fault) : 0);
+ 			dev->recovery.state |= MT_MCU_CMD_WDT_MASK;
+ 			mt7915_reset(dev);
+ 			break;

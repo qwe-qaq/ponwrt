@@ -1,0 +1,266 @@
+Subject: [PATCH] r61 bounded PS software probe and fixed DMA prefix
+
+--- a/dma.c
++++ b/dma.c
+@@ -392,6 +392,8 @@
+ 
+ 		q->head = next;
+ 		q->queued++;
++		if (q->kite_tx)
++			q->kite_staged++;
+ 	}
+ 
+ 	q->entry[idx].txwi = txwi;
+--- a/mt76.h
++++ b/mt76.h
+@@ -253,6 +253,7 @@
+ 	dma_addr_t kite_tx_dma;
+ 	bool kite_tx_active, kite_tx_blocked, kite_tx_pressure;
+ 	u32 kite_kicks, kite_full, kite_gated, kite_wa_freed;
++	u32 kite_staged; /* descriptors since TX_BIND, protected by q->lock */
+ 	u32 kite_last_progress, kite_pending, kite_aborted;
+ 	u32 kite_rx_polls, kite_rx_frames, kite_rx_batches, kite_rx_invalid;
+ 	u32 kite_rx_empty, kite_rx_budget, kite_rx_refill_short,
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -289,9 +289,16 @@
+ };
+ struct mt7915_kite_gate_stat { u64 requests, closed, total_ns, max_ns; };
+ struct mt7915_kite_context_stat { u64 calls, total_ns, max_ns, failed; };
++struct mt7915_kite_ps_fence {
++ u32 session, epoch, target, reaped;
++};
+ struct mt7915_kite_ps_state {
+  u32 generation, key_generation, changes, sleeps, wakes, revoked, revokes;
+  u32 resumes, coalesced, request, drain_wait, queue_wait;
++ struct mt7915_kite_ps_fence fence;
++ u32 fence_valid, fence_issued, fence_failed, fence_changes;
++ u32 probe_mask, probe_count, reason[10], dma_wait, fence_reset;
++ u64 probe_ns, probe_max_ns;
+  u64 awake_ns, drain_ns, revoke_ns, sleep_at_ns, sleep_ns;
+  unsigned long changed_at;
+  u64 blocked_ns, since_ns, max_blocked_ns;
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1097,6 +1097,7 @@
+ 		}
+ 		s = q->kite_tx;
+ 		memset(s, 0, KITE_TX_BYTES);
++		q->kite_staged = 0;
+ 		s->magic = (__force u32)cpu_to_le32(KITE_TX_MAGIC);
+ 		s->session = (__force u32)cpu_to_le32(dev->kite.session);
+ 		s->epoch = (__force u32)cpu_to_le32(dev->kite.serial + 1);
+@@ -1980,7 +1981,7 @@
+ 	ret = mt7915_kite_command(dev, KITE_CTL_DP_BIND, args, 3);
+ 	if (!ret)
+ 		dev_info(dev->mt76.dev,
+-			 "Kite datapath r60 ABI11 bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
++			 "Kite datapath r61 ABI11 bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
+ 			 s->session, s->epoch, sizeof(*s), s->perf.flags, npu_amsdu);
+ out:
+ 	if (ret)
+--- a/mt7915/npu-ps.inc
++++ b/mt7915/npu-ps.inc
+@@ -1,22 +1,70 @@
+ /* SPDX-License-Identifier: ISC */
+ /* Retry schedules observations; elapsed time is never drain proof. */
+ #define MT7915_KITE_DRAIN_RETRY_MS 10
+-static bool mt7915_dp_ps_queues_pending(struct mt7915_dev *dev, u32 wi)
++#define MT7915_KITE_PS_HOST BIT(7)
++#define MT7915_KITE_PS_OFFCHANNEL BIT(8)
++#define MT7915_KITE_PS_IDENTITY BIT(9)
++
++/* mt76.mutex protects q/shared lifetimes. No ownership is released here. */
++static bool mt7915_dp_ps_tx_identity(struct mt7915_dev *dev,
++                                    struct mt76_queue *q)
++{
++ struct kite_tx_shared *tx;
++ if (!q || !q->kite_tx_active || q->kite_tx_blocked) return false;
++ tx=q->kite_tx;
++ return tx && kite_tx_read(&tx->magic)==KITE_TX_MAGIC &&
++        kite_tx_read(&tx->session)==dev->kite.session &&
++        kite_tx_read(&tx->count)==KITE_TX_COUNT &&
++        !kite_tx_read(&tx->fault) && !kite_tx_read(&tx->cancelled);
++}
++static u32 mt7915_dp_ps_queues_pending(struct mt7915_dev *dev, u32 wi,
++                                      struct mt7915_kite_ps_fence *f)
+ {
+  struct mt76_wcid *wcid;
+  struct mt7915_sta *msta;
+  struct ieee80211_sta *sta;
+- bool pending=true;
++ struct mt76_queue *q;
++ unsigned long flags;
++ u32 pending,band=READ_ONCE(dev->mt76.kite_dp->sta[wi].band);
+  wcid=rcu_dereference_protected(dev->mt76.wcid[wi],lockdep_is_held(&dev->mt76.mutex));
+- if (!wcid || !wcid->sta) return true;
++ if (!wcid || !wcid->sta || band>=ARRAY_SIZE(dev->kite.txq)) return MT7915_KITE_PS_IDENTITY;
+  msta=container_of(wcid,struct mt7915_sta,wcid);
+  sta=container_of((void *)msta,struct ieee80211_sta,drv_priv);
++ q=dev->kite.txq[band];
+  mt76_worker_disable(&dev->mt76.tx_worker);
+  pending=ieee80211_sta_tx_pending(sta);
+- pending |= !skb_queue_empty(&wcid->tx_pending) || !skb_queue_empty(&wcid->tx_offchannel) ||
+-            atomic_read(&wcid->non_aql_packets);
++ if (!skb_queue_empty(&wcid->tx_pending)) pending |= MT7915_KITE_PS_HOST;
++ if (!skb_queue_empty(&wcid->tx_offchannel)) pending |= MT7915_KITE_PS_OFFCHANNEL;
++ if (!pending && q) {
++  spin_lock_irqsave(&q->lock,flags);
++  if (mt7915_dp_ps_tx_identity(dev,q)) {
++   f->session=kite_tx_read(&q->kite_tx->session);
++   f->epoch=kite_tx_read(&q->kite_tx->epoch);
++   f->reaped=kite_tx_read(&q->kite_tx->reaped); dma_rmb();
++   f->target=q->kite_staged;
++   /* At most one staging ring plus one device ring can be outstanding. */
++   if ((u32)(f->target-f->reaped)>2*KITE_TX_COUNT) pending |= MT7915_KITE_PS_IDENTITY;
++  } else pending |= MT7915_KITE_PS_IDENTITY;
++  spin_unlock_irqrestore(&q->lock,flags);
++ } else if (!q) pending |= MT7915_KITE_PS_IDENTITY;
+  mt76_worker_enable(&dev->mt76.tx_worker);
+  return pending;
++}
++/* Once captured, later ordinary traffic cannot move this target. Native
++ * AC/PSD and direct NPU TX use the same band WFDMA FIFO. Actual DMA reap
++ * proves transfer of the older prefix; WA remains the payload owner. */
++static bool mt7915_dp_ps_prefix_done(struct mt7915_dev *dev, u32 wi,
++                                    struct mt7915_kite_ps_fence *f)
++{
++ u32 band=READ_ONCE(dev->mt76.kite_dp->sta[wi].band);
++ struct mt76_queue *q;
++ if (band>=ARRAY_SIZE(dev->kite.txq)) return false;
++ q=dev->kite.txq[band];
++ if (!mt7915_dp_ps_tx_identity(dev,q) ||
++     kite_tx_read(&q->kite_tx->session)!=f->session ||
++     kite_tx_read(&q->kite_tx->epoch)!=f->epoch) return false;
++ f->reaped=kite_tx_read(&q->kite_tx->reaped); dma_rmb();
++ return (s32)(f->reaped-f->target)>=0;
+ }
+ static void mt7915_dp_ps_work(struct work_struct *work)
+ {
+@@ -28,7 +76,10 @@
+   struct mt7915_kite_ps_state *p = &dev->kite.ps[wi];
+   struct kdp_shared *s;
+   unsigned long flags;
+-  bool pending;
++  u32 pending,changes,issued,failed,drained;
++  struct mt7915_kite_ps_fence fence;
++  u64 start,elapsed;
++  unsigned int reason;
+   bool revoke = false;
+   int ret;
+   spin_lock_irqsave(&dev->kite.dp_done_lock, flags);
+@@ -51,6 +102,11 @@
+    }
+    WRITE_ONCE(s->sta[wi].tx_blocked, s->sta[wi].tx_blocked | KDP_TX_BLOCK_WAKE);
+    dma_wmb(); p->changed_at = jiffies; p->since_ns = ktime_get_ns();
++  }
++  if (s->session!=dev->kite.session || s->epoch!=dev->kite.dp_epoch ||
++      s->gate || kdp_failed(s)) {
++   p->fence_valid=0; p->probe_mask=MT7915_KITE_PS_IDENTITY;
++   p->reason[9]++; again=msecs_to_jiffies(MT7915_KITE_DRAIN_RETRY_MS); goto unlock;
+   }
+   /* Track PS even while the controlled port is closed; enabled remains
+    * an independent admission check. Otherwise re-authorization could
+@@ -88,24 +144,47 @@
+   if (READ_ONCE(s->sta[wi].tx_blocked) & KDP_TX_BLOCK_PS) goto unlock;
+   if (!p->awake_ns) p->awake_ns=ktime_get_ns();
+   WRITE_ONCE(s->r60.drain_wcid,wi); dma_wmb();
+-  if (READ_ONCE(s->r60.ps[wi].drained)!=p->request ||
++  drained=READ_ONCE(s->r60.ps[wi].drained);
++  dma_rmb(); /* acquire the NPU drain publication before its counters */
++  if (drained!=p->request ||
+       READ_ONCE(s->r60.ps[wi].issued)-READ_ONCE(s->r60.ps[wi].failed)!=
+       READ_ONCE(s->r60.ps[wi].consumed)) {
++   if (p->fence_valid) { p->fence_valid=0; p->fence_reset++; }
+    p->drain_wait++; again=msecs_to_jiffies(MT7915_KITE_DRAIN_RETRY_MS);
+    spin_unlock_irqrestore(&dev->kite.dp_done_lock,flags);
+    break; /* one bounded probe, no repeated PARK */
+   }
++  changes=p->changes; issued=READ_ONCE(s->r60.ps[wi].issued);
++  failed=READ_ONCE(s->r60.ps[wi].failed);
++  if (p->fence_valid && (p->fence_changes!=changes ||
++      p->fence_issued!=issued || p->fence_failed!=failed)) {
++   p->fence_valid=0; p->fence_reset++;
++  }
++  if (!p->fence_valid) {
++   spin_unlock_irqrestore(&dev->kite.dp_done_lock,flags);
++   start=ktime_get_ns();
++   pending=mt7915_dp_ps_queues_pending(dev,wi,&fence);
++   elapsed=ktime_get_ns()-start;
++   spin_lock_irqsave(&dev->kite.dp_done_lock,flags);
++   p->probe_count++; p->probe_ns+=elapsed;
++   if (elapsed>p->probe_max_ns) p->probe_max_ns=elapsed;
++   p->probe_mask=pending;
++   for (reason=0;reason<ARRAY_SIZE(p->reason);reason++)
++    if (pending & BIT(reason)) p->reason[reason]++;
++   if (pending || changes!=p->changes || (s->sta[wi].tx_blocked & KDP_TX_BLOCK_PS) ||
++       READ_ONCE(s->r60.ps[wi].drained)!=p->request ||
++       issued!=READ_ONCE(s->r60.ps[wi].issued) || failed!=READ_ONCE(s->r60.ps[wi].failed) ||
++       issued-failed!=READ_ONCE(s->r60.ps[wi].consumed)) {
++    p->queue_wait++; again=msecs_to_jiffies(MT7915_KITE_DRAIN_RETRY_MS); goto unlock;
++   }
++   p->fence=fence; p->fence_valid=1; p->fence_changes=changes;
++   p->fence_issued=issued; p->fence_failed=failed;
++  }
++  if (!mt7915_dp_ps_prefix_done(dev,wi,&p->fence)) {
++   p->dma_wait++; again=msecs_to_jiffies(MT7915_KITE_DRAIN_RETRY_MS); goto unlock;
++  }
+   spin_unlock_irqrestore(&dev->kite.dp_done_lock,flags);
+-  pending=mt7915_dp_ps_queues_pending(dev,wi);
+-  spin_lock_irqsave(&dev->kite.dp_done_lock,flags);
+-  if (pending || (s->sta[wi].tx_blocked & KDP_TX_BLOCK_PS) ||
+-      READ_ONCE(s->r60.ps[wi].drained)!=p->request ||
+-      READ_ONCE(s->r60.ps[wi].issued)-READ_ONCE(s->r60.ps[wi].failed)!=
+-      READ_ONCE(s->r60.ps[wi].consumed)) {
+-   p->queue_wait++; again=msecs_to_jiffies(MT7915_KITE_DRAIN_RETRY_MS); goto unlock;
+-  }
+-  spin_unlock_irqrestore(&dev->kite.dp_done_lock,flags);
+-  /* All old handoffs/completions are accounted for. Retire the original
++  /* Old handoffs and the captured native DMA prefix are accounted for. Retire the original
+    * policies and resume by native learning, never resurrect a stale FOE. */
+   ret=airoha_kite_revoke_tx(rcu_access_pointer(dev->mt76.mmio.ppe_dev),wi);
+   if (ret) {
+@@ -113,8 +192,9 @@
+   }
+   spin_lock_irqsave(&dev->kite.dp_done_lock,flags);
+   WRITE_ONCE(s->r60.ps[wi].active,0); dma_wmb();
+-  p->revoked=0;
+-  if (s->sta[wi].tx_blocked & KDP_TX_BLOCK_PS) {
++  p->revoked=0; p->fence_valid=0;
++  if ((s->sta[wi].tx_blocked & KDP_TX_BLOCK_PS) || changes!=p->changes ||
++      issued!=READ_ONCE(s->r60.ps[wi].issued) || failed!=READ_ONCE(s->r60.ps[wi].failed)) {
+    again=msecs_to_jiffies(MT7915_KITE_DRAIN_RETRY_MS); goto unlock;
+   }
+   if (p->awake_ns) { p->drain_ns+=ktime_get_ns()-p->awake_ns; p->awake_ns=0; }
+@@ -122,6 +202,9 @@
+   WRITE_ONCE(s->r60.ps[wi].resume_ms,(u32)jiffies_to_msecs(jiffies)); dma_wmb();
+   WRITE_ONCE(s->sta[wi].tx_blocked, s->sta[wi].tx_blocked & ~KDP_TX_BLOCK_WAKE);
+   dma_wmb();
++  if (READ_ONCE(s->r60.drain_wcid)==wi) {
++   WRITE_ONCE(s->r60.drain_wcid,0); dma_wmb();
++  }
+   clear_bit(wi, dev->kite.dp_ps_pending);
+   p->revoked = 0; p->resumes++;
+   if (p->since_ns) {
+@@ -174,6 +257,7 @@
+  changed = !!(s->sta[wi].tx_blocked & KDP_TX_BLOCK_PS) != ps;
+  if (!changed) { p->coalesced++; goto out; }
+  p->changes++;
++ if (p->fence_valid) { p->fence_valid=0; p->fence_reset++; }
+  if (ps) { p->sleeps++; if (p->awake_ns) p->drain_ns+=ktime_get_ns()-p->awake_ns; p->awake_ns=0; p->sleep_at_ns=ktime_get_ns(); }
+  else { p->wakes++; p->awake_ns=ktime_get_ns(); if (p->sleep_at_ns) { p->sleep_ns+=ktime_get_ns()-p->sleep_at_ns; p->sleep_at_ns=0; } }
+  p->changed_at = jiffies;
+--- a/mt7915/npu-r59-observe.inc
++++ b/mt7915/npu-r59-observe.inc
+@@ -67,6 +67,11 @@
+    p.request && READ_ONCE(s->r60.ps[i].learned_request)==p.request,
+    p.request && READ_ONCE(s->r60.ps[i].learned_request)==p.request ?
+     (u32)(READ_ONCE(s->r60.ps[i].learned_ms)-READ_ONCE(s->r60.ps[i].resume_ms)) : 0);
++  seq_printf(m,"r61_ps%u generation=%u key_generation=%u request=%u mask=%u probes=%u probe_ns=%llu probe_max_ns=%llu dma_wait=%u fence_reset=%u fence_valid=%u fence_target=%u fence_reaped=%u fence_session=%u fence_epoch=%u",
++   i,p.generation,p.key_generation,p.request,p.probe_mask,p.probe_count,p.probe_ns,p.probe_max_ns,
++   p.dma_wait,p.fence_reset,p.fence_valid,p.fence.target,p.fence.reaped,p.fence.session,p.fence.epoch);
++  for (j=0;j<ARRAY_SIZE(p.reason);j++) seq_printf(m," reason%u=%u",j,p.reason[j]);
++  seq_putc(m,'\n');
+   wcid = rcu_dereference_protected(dev->mt76.wcid[i], lockdep_is_held(&dev->mt76.mutex));
+   if (!wcid || !wcid->sta) continue;
+   msta = container_of(wcid, struct mt7915_sta, wcid);

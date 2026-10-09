@@ -1,0 +1,27 @@
+Subject: Reduce healthy periodic summaries; preserve all fault and recovery checks
+
+Only logging cadence changes. Sampling, debugfs counters, watchdog scheduling,
+fault detection, ownership and datapath logic remain unchanged.
+
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1292,7 +1292,9 @@
+ 		}
+ 		return;
+ 	}
+-	report = time_after_eq(jiffies, dev->kite.tx_log_at + 30 * HZ);
++	/* Healthy summaries are redundant with debugfs samples. Keep the
++	 * five-second inactive warning and every watchdog check unchanged. */
++	report = time_after_eq(jiffies, dev->kite.tx_log_at + 60 * HZ);
+ 	for (b = 0; b < 2; b++) {
+ 		struct mt76_queue *q = dev->kite.txq[b];
+ 		struct kite_tx_shared *s;
+@@ -1316,7 +1318,7 @@
+ 				dev->kite.dp_last_freed[b] = freed;
+ 			}
+ 			dp_pending = READ_ONCE(dp->tx_sent[b]) - READ_ONCE(dp->tx_freed[b]);
+-			if (trace)
++			if (report)
+ 				dev_info(dev->mt76.dev,
+ 					 "Kite DP band%d: session=%u epoch=%u gate=%u fault=%u RX_ppe=%u RX_host=%u RX_return=%u RX_free=%u replay=%u stale=%u policy_hit=%u policy_miss=%u TX_sent=%u TX_freed=%u TX_drop=%u pending=%u WA_bad=%u tokens=%u\n",
+ 					 b, dev->kite.session, kite_tx_read(&s->epoch), dp->gate,

@@ -1,0 +1,22 @@
+Subject: Kite: publish accepted PN proof before encrypted RX policy lookup
+
+The telemetry refactor evaluated policy before setting KDP_RX_PN. Every
+encrypted MPDU then failed the security precondition and fell back to host,
+even with an exact policy. Keep PN validation and proof ahead of admission.
+
+--- a/npu_kite_secure_rx.c
++++ b/npu_kite_secure_rx.c
+@@ -135,10 +135,12 @@
+ 		if (!accepted) {
+ 			dp_rx_drop(ctx, id);
+ 		} else {
+-			int policy = dp_rx_policy(s, id);
++			int policy;
+ 
+ 			r->flags |= KDP_RX_REORDERED | (m->encrypted ? KDP_RX_PN : 0);
+ 			KDP_BARRIER();
++			/* PN was accepted above; publish proof before policy lookup. */
++			policy = dp_rx_policy(s, id);
+ 			if (policy) {
+ 				s->stats[r->band].rx_policy_hit++;
+ 				if (!tdma_tx_submit(id, r->len - r->offset,

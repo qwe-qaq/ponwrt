@@ -1,0 +1,32 @@
+Subject: mt7915: preserve radio run intent before Kite reset can fail
+
+The retryable Kite recovery path must remember which PHYs were running before
+the reset transaction.  Initialising run_main/run_ext to false without taking
+the state bits loses the 5 GHz run intent when DMA or firmware restart fails,
+leaving the ext PHY disabled until a later manual device restart.  Capture and
+clear both bits before any operation that can fail; successful mt7915_run()
+re-establishes them and the error path restores them for the next retry.
+
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1458,6 +1458,9 @@
+ 
+ 	ext_phy = dev->mt76.phys[MT_BAND1];
+ 	phy2 = ext_phy ? ext_phy->priv : NULL;
++	run_main = test_and_clear_bit(MT76_STATE_RUNNING, &dev->mphy.state);
++	run_ext = ext_phy &&
++		  test_and_clear_bit(MT76_STATE_RUNNING, &ext_phy->state);
+ 
+ 	if (dev->hif2) {
+ 		mt76_wr(dev, MT_INT1_MASK_CSR, 0x0);
+@@ -1543,10 +1546,6 @@
+ 	ret = mt7915_txbf_init(dev);
+ 	if (ret)
+ 		goto out;
+-
+-	run_main = test_and_clear_bit(MT76_STATE_RUNNING, &dev->mphy.state);
+-	run_ext = ext_phy &&
+-		  test_and_clear_bit(MT76_STATE_RUNNING, &ext_phy->state);
+ 
+ 	if (run_main) {
+ 		ret = mt7915_run(dev->mphy.hw);

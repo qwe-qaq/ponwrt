@@ -1,0 +1,193 @@
+Subject: [PATCH] admit standard nft bridge L4 actions as PPE L2 capture
+
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -292,6 +292,13 @@
+ 		case FLOW_ACTION_REDIRECT:
+ 			redirect = true;
+ 			break;
++		case FLOW_ACTION_MANGLE:
++			/* nf_flow_rule_bridge emits two Ethernet mangle actions to
++			 * describe learned egress source/destination. They do not
++			 * widen the NPU L4 key and are applied to the PPE template. */
++			if (act->mangle.htype != FLOW_ACT_MANGLE_HDR_TYPE_ETH)
++				return false;
++			break;
+ 		default:
+ 			return false;
+ 		}
+@@ -300,8 +307,9 @@
+ 		return false;
+ 
+ 	flow_rule_match_control(rule, &control);
+-	if (control.key->addr_type || control.mask->addr_type != U16_MAX ||
+-	    control.mask->flags)
++	if ((control.key->addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS &&
++	     control.key->addr_type != FLOW_DISSECTOR_KEY_IPV6_ADDRS) ||
++	    control.mask->addr_type != U16_MAX || control.mask->flags)
+ 		return false;
+ 	flow_rule_match_eth_addrs(rule, &eth);
+ 	if (!airoha_kite_mask_full(eth.mask->src, ETH_ALEN) ||
+@@ -310,9 +318,14 @@
+ 	    !is_valid_ether_addr(eth.key->dst))
+ 		return false;
+ 	flow_rule_match_basic(rule, &basic);
+-	if (basic.mask->ip_proto != 0xff ||
++	if (basic.mask->n_proto != htons(U16_MAX) ||
++	    ((control.key->addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS) &&
++	     basic.key->n_proto != htons(ETH_P_IP)) ||
++	    ((control.key->addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) &&
++	     basic.key->n_proto != htons(ETH_P_IPV6)) ||
++	    basic.mask->ip_proto != 0xff ||
+ 	    (basic.key->ip_proto != IPPROTO_TCP && basic.key->ip_proto != IPPROTO_UDP) ||
+-	    (basic.mask->n_proto && basic.mask->n_proto != htons(U16_MAX)))
++	    basic.mask->padding)
+ 		return false;
+ 	flow_rule_match_ports(rule, &ports);
+ 	if (ports.mask->src != htons(U16_MAX) || ports.mask->dst != htons(U16_MAX))
+@@ -320,8 +333,10 @@
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META)) {
+ 		struct flow_match_meta meta;
+ 		flow_rule_match_meta(rule, &meta);
+-		/* No ingress-port/isolation field exists in the NPU packet key. */
+-		if (meta.mask->ingress_ifindex)
++		/* PPE admission carries the ingress device; the NPU policy remains
++		 * keyed by exact source/destination MAC. */
++		if (!meta.key->ingress_ifindex ||
++		    meta.mask->ingress_ifindex != U32_MAX || meta.mask->l2_miss)
+ 			return false;
+ 	}
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IP)) {
+@@ -352,14 +367,16 @@
+ 		struct flow_match_vlan vlan;
+ 		flow_rule_match_vlan(rule, &vlan);
+ 		if (vlan.key->vlan_tpid != htons(ETH_P_8021Q) ||
+-		    vlan.mask->vlan_id != VLAN_VID_MASK)
++		    vlan.mask->vlan_id != VLAN_VID_MASK ||
++		    vlan.mask->vlan_dei || vlan.mask->vlan_priority)
+ 			return false;
+ 	}
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_TCP)) {
+ 		struct flow_match_tcp tcp;
+ 		flow_rule_match_tcp(rule, &tcp);
+-		/* kdp_flow has no TCP flag field; never widen a flag rule. */
+-		if (tcp.mask->flags)
++		/* nf_flow_table uses a zero key and a low TCP-flag termination
++		 * guard. The NPU parser rejects those packets. */
++		if (tcp.key->flags || (tcp.mask->flags & ~htons(7)))
+ 			return false;
+ 	}
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN) ||
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1373,6 +1373,7 @@
+ 	u8 dsfield = 0, l4proto = 0;
+ 	int err, i, offload_type;
+ 	u16 addr_type = 0;
++	bool bridge_l4 = airoha_kite_bridge_l4_rule(rule);
+ 
+ 	err = airoha_ppe_flow_replace_remove(eth, f->cookie);
+ 	if (err)
+@@ -1416,8 +1417,7 @@
+ 		dsfield = match.key->tos;
+ 	}
+ 
+-	switch (addr_type) {
+-	case 0:
++	if (bridge_l4 || addr_type == 0) {
+ 		offload_type = PPE_PKT_TYPE_BRIDGE;
+ 		if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ETH_ADDRS)) {
+ 			struct flow_match_eth_addrs match;
+@@ -1428,15 +1428,17 @@
+ 		} else {
+ 			return -EOPNOTSUPP;
+ 		}
+-		break;
+-	case FLOW_DISSECTOR_KEY_IPV4_ADDRS:
+-		offload_type = PPE_PKT_TYPE_IPV4_HNAPT;
+-		break;
+-	case FLOW_DISSECTOR_KEY_IPV6_ADDRS:
+-		offload_type = PPE_PKT_TYPE_IPV6_ROUTE_5T;
+-		break;
+-	default:
+-		return -EOPNOTSUPP;
++	} else {
++		switch (addr_type) {
++		case FLOW_DISSECTOR_KEY_IPV4_ADDRS:
++			offload_type = PPE_PKT_TYPE_IPV4_HNAPT;
++			break;
++		case FLOW_DISSECTOR_KEY_IPV6_ADDRS:
++			offload_type = PPE_PKT_TYPE_IPV6_ROUTE_5T;
++			break;
++		default:
++			return -EOPNOTSUPP;
++		}
+ 	}
+ 
+ 	/* Seed the original Ethernet key. Native Ethernet MANGLE actions
+@@ -1453,8 +1455,12 @@
+ 	flow_action_for_each(i, act, &rule->action) {
+ 		switch (act->id) {
+ 		case FLOW_ACTION_MANGLE:
+-			if (offload_type == PPE_PKT_TYPE_BRIDGE)
+-				return -EOPNOTSUPP;
++			if (offload_type == PPE_PKT_TYPE_BRIDGE) {
++				if (act->mangle.htype != FLOW_ACT_MANGLE_HDR_TYPE_ETH)
++					return -EOPNOTSUPP;
++				airoha_ppe_flow_mangle_eth(act, &data.eth);
++				break;
++			}
+ 
+ 			if (act->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_ETH)
+ 				airoha_ppe_flow_mangle_eth(act, &data.eth);
+@@ -1512,16 +1518,14 @@
+ 		    !airoha_kite_bridge_l4_rule(rule))
+ 			return -EOPNOTSUPP;
+ 
+-		/* Native L2B ignores the tuple; the NPU policy retains it. */
+-		if (offload_type != PPE_PKT_TYPE_BRIDGE)
+-			flow_rule_match_ports(rule, &ports);
++		flow_rule_match_ports(rule, &ports);
+ 		data.src_port = ports.key->src;
+ 		data.dst_port = ports.key->dst;
+ 	} else if (offload_type != PPE_PKT_TYPE_BRIDGE) {
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	if (addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS) {
++	if (!bridge_l4 && addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS) {
+ 		struct flow_match_ipv4_addrs addrs;
+ 
+ 		flow_rule_match_ipv4_addrs(rule, &addrs);
+@@ -1530,7 +1534,7 @@
+ 		airoha_ppe_foe_entry_set_ipv4_tuple(&hwe, &data, false);
+ 	}
+ 
+-	if (addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
++	if (!bridge_l4 && addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
+ 		struct flow_match_ipv6_addrs addrs;
+ 
+ 		flow_rule_match_ipv6_addrs(rule, &addrs);
+@@ -1544,8 +1548,11 @@
+ 		if (act->id != FLOW_ACTION_MANGLE)
+ 			continue;
+ 
+-		if (offload_type == PPE_PKT_TYPE_BRIDGE)
+-			return -EOPNOTSUPP;
++		if (offload_type == PPE_PKT_TYPE_BRIDGE) {
++			if (act->mangle.htype != FLOW_ACT_MANGLE_HDR_TYPE_ETH)
++				return -EOPNOTSUPP;
++			continue;
++		}
+ 
+ 		switch (act->mangle.htype) {
+ 		case FLOW_ACT_MANGLE_HDR_TYPE_TCP:
+@@ -1566,7 +1573,7 @@
+ 			return err;
+ 	}
+ 
+-	if (addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS) {
++	if (!bridge_l4 && addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS) {
+ 		err = airoha_ppe_foe_entry_set_ipv4_tuple(&hwe, &data, true);
+ 		if (err)
+ 			return err;

@@ -1,0 +1,75 @@
+Subject: airoha: copy routed Ethernet key before PPE actions
+
+The flowtable offload path adds an exact Ethernet key for a Kite routed
+ tuple after resolving the ingress and egress neighbours. The PPE replace
+path historically copied Ethernet addresses only for bridge rules, leaving
+the routed key in the dissector while data.eth stayed zero. The subsequent
+validity check rejected the rule before Kite admission and no routed FOE
+could ever be installed. Seed data.eth from the explicit routed key before
+processing actions, so a later Ethernet mangle remains authoritative.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1387,50 +1387,62 @@
+ 	}
+ 
+ 	switch (addr_type) {
+ 	case 0:
+ 		offload_type = PPE_PKT_TYPE_BRIDGE;
+ 		if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ETH_ADDRS)) {
+ 			struct flow_match_eth_addrs match;
+ 
+ 			flow_rule_match_eth_addrs(rule, &match);
+ 			memcpy(data.eth.h_dest, match.key->dst, ETH_ALEN);
+ 			memcpy(data.eth.h_source, match.key->src, ETH_ALEN);
+ 		} else {
+ 			return -EOPNOTSUPP;
+ 		}
+ 		break;
+ 	case FLOW_DISSECTOR_KEY_IPV4_ADDRS:
+ 		offload_type = PPE_PKT_TYPE_IPV4_HNAPT;
+ 		break;
+ 	case FLOW_DISSECTOR_KEY_IPV6_ADDRS:
+ 		offload_type = PPE_PKT_TYPE_IPV6_ROUTE_5T;
+ 		break;
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	/* Routed Kite rules carry the exact neighbour pair in the flow
++	 * dissector.  Seed FOE construction with that key before actions run;
++	 * bridge rules already have their own key and mangle semantics. */
++	if (offload_type != PPE_PKT_TYPE_BRIDGE &&
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ETH_ADDRS)) {
++		struct flow_match_eth_addrs match;
++
++		flow_rule_match_eth_addrs(rule, &match);
++		ether_addr_copy(data.eth.h_dest, match.key->dst);
++		ether_addr_copy(data.eth.h_source, match.key->src);
++	}
++
+ 	flow_action_for_each(i, act, &rule->action) {
+ 		switch (act->id) {
+ 		case FLOW_ACTION_MANGLE:
+ 			if (offload_type == PPE_PKT_TYPE_BRIDGE)
+ 				return -EOPNOTSUPP;
+ 
+ 			if (act->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_ETH)
+ 				airoha_ppe_flow_mangle_eth(act, &data.eth);
+ 			break;
+ 		case FLOW_ACTION_REDIRECT:
+ 			odev = act->dev;
+ 			break;
+ 		case FLOW_ACTION_CSUM:
+ 			break;
+ 		case FLOW_ACTION_VLAN_PUSH:
+ 			if (data.vlan.num == 2 ||
+ 			    act->vlan.proto != htons(ETH_P_8021Q))
+ 				return -EOPNOTSUPP;
+ 
+ 			data.vlan.hdr[data.vlan.num].id = act->vlan.vid;
+ 			data.vlan.hdr[data.vlan.num].proto = act->vlan.proto;
+ 			data.vlan.num++;
+ 			break;
+ 		case FLOW_ACTION_VLAN_POP:
+ 			break;

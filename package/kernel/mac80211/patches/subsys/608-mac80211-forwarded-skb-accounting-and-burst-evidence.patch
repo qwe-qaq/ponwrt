@@ -1,0 +1,182 @@
+From: ponwrt maintainers
+Subject: [PATCH] r78: Condense unowned linear forwarded skb accounting and retain loss bursts.
+
+Native incremental patch on release77. Ownership and datapath ABI12 unchanged.
+
+--- a/net/mac80211/debugfs.c
++++ b/net/mac80211/debugfs.c
+@@ -85,10 +85,19 @@
+             IEEE80211_QUEUE_LOSS_ENTRIES, q->capacity, q->codel, q->purge);
+  for (i = first; i < q->serial; i++) {
+   const struct ieee80211_queue_loss_event *e = &q->events[i % IEEE80211_QUEUE_LOSS_ENTRIES];
+-  seq_printf(m, "queue_loss serial=%llu ns=%llu reason=%u sta=%pM tid=%u len=%u backlog=%u memory=%u tcp_valid=%u src=%pI4 sport=%u dst=%pI4 dport=%u seq=%u ack=%u frag_list=%u\n",
++  seq_printf(m, "queue_loss serial=%llu ns=%llu reason=%u sta=%pM tid=%u len=%u backlog=%u memory=%u tcp_valid=%u src=%pI4 sport=%u dst=%pI4 dport=%u seq=%u ack=%u frag_list=%u truesize=%u headlen=%u headroom=%u headsize=%u data_len=%u nr_frags=%u gso_size=%u gso_segs=%u\n",
+              e->serial, e->ns, e->reason, e->sta, e->tid, e->len,
+              e->backlog, e->memory, e->tcp_valid, &e->src, ntohs(e->sport),
+-             &e->dst, ntohs(e->dport), e->seq, e->ack, e->frag_list);
++             &e->dst, ntohs(e->dport), e->seq, e->ack, e->frag_list, e->truesize, e->headlen, e->headroom, e->headsize, e->data_len, e->nr_frags, e->gso_size, e->gso_segs);
++ }
++ seq_printf(m,"queue_condense packets=%llu bytes=%llu\n",q->condensed,q->condensed_bytes);
++ first=q->burst_serial>IEEE80211_QUEUE_BURSTS?q->burst_serial-IEEE80211_QUEUE_BURSTS:0;
++ seq_printf(m,"queue_burst_ring first=%llu last=%llu overwritten=%llu capacity=%u\n",q->burst_serial?first+1:0,q->burst_serial,first,IEEE80211_QUEUE_BURSTS);
++ for (i=first;i<q->burst_serial;i++) {
++  const struct ieee80211_queue_burst *b=&q->bursts[i%IEEE80211_QUEUE_BURSTS];
++  seq_printf(m,"queue_burst serial=%llu first_ns=%llu last_ns=%llu first_event=%llu last_event=%llu count=%llu sta=%pM tid=%u reason=%u first_truesize=%u last_truesize=%u max_truesize=%u max_memory=%u max_backlog=%u max_headsize=%u max_headroom=%u nonlinear=%u gso=%u frag_list=%u\n",
++   b->serial,b->first_ns,b->last_ns,b->first_event,b->last_event,b->count,b->sta,b->tid,b->reason,
++   b->first_truesize,b->last_truesize,b->max_truesize,b->max_memory,b->max_backlog,b->max_headsize,b->max_headroom,b->nonlinear,b->gso,b->frag_list);
+  }
+  seq_puts(m, "scope=FQ_only reason1=capacity reason2=CoDel reason3=purge tuple=head_only no_delivery_proof\n");
+  return 0;
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1452,12 +1452,22 @@
+ struct ieee80211_queue_loss_event {
+  u64 serial, ns;
+  u32 len, backlog, memory, seq, ack;
++ u32 truesize, headlen, headroom, headsize, data_len, nr_frags, gso_size, gso_segs;
+  __be32 src, dst;
+  __be16 sport, dport;
+  u8 sta[ETH_ALEN], tid, reason, tcp_valid, frag_list;
+ };
++#define IEEE80211_QUEUE_BURSTS 64
++struct ieee80211_queue_burst {
++ u64 serial, first_ns, last_ns, first_event, last_event, count;
++ u32 first_truesize, last_truesize, max_truesize, max_memory, max_backlog;
++ u32 max_headsize, max_headroom, nonlinear, gso, frag_list;
++ u8 sta[ETH_ALEN], tid, reason;
++};
+ struct ieee80211_queue_loss {
+- u64 serial, capacity, codel, purge;
++ u64 serial, capacity, codel, purge, burst_serial;
++ u64 condensed, condensed_bytes;
++ struct ieee80211_queue_burst bursts[IEEE80211_QUEUE_BURSTS];
+  struct ieee80211_queue_loss_event events[IEEE80211_QUEUE_LOSS_ENTRIES];
+ };
+ 
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -1412,11 +1412,36 @@
+  else if (reason == 2) q->codel++;
+  else q->purge++;
+  e->len = skb->len;
++ e->truesize = skb->truesize; e->headlen = skb_headlen(skb);
++ e->headroom = skb_headroom(skb); e->headsize = skb_end_offset(skb);
++ e->data_len = skb->data_len; e->nr_frags = skb_shinfo(skb)->nr_frags;
++ e->gso_size = skb_shinfo(skb)->gso_size; e->gso_segs = skb_shinfo(skb)->gso_segs;
+  e->backlog = local->fq.backlog;
+  e->memory = local->fq.memory_usage;
+  e->tid = txqi->txq.tid;
+  if (txqi->txq.sta) ether_addr_copy(e->sta, txqi->txq.sta->addr);
+  e->frag_list = skb_has_frag_list(skb);
++ /* Preserve a whole exceptional burst even if 256 packet records wrap.
++  * A 20ms separation or station/TID/reason change starts another burst. */
++ {
++  struct ieee80211_queue_burst *b = &q->bursts[(q->burst_serial ? q->burst_serial - 1 : 0) % IEEE80211_QUEUE_BURSTS];
++  if (!q->burst_serial || e->ns - b->last_ns > 20000000 ||
++      b->reason != reason || b->tid != e->tid || memcmp(b->sta,e->sta,ETH_ALEN)) {
++   b = &q->bursts[q->burst_serial++ % IEEE80211_QUEUE_BURSTS];
++   memset(b,0,sizeof(*b)); b->serial=q->burst_serial;
++   b->first_ns=e->ns; b->first_event=e->serial;
++   b->first_truesize=e->truesize; b->reason=reason; b->tid=e->tid;
++   ether_addr_copy(b->sta,e->sta);
++  }
++  b->last_ns=e->ns; b->last_event=e->serial; b->count++;
++  b->last_truesize=e->truesize;
++  b->max_truesize=max(b->max_truesize,e->truesize);
++  b->max_memory=max(b->max_memory,e->memory);
++  b->max_backlog=max(b->max_backlog,e->backlog);
++  b->max_headsize=max(b->max_headsize,e->headsize);
++  b->max_headroom=max(b->max_headroom,e->headroom);
++  b->nonlinear+=!!e->data_len; b->gso+=!!e->gso_size; b->frag_list+=!!e->frag_list;
++ }
+  /* IPv4 TCP header identity only. Aggregates describe their head only;
+   * short/non-IP/fragmented/invalid headers keep tcp_valid=0. */
+  if (skb->protocol != htons(ETH_P_IP) || off < 0 ||
+@@ -1507,17 +1532,39 @@
+ 	ieee80211_free_txskb(&local->hw, skb);
+ }
+ 
++/* No copy/allocation and no socket-owned, shared or nonlinear rewrite.
++ * __pskb_pull_tail can leave fragment charges on an already linear skb;
++ * the core helper normalizes only actual head allocation accounting. */
++static u32 ieee80211_txq_condense(struct sk_buff *skb)
++{
++ u32 before = skb->truesize;
++ if (!skb->sk && !skb->destructor && !skb_shared(skb) && !skb_cloned(skb) &&
++     !skb_is_nonlinear(skb) && !skb_is_gso(skb) && !skb_has_frag_list(skb) &&
++     before > SKB_TRUESIZE(skb_end_offset(skb)))
++  skb_condense(skb);
++ return before - skb->truesize;
++}
++
+ static void ieee80211_txq_enqueue(struct ieee80211_local *local,
+ 				  struct txq_info *txqi,
+ 				  struct sk_buff *skb)
+ {
+ 	struct fq *fq = &local->fq;
+ 	struct fq_tin *tin = &txqi->tin;
+-	u32 flow_idx;
+-
++	u32 flow_idx, condensed = 0;
++	u64 saved = 0;
++	struct sk_buff *segment;
++
++	if (local->hw.txq_condense)
++		for (segment = skb; segment; segment = segment->next) {
++			u32 bytes = ieee80211_txq_condense(segment);
++			condensed += !!bytes; saved += bytes;
++		}
+ 	ieee80211_set_skb_enqueue_time(skb);
+ 
+ 	spin_lock_bh(&fq->lock);
++	local->queue_loss.condensed += condensed;
++	local->queue_loss.condensed_bytes += saved;
+ 	/*
+ 	 * For management frames, don't really apply codel etc.,
+ 	 * we don't want to apply any shaping or anything we just
+@@ -6794,3 +6841,17 @@
+  spin_unlock_bh(&local->fq.lock);
+ }
+ EXPORT_SYMBOL(ieee80211_sta_txq_observe);
++
++bool ieee80211_sta_txq_maybe_empty(struct ieee80211_sta *pub)
++{
++ int i;
++ for (i=0;i<IEEE80211_NUM_TIDS+1;i++) {
++  struct ieee80211_txq *q=READ_ONCE(pub->txq[i]);
++  struct txq_info *qi;
++  if (!q) continue;
++  qi=to_txq_info(q);
++  if (READ_ONCE(qi->tin.backlog_packets) || READ_ONCE(qi->frags.qlen)) return false;
++ }
++ return true;
++}
++EXPORT_SYMBOL(ieee80211_sta_txq_maybe_empty);
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -3192,6 +3192,7 @@
+  *	within &struct ieee80211_sta.
+  * @chanctx_data_size: size (in bytes) of the drv_priv data area
+  *	within &struct ieee80211_chanctx_conf.
++ * @txq_condense: normalize unowned linear forwarded skb accounting before FQ
+  * @txq_data_size: size (in bytes) of the drv_priv data area
+  *	within @struct ieee80211_txq.
+  *
+@@ -3285,6 +3286,7 @@
+ 	int sta_data_size;
+ 	int chanctx_data_size;
+ 	int txq_data_size;
++	bool txq_condense;
+ 	u16 queues;
+ 	u16 max_listen_interval;
+ 	s8 max_signal;
+@@ -7933,6 +7935,9 @@
+  * driver to capture a finite DMA prefix, not to free any payload.
+  */
+ u32 ieee80211_sta_tx_pending(struct ieee80211_sta *sta);
++/* Caller retains STA lifetime with RCU or mutex. Racy empty is only a hint
++ * to schedule the full proof, never authorizes delivery or frees ownership. */
++bool ieee80211_sta_txq_maybe_empty(struct ieee80211_sta *sta);
+ /* Diagnostic/negative probe only. Zero is never a software drain proof.
+  * dequeued counts FQ dequeues, not WFDMA/WA completion or peer ACK. */
+ struct ieee80211_sta_txq_observation {

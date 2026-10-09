@@ -1,0 +1,48 @@
+From: ponwrt maintainers
+Subject: [PATCH] r77: Expose FE1 enabled state and sampled credit peaks.
+
+Native incremental patch on release76. Ownership and datapath ABI12 unchanged.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -912,7 +912,7 @@
+   n+=sysfs_emit_at(buf,n,"queue_band%u pending=%u peak=%u demand=%u credit_hold=%u no_buffer=%u wait_kind=%u wait_at=%u no_buffer_cycles=%u credit_cycles=%u released=%u dma_wait=%u wa_wait=%u ready_wait=%u owner_wcid=%u owner_pending=%u sta_peak=%u no_buffer_cycles_hi=%u credit_cycles_hi=%u\n",
+    b,p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15],p[16],p[17]);
+  }
+- n+=sysfs_emit_at(buf,n,"scope=KF1_u32_counters waits_not_drops pressure_fields_only_at_pressure_tick owner_and_sta_peak_sampled_at_pressure_tick per_STA_FIFO_not_bypassed\n");
++ n+=sysfs_emit_at(buf,n,"scope=KF1_u32_counters waits_not_drops revision77_peak_sampled_at_publication pressure_fields_only_at_pressure_tick owner_and_sta_peak_sampled_at_pressure_tick per_STA_FIFO_not_bypassed\n");
+  mutex_unlock(&d->lock);return n;
+ }
+ static DEVICE_ATTR_RO(clanker_queue_status);
+@@ -923,10 +923,10 @@
+  struct airoha_clanker_diag *d=((struct airoha_npu *)dev_get_drvdata(dev))->clanker;
+  const u32 *v;ssize_t n=0;
+  mutex_lock(&d->lock);v=d->feed+4;
+- n+=sysfs_emit_at(buf,n,"feed available=%u last_error=%d age_ms=%u producer_age_ms=%u valid=%u seq=%u session=%u epoch=%u revision=%u mhz=%u tick=%u\n",
++ n+=sysfs_emit_at(buf,n,"feed available=%u last_error=%d age_ms=%u producer_age_ms=%u valid=%u seq=%u session=%u epoch=%u revision=%u mhz=%u tick=%u enabled=%u\n",
+   d->feed_valid,d->feed_error,d->feed_valid?jiffies_to_msecs(jiffies-d->feed_updated):0,
+-  d->feed_valid?jiffies_to_msecs(jiffies-d->feed_advanced):0,v[0],v[1],v[2],v[3],v[4],v[5],v[6]);
+- if(d->feed_valid&&v[0])for(u32 b=0;b<2;b++){
++  d->feed_valid?jiffies_to_msecs(jiffies-d->feed_advanced):0,v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[4]>=77?v[7]:1);
++ if(d->feed_valid&&v[0]&&(v[4]<77||v[7]))for(u32 b=0;b<2;b++){
+   const u32 *p=v+9+b*24;
+   n+=sysfs_emit_at(buf,n,"feed_band%u batches=%u packets=%u batch1=%u batch2_4=%u batch5_8=%u batch9_15=%u batch16=%u end_other=%u end_empty=%u end_token=%u end_credit=%u end_ps=%u end_gate=%u end_ring=%u end_budget=%u sampled_mixed=%u last_wcid=%u last_tid=%u sampled_run_max=%u gap_samples=%u gap_cycles=%u gap_max=%u ready_gap_samples=%u ready_gap_cycles=%u\n",
+    b,p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15],p[16],p[17],p[18],p[19],p[20],p[21],p[22],p[23]);
+@@ -1080,7 +1080,7 @@
+    queue_error=airoha_npu_wlan_msg_get(npu,7,
+     (enum airoha_npu_wlan_get_cmd)32,path,sizeof(path),GFP_KERNEL);
+    if (!queue_error && (path[0]!=CLANKER_DIAG_MAGIC || path[1]!=7 ||
+-       path[61]!=0x4b460001 || (path[4] && path[8]!=76))) queue_error=-EPROTO;
++       path[61]!=0x4b460001 || (path[4] && path[8]!=76 && path[8]!=77))) queue_error=-EPROTO;
+   }
+   mutex_lock(&d->lock);
+   d->queue_error=queue_error;
+@@ -1099,7 +1099,7 @@
+    feed_error=airoha_npu_wlan_msg_get(npu,8,
+     (enum airoha_npu_wlan_get_cmd)32,path,sizeof(path),GFP_KERNEL);
+    if (!feed_error && (path[0]!=CLANKER_DIAG_MAGIC || path[1]!=8 ||
+-       path[61]!=0x4b450001 || (path[4] && path[8]!=76))) feed_error=-EPROTO;
++       path[61]!=0x4b450001 || (path[4] && path[8]!=76 && path[8]!=77))) feed_error=-EPROTO;
+   }
+   mutex_lock(&d->lock);
+   d->feed_error=feed_error;

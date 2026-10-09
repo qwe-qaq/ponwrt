@@ -1,0 +1,61 @@
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -616,6 +616,7 @@
+ 	case 1: return "running";
+ 	case 2: return "parking";
+ 	case 3: return "parked";
++	case 4: return "faulted-dma-unconfirmed";
+ 	default: return "unknown";
+ 	}
+ }
+@@ -640,7 +641,7 @@
+ 
+ 		n += sysfs_emit_at(buf, n,
+ 			"control mode=%s state=%s session=%u serial=%u result=%u ack=%#x accepted=%u rejected=%u stations=%u ba=%u key_fences=%u\n",
+-			k[15] ? "control-only" : "data-development",
++			!k[6] ? "none" : k[15] ? "control-only" : "data-development",
+ 			airoha_clanker_control_state(k[6]), k[3], k[4], k[5],
+ 			k[7], k[10], k[11], k[12], k[13], k[14]);
+ 	}
+@@ -681,6 +682,11 @@
+ 	n += sysfs_emit_at(buf, n,
+ 		"tdma outstanding=%u/%u invalid_returns=%u duplicate_submits=%u\n",
+ 		c[27], c[28], c[29], c[30]);
++	if (c[31] == 0x4b480001)
++		n += sysfs_emit_at(buf, n,
++			"host_dma session=%u epoch=%u bands=%#x inflight=%u fault=%u submitted=%u completed=%u timeouts=%u last_src=%#x last_dst=%#x last_len=%u\n",
++			c[39], c[32], c[33], c[34], c[35], c[36], c[37],
++			c[38], c[40], c[41], c[42]);
+ out:
+ 	mutex_unlock(&d->lock);
+ 	return n;
+@@ -775,7 +781,8 @@
+ 		if (d->quiet[i] >= 3)
+ 			quiet |= BIT(i);
+ 	}
+-	report = d->samples < 2 || !(d->samples % 3) || traps || previous_error;
++	report = d->samples < 2 || !(d->samples % 3) || traps || previous_error ||
++		 (data[1][31] == 0x4b480001 && data[1][35] != d->data[1][35]);
+ 	d->samples++;
+ 	d->moving = moving;
+ 	memcpy(d->data, data, sizeof(data));
+@@ -799,13 +806,18 @@
+ 		else
+ 			dev_info(npu->dev,
+ 				 "Clanker control: mode=%s state=%s session=%u serial=%u result=%u ack=%#x accepted=%u rejected=%u sta=%u ba=%u keys=%u; data=host PN=host\n",
+-				 control[15] ? "control-only" : "data-development",
++				 !control[6] ? "none" : control[15] ? "control-only" : "data-development",
+ 				 airoha_clanker_control_state(control[6]), control[3],
+ 				 control[4], control[5], control[7], control[10],
+ 				 control[11], control[12], control[13], control[14]);
+ 		dev_info(npu->dev,
+ 			 "Clanker TDMA: outstanding=%u/%u invalid_returns=%u duplicate_submits=%u\n",
+ 			 data[1][27], data[1][28], data[1][29], data[1][30]);
++		if (data[1][31] == 0x4b480001)
++			dev_info(npu->dev,
++				 "Clanker host DMA: session=%u epoch=%u bands=%#x inflight=%u fault=%u submitted=%u completed=%u timeouts=%u\n",
++				 data[1][39], data[1][32], data[1][33], data[1][34],
++				 data[1][35], data[1][36], data[1][37], data[1][38]);
+ 	}
+ 	for (i = 0; i < 8; i++) {
+ 		u32 *h = data[0] + 14 + i * 6;

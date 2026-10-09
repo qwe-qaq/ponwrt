@@ -1,0 +1,19 @@
+Subject: netfilter: mark Kite bridge paths software-only only for bridge flowtables
+
+The bridge-policy restriction is only valid for nft bridge flowtables.  The
+same path walker is also used by inet/routed flowtables; marking every
+DEV_PATH_AIROHA_NPU path as bridge_sw_only disables the Wi-Fi NPU endpoint on
+WAN/routed flows before the PPE driver can receive the rule.  Carry the path
+kind explicitly so routed Wi-Fi traffic remains eligible while exact bridge
+L4/domain rules retain the software fallback.
+
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -108,5 +108,6 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+ 		info->sw_only |= !!(path->flags & NET_DEVICE_PATH_F_SW_ONLY);
+ 		/* Kite cannot express nft bridge L4+isolation-domain matches.
+ 		 * This restriction is bridge-only: routed NPU paths stay eligible. */
+-		info->bridge_sw_only |= path->type == DEV_PATH_AIROHA_NPU;
++		if (flowtable->type->family == NFPROTO_BRIDGE)
++			info->bridge_sw_only |= path->type == DEV_PATH_AIROHA_NPU;
+ 		switch (path->type) {

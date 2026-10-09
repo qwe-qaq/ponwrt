@@ -1,0 +1,53 @@
+Subject: airoha: use the Wi-Fi BSS MAC for routed Kite ingress policy
+
+The routed flowtable rule carries the post-route Ethernet pair needed by the
+PPE FOE: station source and upstream next-hop destination.  The NPU evaluates
+the original 802.3 frame before routing, however, so its destination is the
+AP/BSS MAC.  Reusing the post-route destination made every routed RX policy
+miss even when the five-tuple and station generation were correct.  Keep the
+PPE key unchanged and seed the NPU policy with the ingress Wi-Fi interface
+MAC for routed IPv4/IPv6 flows.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -756,4 +756,5 @@
+ 	atomic64_t kite_replace_reuse, kite_replace_gc;
+ 	atomic64_t kite_ingress_published, kite_downlink_published;
++	atomic64_t kite_routed_ingress, kite_routed_mac_rewrite;
+ 	int kite_prepare_errno;
+ };
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -254,7 +254,6 @@
+ 	k->wcid = in.airoha_npu.wcid;
+ 	k->band = in.airoha_npu.band;
+ 	k->bss = in.airoha_npu.bss;
+ 	ether_addr_copy(k->smac, mac.key->src);
+-	ether_addr_copy(k->dmac, mac.key->dst);
+ 	k->vlan = KDP_SLOT_NONE;
+ 	k->hw_slot = KDP_SLOT_NONE;
+@@ -309,4 +309,14 @@
+ 	} else {
+ 		k->type = KDP_FLOW_BRIDGE;
+ 	}
++	/* mac.key is also used by the PPE FOE and therefore contains the
++	 * post-route neighbour destination for routed rules.  Kite sees the
++	 * original Wi-Fi frame before routing; its destination is the BSS MAC.
++	 * Bridge policies retain their exact peer destination. */
++	ether_addr_copy(k->dmac, mac.key->dst);
++	if (k->type != KDP_FLOW_BRIDGE && idev->ieee80211_ptr) {
++		ether_addr_copy(k->dmac, idev->dev_addr);
++		atomic64_inc(&ppe->kite_routed_ingress);
++		atomic64_inc(&ppe->kite_routed_mac_rewrite);
++	}
+ 	if (k->type != KDP_FLOW_BRIDGE) {
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -236,4 +236,7 @@
+ 		atomic64_read(&ppe->kite_ingress_published),
+ 		atomic64_read(&ppe->kite_downlink_published));
++	seq_printf(m, "kite_routed_ingress=%lld kite_routed_mac_rewrite=%lld\n",
++		atomic64_read(&ppe->kite_routed_ingress),
++		atomic64_read(&ppe->kite_routed_mac_rewrite));
+ 	{
+ 		struct airoha_flow_table_entry *flow;

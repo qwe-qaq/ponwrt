@@ -1,0 +1,178 @@
+From: ponwrt maintainers
+Subject: [PATCH] r79 event-first PS wake and load counters
+
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -314,7 +314,8 @@
+  u32 probe_mask, probe_count, reason[10], dma_wait, fence_reset;
+  u64 probe_ns, probe_max_ns;
+  u32 progress_wakes, worker_runs, seen_consumed, seen_drained, seen_reaped, seen_staged;
+- u32 progress_coalesced, empty_hint_wakes;
++ u32 progress_coalesced, empty_hint_wakes, watchdog_runs;
++ bool event_empty;
+  u32 negative_request, worst_request, worst_tid;
+  u64 negative_since_ns, worst_wait_ns, worst_ns;
+  struct ieee80211_sta_txq_observation worst_backlog;
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1573,7 +1573,7 @@
+  }
+  seq_printf(m, "observe_abi=1 valid=%u seq=%u latency_tick_cycles=256 reap_scope=global_band0\n", valid, seq);
+  if (valid) {
+-  seq_printf(m, "observe_config sample_shift=%u clock_mhz=%u publishes=%u hint_sets=4 hint_ways=2\n",
++  seq_printf(m, "observe_config sample_shift=%u clock_mhz=%u publishes=%u hint_sets=4 hint_ways=4 recent_flows=4 probe_scope=slow_lookup\n",
+              o.sample_shift, o.clock_mhz, o.publishes);
+   for (b = 0; b < 2; b++) {
+    struct kdp_observe_band *v = &o.band[b];
+--- a/mt7915/npu-ps.inc
++++ b/mt7915/npu-ps.inc
+@@ -1,6 +1,11 @@
+ /* SPDX-License-Identifier: ISC */
+ /* Retry schedules observations; elapsed time is never drain proof. */
+-#define MT7915_KITE_DRAIN_RETRY_MS 2
++/* TX-worker/NAPI events are primary. Only a lost-event/no-IRQ watchdog
++ * remains; elapsed time still never proves that any queue is empty. */
++/* A pending PS transaction is retried on the next jiffy after an event or
++ * failed proof.  The long period is reserved for the no-event watchdog. */
++#define MT7915_KITE_DRAIN_RETRY_MS 100
++#define MT7915_KITE_PS_RETRY_JIFFIES 1
+ #define MT7915_KITE_PS_HOST BIT(7)
+ #define MT7915_KITE_PS_OFFCHANNEL BIT(8)
+ #define MT7915_KITE_PS_IDENTITY BIT(9)
+@@ -69,23 +74,22 @@
+   consumed=READ_ONCE(s->r60.ps[wi].consumed);
+   drained=READ_ONCE(s->r60.ps[wi].drained);
+   reaped=kite_tx_read(&q->kite_tx->reaped); staged=READ_ONCE(q->kite_staged);
+-  /* Notify only when the current wait can finish. Global staging traffic
+-   * does not prove this station's software queue empty. Its already armed
+-   * bounded retry remains the fallback; native completion does not busy-
+-   * wake a sleeping worker repeatedly within that same jiffy. */
++  /* Coalesce unchanged queue states. No jiffy throttle: the first empty
++   * edge or DMA-prefix completion schedules the unchanged full proof now. */
+   if (p->fence_valid) {
+-   if ((s32)(reaped-p->fence.target)<0) { p->progress_coalesced++; continue; }
++   if ((s32)(reaped-p->fence.target)<0) {p->progress_coalesced++;continue;}
+   } else if (drained!=p->request ||
+        READ_ONCE(s->r60.ps[wi].issued)-READ_ONCE(s->r60.ps[wi].failed)!=consumed) {
+    if (consumed==p->seen_consumed && drained==p->seen_drained) continue;
+-  } else if (p->probe_mask && time_before(jiffies,p->queue_retry_at)) {
+-   if (!(p->probe_mask & (IEEE80211_STA_TX_TXQ | IEEE80211_STA_TX_FRAG)) ||
+-       p->empty_hint_at == jiffies || !mt7915_dp_ps_empty_hint(dev,wi)) {
+-    p->progress_coalesced++; continue;
+-   }
+-   p->empty_hint_at=jiffies; p->empty_hint_wakes++;
++  } else if (p->probe_mask & (IEEE80211_STA_TX_TXQ | IEEE80211_STA_TX_FRAG)) {
++   bool empty=mt7915_dp_ps_empty_hint(dev,wi);
++   if (!empty) {p->event_empty=false;p->progress_coalesced++;continue;}
++   if (p->event_empty && staged==p->seen_staged && reaped==p->seen_reaped) {
++    p->progress_coalesced++;continue;
++   }
++   p->event_empty=true;p->empty_hint_wakes++;
+   } else if (consumed==p->seen_consumed && drained==p->seen_drained &&
+-             reaped==p->seen_reaped) continue;
++             reaped==p->seen_reaped && staged==p->seen_staged) continue;
+   p->seen_consumed=consumed; p->seen_drained=drained;
+   p->seen_reaped=reaped; p->seen_staged=staged;
+   p->progress_wakes++; if (!p->queued_ns) p->queued_ns=ktime_get_ns(); wake=true;
+@@ -106,6 +110,13 @@
+         kite_tx_read(&tx->session)==dev->kite.session &&
+         kite_tx_read(&tx->count)==KITE_TX_COUNT &&
+         !kite_tx_read(&tx->fault) && !kite_tx_read(&tx->cancelled);
++}
++static unsigned long mt7915_dp_ps_retry_delay(const struct mt7915_kite_ps_state *p)
++{
++ /* since_ns remains set from the PS transition until the complete proof and
++  * reauthorization finish.  Never add the watchdog delay to a live fence. */
++ return p->since_ns || p->revoked || p->fence_valid ?
++  MT7915_KITE_PS_RETRY_JIFFIES : msecs_to_jiffies(MT7915_KITE_DRAIN_RETRY_MS);
+ }
+ static u32 mt7915_dp_ps_queues_pending(struct mt7915_dev *dev, u32 wi,
+                                       struct mt7915_kite_ps_fence *f)
+@@ -229,11 +240,12 @@
+   s = READ_ONCE(dev->mt76.kite_dp);
+   if (!test_bit(wi, dev->kite.dp_ps_pending)) goto unlock;
+   if (serviced++ == 8) {
+-   again=msecs_to_jiffies(MT7915_KITE_DRAIN_RETRY_MS);
++   again=1;
+    spin_unlock_irqrestore(&dev->kite.dp_done_lock,flags); break;
+   }
+   dev->kite.ps_cursor=wi % (KDP_WCIDS - 1);
+   p->worker_runs++;
++  if (!p->queued_ns) p->watchdog_runs++;
+   if (p->queued_ns) {
+    u64 delay=ktime_get_ns()-p->queued_ns;
+    p->queue_delay_ns+=delay;
+@@ -262,7 +274,7 @@
+   if (s->session!=dev->kite.session || s->epoch!=dev->kite.dp_epoch ||
+       s->gate || kdp_failed(s)) {
+    p->fence_valid=0; p->probe_mask=MT7915_KITE_PS_IDENTITY;
+-   p->reason[9]++; again=msecs_to_jiffies(MT7915_KITE_DRAIN_RETRY_MS); goto unlock;
++   p->reason[9]++; again=mt7915_dp_ps_retry_delay(p); goto unlock;
+   }
+   /* Track PS even while the controlled port is closed; enabled remains
+    * an independent admission check. Otherwise re-authorization could
+@@ -306,7 +318,7 @@
+       READ_ONCE(s->r60.ps[wi].issued)-READ_ONCE(s->r60.ps[wi].failed)!=
+       READ_ONCE(s->r60.ps[wi].consumed)) {
+    if (p->fence_valid) { p->fence_valid=0; p->fence_reset++; }
+-   p->drain_wait++; again=msecs_to_jiffies(MT7915_KITE_DRAIN_RETRY_MS);
++   p->drain_wait++; again=mt7915_dp_ps_retry_delay(p);
+    spin_unlock_irqrestore(&dev->kite.dp_done_lock,flags);
+    break; /* one bounded probe, no repeated PARK */
+   }
+@@ -325,21 +337,25 @@
+    p->probe_count++; p->probe_ns+=elapsed;
+    if (elapsed>p->probe_max_ns) p->probe_max_ns=elapsed;
+    p->probe_mask=pending;
+-   p->queue_retry_at=jiffies+max_t(unsigned long,1,msecs_to_jiffies(MT7915_KITE_DRAIN_RETRY_MS));
++   p->queue_retry_at=jiffies+mt7915_dp_ps_retry_delay(p);
+    for (reason=0;reason<ARRAY_SIZE(p->reason);reason++)
+     if (pending & BIT(reason)) p->reason[reason]++;
+    if (pending || changes!=p->changes || (s->sta[wi].tx_blocked & KDP_TX_BLOCK_PS) ||
+        READ_ONCE(s->r60.ps[wi].drained)!=p->request ||
+        issued!=READ_ONCE(s->r60.ps[wi].issued) || failed!=READ_ONCE(s->r60.ps[wi].failed) ||
+        issued-failed!=READ_ONCE(s->r60.ps[wi].consumed)) {
+-    p->queue_wait++; again=msecs_to_jiffies(MT7915_KITE_DRAIN_RETRY_MS); goto unlock;
++    /* The full queue/FQ/fragment/local proof failed.  Clear the old empty
++     * edge so the next event is not coalesced as an already-proven empty
++     * state; the transaction itself is retried on the next jiffy. */
++    p->event_empty=false;
++    p->queue_wait++; again=mt7915_dp_ps_retry_delay(p); goto unlock;
+    }
+    p->fence=fence; p->fence_valid=1; p->fence_changes=changes;
+    mt7915_dp_ps_trace_locked(dev,wi,4,pending);
+    p->fence_issued=issued; p->fence_failed=failed;
+   }
+   if (!mt7915_dp_ps_prefix_done(dev,wi,&p->fence)) {
+-   p->dma_wait++; again=msecs_to_jiffies(MT7915_KITE_DRAIN_RETRY_MS); goto unlock;
++   p->dma_wait++; again=mt7915_dp_ps_retry_delay(p); goto unlock;
+   }
+   /* Original rule objects stay suspended with INVALID hardware slots.
+    * Only a fresh native REPLACE can authorize learning after this fence. */
+@@ -348,7 +364,7 @@
+   p->revoked=0; p->fence_valid=0;
+   if ((s->sta[wi].tx_blocked & KDP_TX_BLOCK_PS) || changes!=p->changes ||
+       issued!=READ_ONCE(s->r60.ps[wi].issued) || failed!=READ_ONCE(s->r60.ps[wi].failed)) {
+-   again=msecs_to_jiffies(MT7915_KITE_DRAIN_RETRY_MS); goto unlock;
++   again=mt7915_dp_ps_retry_delay(p); goto unlock;
+   }
+   if (p->awake_ns) { p->drain_ns+=ktime_get_ns()-p->awake_ns; p->awake_ns=0; }
+   WRITE_ONCE(s->r60.ps[wi].learned_request,0);
+@@ -411,6 +427,7 @@
+  }
+  changed = !!(s->sta[wi].tx_blocked & KDP_TX_BLOCK_PS) != ps;
+  if (!changed) { p->coalesced++; mt7915_dp_ps_trace_locked(dev,wi,1,ps); goto out; }
++ p->event_empty=false;
+  p->changes++;
+  if (p->fence_valid) { p->fence_valid=0; p->fence_reset++; }
+  if (ps) { p->sleeps++; if (p->awake_ns) p->drain_ns+=ktime_get_ns()-p->awake_ns; p->awake_ns=0; p->sleep_at_ns=ktime_get_ns(); }
+--- a/mt7915/npu-r59-observe.inc
++++ b/mt7915/npu-r59-observe.inc
+@@ -190,6 +190,7 @@
+     bound?(u32)(READ_ONCE(s->r60.ps[i].learned_ms)-first):0);
+   }
+   seq_printf(m,"r64_ps%u progress_coalesced=%u\n",i,p.progress_coalesced);
++  seq_printf(m,"r79_ps%u watchdog_runs=%u empty_edge=%u watchdog_ms=100\n",i,p.watchdog_runs,p.event_empty);
+   seq_printf(m,"r63_ps%u progress_wakes=%u worker_runs=%u queue_delay_ns=%llu queue_delay_max_ns=%llu\n",
+    i,p.progress_wakes,p.worker_runs,p.queue_delay_ns,p.queue_delay_max_ns);
+   seq_printf(m,"r66_ps%u negative=%u confirm=%u nudges=%u backlog_request=%u backlog_ns=%llu staged=%u reaped=%u queue_flags=%u non_aql=%u\n",

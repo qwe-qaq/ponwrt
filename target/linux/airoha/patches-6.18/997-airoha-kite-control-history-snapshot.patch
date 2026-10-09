@@ -1,0 +1,82 @@
+From: ponwrt maintainers
+Subject: [PATCH] r78: Retain transition bursts and format outside the flow mutex.
+
+Native incremental patch on release77. Ownership and datapath ABI12 unchanged.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -720,7 +720,7 @@
+ #define AIROHA_RXD4_FOE_ENTRY		GENMASK(15, 0)
+ 
+ /* flow_offload_mutex serializes this control-only ring. No packet logs. */
+-#define AIROHA_KITE_FLOW_EVENTS 256
++#define AIROHA_KITE_FLOW_EVENTS 1024
+ struct airoha_kite_flow_event {
+  u64 serial, ns;
+  unsigned long cookie;
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -191,28 +191,56 @@
+ }
+ DEFINE_SHOW_ATTRIBUTE(airoha_ppe_debugfs_foe_bind);
+ 
++/* Readers copy control metadata once; large formatting/retries never hold
++ * the flow admission mutex. Fixed capacity includes the r77 638-event burst. */
++struct airoha_kite_history_snapshot {
++ u64 serial;
++ struct airoha_kite_flow_event events[AIROHA_KITE_FLOW_EVENTS];
++};
+ static int airoha_ppe_debugfs_kite_history_show(struct seq_file *m, void *private)
+ {
+- struct airoha_ppe *ppe=m->private;
++ struct airoha_kite_history_snapshot *snap=m->private;
+  u64 last, first, n;
+- mutex_lock(&flow_offload_mutex);
+- last=ppe->kite_event_serial;
++ last=snap->serial;
+  first=last>AIROHA_KITE_FLOW_EVENTS ? last-AIROHA_KITE_FLOW_EVENTS+1 : 1;
+  seq_printf(m,"r76_flow_ring first=%llu last=%llu overwritten=%llu capacity=%u\n",
+   last?first:0,last,last>AIROHA_KITE_FLOW_EVENTS?last-AIROHA_KITE_FLOW_EVENTS:0,
+   AIROHA_KITE_FLOW_EVENTS);
+  for (n=first;n<=last;n++) {
+-  const struct airoha_kite_flow_event *e=&ppe->kite_events[(n-1)%AIROHA_KITE_FLOW_EVENTS];
++  const struct airoha_kite_flow_event *e=&snap->events[(n-1)%AIROHA_KITE_FLOW_EVENTS];
+   const struct kdp_flow *f=&e->key;
+   seq_printf(m,"r76_flow seq=%llu ns=%llu event=%u cookie=%lu request=%u active=%u blocked=%u suspended=%u soft_slot=%u soft_version=%u session=%u generation=%u key_generation=%u wcid=%u band=%u type=%u protocol=%u vlan=%u dsfield=%u dsmask=%u ports=%08x src=%08x:%08x:%08x:%08x dst=%08x:%08x:%08x:%08x smac=%pM dmac=%pM\n",
+    e->serial,e->ns,e->event,e->cookie,e->request,e->active,e->blocked,e->suspended,e->soft_slot,e->soft_version,
+    f->session,f->generation,f->key_generation,f->wcid,f->band,f->type,f->protocol,f->vlan,f->dsfield,f->dsmask,f->ports,
+    f->src[0],f->src[1],f->src[2],f->src[3],f->dst[0],f->dst[1],f->dst[2],f->dst[3],f->smac,f->dmac);
+  }
++ return 0;
++}
++static int airoha_ppe_debugfs_kite_history_open(struct inode *inode, struct file *file)
++{
++ struct airoha_ppe *ppe=inode->i_private;
++ struct airoha_kite_history_snapshot *snap=kvzalloc(sizeof(*snap),GFP_KERNEL);
++ int ret;
++ if (!snap) return -ENOMEM;
++ ret=mutex_lock_interruptible(&flow_offload_mutex);
++ if (ret) { kvfree(snap); return ret; }
++ snap->serial=ppe->kite_event_serial;
++ memcpy(snap->events,ppe->kite_events,sizeof(snap->events));
+  mutex_unlock(&flow_offload_mutex);
+- return 0;
+-}
+-DEFINE_SHOW_ATTRIBUTE(airoha_ppe_debugfs_kite_history);
++ ret=single_open(file,airoha_ppe_debugfs_kite_history_show,snap);
++ if (ret) kvfree(snap);
++ return ret;
++}
++static int airoha_ppe_debugfs_kite_history_release(struct inode *inode, struct file *file)
++{
++ struct seq_file *m=file->private_data;
++ kvfree(m->private);
++ return single_release(inode,file);
++}
++static const struct file_operations airoha_ppe_debugfs_kite_history_fops = {
++ .owner=THIS_MODULE, .open=airoha_ppe_debugfs_kite_history_open,
++ .read=seq_read, .llseek=seq_lseek, .release=airoha_ppe_debugfs_kite_history_release,
++};
+ 
+ static int airoha_ppe_debugfs_status_show(struct seq_file *m, void *private)
+ {

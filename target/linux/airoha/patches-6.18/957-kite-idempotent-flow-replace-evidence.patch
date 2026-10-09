@@ -1,0 +1,76 @@
+Subject: airoha: make repeated flow replace idempotent and expose Kite directions
+
+nft_flowtable may replay REPLACE for a live conntrack cookie while a route or
+neighbour is being refreshed. Returning -EEXIST leaves the flow in a retry
+loop and hides a valid PPE rule behind replace_fail. Reuse a live object and
+only collect an already-retired object. Add direction counters and a compact
+per-flow listing so hardware admission and learning can be correlated without
+claiming that publication alone is a packet hit.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -756,4 +756,7 @@
+ 	atomic64_t kite_prepare_attempts, kite_prepare_ok, kite_prepare_reject;
+ 	atomic64_t kite_path_out_npu, kite_path_in_npu, kite_egress_blocked;
++	/* A live cookie may be replaced repeatedly while its route is refreshed. */
++	atomic64_t kite_replace_reuse, kite_replace_gc;
++	atomic64_t kite_ingress_published, kite_downlink_published;
+ 	int kite_prepare_errno;
+ };
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1355,3 +1355,18 @@
+-	if (rhashtable_lookup(&eth->flow_table, &f->cookie,
+-			      airoha_flow_table_params))
+-		return -EEXIST;
++	e = rhashtable_lookup(&eth->flow_table, &f->cookie,
++			      airoha_flow_table_params);
++	if (e) {
++		/* nft_flowtable can replay REPLACE for a still-live conntrack
++		 * cookie while refreshing its route. Keeping the installed FOE is
++		 * the idempotent result; reporting -EEXIST leaves the flow in a
++		 * permanent software-only retry loop. A retired object is safe to
++		 * collect here because its hardware entry was already invalidated. */
++		if (READ_ONCE(e->kite_retired)) {
++			rhashtable_remove_fast(&eth->flow_table, &e->node,
++					       airoha_flow_table_params);
++			atomic64_inc(&eth->ppe->kite_replace_gc);
++			kfree(e);
++		} else {
++			atomic64_inc(&eth->ppe->kite_replace_reuse);
++			return 0;
++		}
++	}
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -347,4 +347,8 @@
+ 	if (!e->kite_in_wcid && !e->kite_out_wcid)
+ 		return;
+ 	list_add_tail(&e->kite_node, &ppe->kite_flows);
++	if (e->kite_in_wcid)
++		atomic64_inc(&ppe->kite_ingress_published);
++	if (e->kite_out_wcid)
++		atomic64_inc(&ppe->kite_downlink_published);
+ 	if (e->kite_in_wcid) {
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -230,6 +230,19 @@
+ 		atomic64_read(&ppe->kite_path_out_npu),
+ 		atomic64_read(&ppe->kite_path_in_npu),
+ 		atomic64_read(&ppe->kite_egress_blocked));
++	seq_printf(m, "kite_replace_reuse=%lld kite_replace_gc=%lld ingress_published=%lld downlink_published=%lld\n",
++		atomic64_read(&ppe->kite_replace_reuse),
++		atomic64_read(&ppe->kite_replace_gc),
++		atomic64_read(&ppe->kite_ingress_published),
++		atomic64_read(&ppe->kite_downlink_published));
++	{
++		struct airoha_flow_table_entry *flow;
++
++		list_for_each_entry(flow, &ppe->kite_flows, kite_node)
++			seq_printf(m, "kite_flow hash=%u policy=%u in_wcid=%u out_wcid=%u type=%u\n",
++				flow->hash, flow->kite_policy, flow->kite_in_wcid,
++				flow->kite_out_wcid, flow->type);
++	}
+ 	mutex_unlock(&flow_offload_mutex);
+ 	seq_printf(m, "setup_attempts=%lld\n", atomic64_read(&ppe->setup_attempts));
+ 	seq_printf(m, "setup_ok=%lld\n", atomic64_read(&ppe->setup_ok));

@@ -1,0 +1,65 @@
+From: ponwrt development <noreply@local>
+Subject: [PATCH] mac80211: expose the exact cfg80211 DSCP classifier to offload drivers
+
+Shared datapath ABI 2 rejects mismatched host/firmware layouts.
+Retain PN, A-MSDU, ownership, bridge fallback and recovery protections.
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -2014,8 +2014,9 @@
+  * @IEEE80211_OFFLOAD_DECAP_ENABLED: rx encapsulation offload is enabled
+  *	The driver supports passing received 802.11 frames as 802.3 frames to
+  *	mac80211.
+- * @IEEE80211_OFFLOAD_CUSTOM_QOS: a configured QoS map requires software
+- *	classification; notified through BSS_CHANGED_QOS before publication.
++ * @IEEE80211_OFFLOAD_CUSTOM_QOS: a configured QoS map is active. Offload must
++ *	honor offload_qos_map or use software classification. BSS_CHANGED_QOS
++ *	notifies before publishing the map to software readers.
+  * @IEEE80211_OFFLOAD_ENCAP_MCAST: tx multicast encapsulation offload is enabled
+  *	The driver supports sending multicast frames passed as 802.3 frames
+  *	by mac80211.
+@@ -2241,6 +2242,9 @@
+ 	netdev_features_t netdev_features;
+ 	u32 driver_flags;
+ 	u32 offload_flags;
++	/* DSCP -> UP, valid when OFFLOAD_CUSTOM_QOS is set. Updated under
++	 * the wiphy lock before BSS_CHANGED_QOS notifies the driver. */
++	u8 offload_qos_map[64];
+ 
+ #ifdef CPTCFG_MAC80211_DEBUGFS
+ 	struct dentry *debugfs_dir;
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -16,6 +16,7 @@
+ #include <linux/rcupdate.h>
+ #include <linux/fips.h>
+ #include <linux/if_ether.h>
++#include <linux/ip.h>
+ #include <net/cfg80211.h>
+ #include "ieee80211_i.h"
+ #include "driver-ops.h"
+@@ -5135,11 +5136,22 @@
+ 		new_qos_map = NULL;
+ 	}
+ 
+-	/* Direct Ethernet-to-WiFi offload cannot bypass a configured QoS map.
++	/* Direct Ethernet-to-WiFi offload must use the configured QoS map.
+ 	 * Notify before publishing the map so existing egress rules are retired.
+ 	 * MT7916 supports a single link; MLO datapaths do not use this contract. */
+-	if (qos_map)
++	if (qos_map) {
++		struct iphdr iph = { .version = 4, .ihl = 5 };
++		struct sk_buff skb = { .head = (void *)&iph,
++			.protocol = htons(ETH_P_IP) };
++		unsigned int dscp;
++
++		for (dscp = 0; dscp < 64; dscp++) {
++			iph.tos = dscp << 2;
++			sdata->vif.offload_qos_map[dscp] =
++				cfg80211_classify8021d(&skb, qos_map);
++		}
+ 		sdata->vif.offload_flags |= IEEE80211_OFFLOAD_CUSTOM_QOS;
++	}
+ 	else
+ 		sdata->vif.offload_flags &= ~IEEE80211_OFFLOAD_CUSTOM_QOS;
+ 	if (sdata->vif.type == NL80211_IFTYPE_AP && ieee80211_sdata_running(sdata))

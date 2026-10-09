@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+
+/*
+ * ClankerNPU Kite profile for AN7581 + MT7916.
+ *
+ * The packet and BA pools are kept above the HG5585F kernel load address.
+ * Kite does not define HAS_NPU_WIFI_TX, so the Eagle TX pools are omitted.
+ */
+
+/ {
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		npu_kite_pkt: npu-kite-pkt@92000000 {
+			no-map;
+			reg = <0x0 0x92000000 0x0 0x2c00000>;
+		};
+
+		npu_kite_ba: npu-kite-ba@94c00000 {
+			no-map;
+			reg = <0x0 0x94c00000 0x0 0x200000>;
+		};
+	};
+};
+
+&npu {
+	memory-region = <&npu_binary>, <&npu_kite_pkt>, <&npu_kite_ba>;
+	memory-region-names = "binary", "pkt", "ba";
+	firmware-name = "airoha/en7581_MT7916_npu_rv32.bin",
+			"airoha/en7581_MT7916_npu_data.bin";
+	/* Clanker GET_WAIT is 0..9; Linux's version query is GET_WAIT 10. */
+	airoha,skip-npu-version-query;
+	airoha,clanker-kite-abi;
+};
+
+/* Initial value is selectable from the DT without changing the driver. */

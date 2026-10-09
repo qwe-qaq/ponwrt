@@ -1,0 +1,177 @@
+Subject: netfilter: retain software-only forwarding endpoints without hardware retries
+
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -880,8 +880,12 @@
+ 	DEV_PATH_MTK_WDMA,
+ };
+ 
++/* The endpoint can forward in software but has no hardware datapath. */
++#define NET_DEVICE_PATH_F_SW_ONLY BIT(0)
++
+ struct net_device_path {
+ 	enum net_device_path_type	type;
++	u32				flags;
+ 	const struct net_device		*dev;
+ 	union {
+ 		struct {
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -772,6 +772,7 @@
+ 	path = dev_fwd_path(stack);
+ 	if (!path)
+ 		return -1;
++	memset(path, 0, sizeof(*path));
+ 	path->type = DEV_PATH_ETHERNET;
+ 	path->dev = ctx->dev;
+ 
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -176,6 +176,7 @@
+ 	NF_FLOW_HW_PENDING,
+ 	NF_FLOW_HW_BIDIRECTIONAL,
+ 	NF_FLOW_HW_ESTABLISHED,
++	NF_FLOW_HW_DISABLED, /* Explicit software-only forwarding endpoint. */
+ };
+ 
+ enum flow_offload_type {
+@@ -203,6 +204,7 @@
+ }
+ 
+ struct nf_flow_route {
++	bool sw_only;
+ 	struct {
+ 		struct dst_entry		*dst;
+ 		struct {
+--- a/include/net/netns/flow_table.h
++++ b/include/net/netns/flow_table.h
+@@ -8,6 +8,7 @@
+ 	unsigned int count_wq_stats;
+ 	unsigned int sw_bridge_packets;
+ 	unsigned int sw_routed_packets;
++	unsigned int hw_skipped_sw_path;
+ };
+ 
+ struct netns_ft {
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -78,6 +78,7 @@
+ }
+ 
+ struct nft_forward_info {
++	bool sw_only;
+ 	const struct net_device *indev;
+ 	const struct net_device *outdev;
+ 	const struct net_device *hw_outdev;
+@@ -103,6 +104,7 @@
+ 
+ 	for (i = 0; i < stack->num_paths; i++) {
+ 		path = &stack->path[i];
++		info->sw_only |= !!(path->flags & NET_DEVICE_PATH_F_SW_ONLY);
+ 		switch (path->type) {
+ 		case DEV_PATH_ETHERNET:
+ 		case DEV_PATH_DSA:
+@@ -220,6 +222,9 @@
+ 
+ 	if (nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack) >= 0)
+ 		nft_dev_path_info(&stack, &info, ha, &ft->data);
++
++	/* Keep the restriction even if another route segment falls back. */
++	route->sw_only |= info.sw_only;
+ 
+ 	if (info.outdev)
+ 		route->tuple[dir].out.ifindex = info.outdev->ifindex;
+@@ -341,6 +346,9 @@
+ 	if (!info.indev || info.indev != dst_dev)
+ 		return -1;
+ 
++	if (info.sw_only)
++		__set_bit(NF_FLOW_HW_DISABLED, &flow->flags);
++
+ 	th[!dir].tuple.iifidx = info.indev->ifindex;
+ 	for (i = info.num_encaps - 1; i >= 0; i--) {
+ 		th[!dir].tuple.encap[j].id = info.encap[i].id;
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -158,6 +158,8 @@
+ 	flow_offload_fill_route(flow, route, FLOW_OFFLOAD_DIR_ORIGINAL);
+ 	flow_offload_fill_route(flow, route, FLOW_OFFLOAD_DIR_REPLY);
+ 	flow->type = NF_FLOW_OFFLOAD_ROUTE;
++	if (route->sw_only)
++		__set_bit(NF_FLOW_HW_DISABLED, &flow->flags);
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_route_init);
+ 
+@@ -342,8 +344,12 @@
+ 	nf_ct_refresh(flow->ct, NF_CT_DAY);
+ 
+ 	if (nf_flowtable_hw_offload(flow_table)) {
+-		__set_bit(NF_FLOW_HW, &flow->flags);
+-		nf_flow_offload_add(flow_table, flow);
++		if (test_bit(NF_FLOW_HW_DISABLED, &flow->flags)) {
++			NF_FLOW_TABLE_STAT_INC(nf_ct_net(flow->ct), hw_skipped_sw_path);
++		} else {
++			__set_bit(NF_FLOW_HW, &flow->flags);
++			nf_flow_offload_add(flow_table, flow);
++		}
+ 	}
+ 
+ 	return 0;
+@@ -362,6 +368,7 @@
+ 		return;
+ 
+ 	if (likely(!nf_flowtable_hw_offload(flow_table)) ||
++	    test_bit(NF_FLOW_HW_DISABLED, &flow->flags) ||
+ 	    test_bit(NF_FLOW_CLOSING, &flow->flags))
+ 		return;
+ 
+--- a/net/netfilter/nf_flow_table_procfs.c
++++ b/net/netfilter/nf_flow_table_procfs.c
+@@ -45,16 +45,17 @@
+ 	const struct nf_flow_table_stat *st = v;
+ 
+ 	if (v == SEQ_START_TOKEN) {
+-		seq_puts(seq, "wq_add   wq_del   wq_stats sw_bridge_packets sw_routed_packets\n");
++		seq_puts(seq, "wq_add   wq_del   wq_stats sw_bridge_packets sw_routed_packets hw_skipped_sw_path\n");
+ 		return 0;
+ 	}
+ 
+-	seq_printf(seq, "%8d %8d %8d %u %u\n",
++	seq_printf(seq, "%8d %8d %8d %u %u %u\n",
+ 		   st->count_wq_add,
+ 		   st->count_wq_del,
+ 		   st->count_wq_stats,
+ 		   st->sw_bridge_packets,
+-		   st->sw_routed_packets
++		   st->sw_routed_packets,
++		   st->hw_skipped_sw_path
+ 		);
+ 	return 0;
+ }
+--- a/net/netfilter/xt_FLOWOFFLOAD.c
++++ b/net/netfilter/xt_FLOWOFFLOAD.c
+@@ -31,6 +31,7 @@
+ };
+ 
+ struct nf_forward_info {
++	bool sw_only;
+ 	const struct net_device *indev;
+ 	const struct net_device *outdev;
+ 	const struct net_device *hw_outdev;
+@@ -292,6 +293,7 @@
+ 
+ 	for (i = 0; i < stack->num_paths; i++) {
+ 		path = &stack->path[i];
++		info->sw_only |= !!(path->flags & NET_DEVICE_PATH_F_SW_ONLY);
+ 		switch (path->type) {
+ 		case DEV_PATH_ETHERNET:
+ 		case DEV_PATH_DSA:
+@@ -405,6 +407,8 @@
+ 	/* The xmit path looks the output device up by index for every xmit
+ 	 * type, so it has to be set even when the forward path is unknown.
+ 	 */
++	route->sw_only |= info.sw_only;
++
+ 	if (info.outdev)
+ 		route->tuple[dir].out.ifindex = info.outdev->ifindex;
+ 	else

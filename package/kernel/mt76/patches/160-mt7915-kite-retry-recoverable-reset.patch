@@ -1,0 +1,92 @@
+Subject: mt7915: retry recoverable Kite resets and retain radio service
+
+A proven Kite stop followed by a transient firmware or MAC restart error was
+logged as retryable but the reset work was never queued again.  The one-shot
+failure then left recovery.failed set and the 5 GHz PHY disabled until reboot.
+Retry full and partial recovery a bounded number of times after ownership is
+proven stopped; keep quarantine as the permanent result only when the stop
+proof is unavailable.
+
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -330,6 +330,7 @@
+ 		u32 wm_reset_count;
+ 		bool hw_full_reset:1;
+ 		bool hw_init_done:1;
++		u8 retry_count;
+ 		bool restart:1;
+ 		bool napi_stopped:1;
+ 		bool failed:1;
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1762,11 +1762,28 @@
+ 	}
+ 
+ 	if (ret) {
++		/* A proven stop with a transient firmware/MAC restart error is
++		 * recoverable.  The old path logged this as retryable but returned
++		 * without queueing reset_work again; the next invocation then saw
++		 * recovery.failed and left the radio disabled.  Retry a bounded
++		 * number of times.  An unproven DMA stop still quarantines and
++		 * remains a hard failure. */
++		if (!dev->mt76.npu_quarantine && dev->recovery.retry_count < 3) {
++			dev->recovery.retry_count++;
++			dev->recovery.failed = false;
++			dev_info(dev->mt76.dev,
++				 "Kite full reset retry queued=%u/3 after ret=%d\n",
++				 dev->recovery.retry_count, ret);
++			mutex_unlock(&dev->mt76.mutex);
++			msleep(100);
++			queue_work(dev->mt76.wq, &dev->reset_work);
++			return ret;
++		}
+ 		dev->recovery.failed = true;
+ 		dev_err(dev->mt76.dev,
+-			"chip full reset failed after %d attempts: %d; queues held, reboot required; quarantine=%u tx_bound=%u dp_bound=%u\n",
++			"chip full reset failed after %d attempts: %d; queues held, reboot required; quarantine=%u tx_bound=%u dp_bound=%u retry=%u\n",
+ 			i + 1, ret, dev->mt76.npu_quarantine, dev->kite.tx_bound,
+-			dev->kite.dp_bound);
++			dev->kite.dp_bound, dev->recovery.retry_count);
+ 		mutex_unlock(&dev->mt76.mutex);
+ 		return ret;
+ 	}
+@@ -1785,6 +1802,7 @@
+ 	dev->mt76.global_wcid.idx = i;
+ 	dev->recovery.hw_full_reset = false;
+ 	dev->recovery.failed = false;
++	dev->recovery.retry_count = 0;
+ 
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+@@ -1924,16 +1942,29 @@
+ 					     MT7915_WATCHDOG_TIME);
+ 	dev_info(dev->mt76.dev, "chip partial reset complete\n");
+ 	dev->recovery.failed = false;
++	dev->recovery.retry_count = 0;
+ 	return;
+ 
+ failed:
+ 	mt7915_dma_quiesce(dev);
++	if (!dev->mt76.npu_quarantine && dev->recovery.retry_count < 3) {
++		dev->recovery.retry_count++;
++		dev->recovery.restart = true;
++		dev->recovery.failed = false;
++		dev_info(dev->mt76.dev,
++			 "Kite partial reset retry queued=%u/3 after ret=%d\n",
++			 dev->recovery.retry_count, ret);
++		mutex_unlock(&dev->mt76.mutex);
++		msleep(100);
++		queue_work(dev->mt76.wq, &dev->reset_work);
++		return;
++	}
+ 	if (dev->mt76.npu_quarantine)
+ 		dev->recovery.failed = true;
+ 	dev_err(dev->mt76.dev,
+-		"chip partial reset failed: %d; %s\n", ret,
++		"chip partial reset failed: %d; %s retry=%u\n", ret,
+ 		dev->recovery.failed ? "queues held, reboot required" :
+-		"NPU stop proof remains retryable");
++		"NPU stop proof remains retryable", dev->recovery.retry_count);
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+ }

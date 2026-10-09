@@ -1,0 +1,593 @@
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -1372,6 +1372,7 @@
+ stop_hw:
+ 	mt7915_stop_hardware(dev);
+ free_phy2:
++	mt7915_npu_control_detach(dev);
+ 	if (phy2)
+ 		ieee80211_free_hw(phy2->mt76->hw);
+ 	return ret;
+@@ -1386,6 +1387,7 @@
+ 	mt7915_coredump_unregister(dev);
+ 	mt7915_unregister_thermal(&dev->phy);
+ 	mt76_unregister_device(&dev->mt76);
++	mt7915_npu_control_detach(dev);
+ 	mt7915_stop_hardware(dev);
+ 
+ 	mt76_free_device(&dev->mt76);
+--- a/mt7915/kite-control.h
++++ b/mt7915/kite-control.h
+@@ -6,7 +6,7 @@
+  * are little endian. SET33/GET33 carry exactly 64 bytes after WLAN header.
+  * A mailbox DONE acknowledges delivery; GET33 reports the command result.
+  */
+-#define KITE_CTL_MAGIC 0x4b430001u
++#define KITE_CTL_MAGIC 0x4b430002u
+ #define KITE_CTL_WORDS 16u
+ #define KITE_CTL_WCIDS 544u
+ #define KITE_CTL_TIDS 8u
+@@ -20,14 +20,33 @@
+ #define KITE_CTL_CAP_GENERATION 2u
+ #define KITE_CTL_CAP_PARK 4u
+ #define KITE_CTL_CAP_KEY_FENCE 8u
+-#define KITE_CTL_CAPS 15u
++#define KITE_CTL_CAP_CONTROL_ONLY 16u
++#define KITE_CTL_CAP_ARM_PA 32u
++#define KITE_CTL_CAPS 63u
++#define KITE_CTL_MODE_DATA 0u
++#define KITE_CTL_MODE_CONTROL_ONLY 1u
++
++/* ARM physical DDR: 0x80000000..0xbfffffff. Never accept a bare
++ * offset or the NPU uncached alias as an ARM address. No wrap allowed. */
++static inline int kite_ctl_pool_valid(unsigned long long addr,
++				      unsigned long long size)
++{
++	return addr >= 0x80000000ull && addr < 0xc0000000ull &&
++	       !(addr & 4095) && size == 0x200000 &&
++	       size <= 0xc0000000ull - addr;
++}
++
++static inline unsigned int kite_ctl_pool_alias(unsigned int addr)
++{
++	return (addr & 0x3fffffffu) | 0x40000000u;
++}
+ #define KITE_CTL_WORKERS 0x0eu /* AN7581 MT7916 harts 1, 2, 3 */
+ 
+ /* Request words: magic, words, command, session, serial, then args.
+  * All unused words must be zero. Session and serial never wrap.
+  */
+ enum kite_ctl_op {
+-	KITE_CTL_OPEN = 1, /* new session; arg0=BA DRAM address, arg1=size */
++	KITE_CTL_OPEN = 1, /* new session; arg0=ARM BA physical address, arg1=size, arg2=mode */
+ 	KITE_CTL_PARK, /* async cooperative park; no DMA drain claim */
+ 	KITE_CTL_RESUME,
+ 	KITE_CTL_STA_ADD, /* wcid, generation, band, bss */
+@@ -53,7 +72,9 @@
+ };
+ /* Reply: magic, words, capabilities, session, last serial, result, state,
+  * ack mask, WCID count, required DRAM bytes, accepted commands, rejected
+- * commands, live STAs, active BA sessions, key fences, reserved zero.
++ * commands, live STAs, active BA sessions, key fences, OPEN mode.
++ * CONTROL_ONLY cannot initialize/enable RX rings or classify packets.
++ * MODE_DATA remains development-only: GET31 ownership capabilities are 0.
+  */
+ 
+ #ifndef __KERNEL__
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1459,6 +1459,7 @@
+ 		phy2->omac_mask = 0;
+ 
+ 	mt76_reset_device(&dev->mt76);
++	mt7915_npu_control_reset(dev);
+ 
+ 	INIT_LIST_HEAD(&dev->sta_rc_list);
+ 	INIT_LIST_HEAD(&dev->twt_list);
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -440,6 +440,8 @@
+ 	err = mt76_connac_mcu_add_key(&dev->mt76, vif, &msta->bip,
+ 				      key, MCU_EXT_CMD(STA_REC_UPDATE),
+ 				      &msta->wcid, cmd);
++	if (!err)
++		mt7915_npu_key_commit(dev, wcid, key);
+ out:
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+@@ -843,6 +845,7 @@
+ 		return;
+ 
+ 	msta = (struct mt7915_sta *)sta->drv_priv;
++	mt7915_npu_port(data->dev, msta, false);
+ 	mt7915_mcu_add_sta(data->dev, vif, sta, CONN_STATE_DISCONNECT, false);
+ 	msta->wcid.tx_info &= ~MT_WCID_TX_INFO_SET;
+ 	msta->wcid.sta_disabled = 1;
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -264,10 +264,12 @@
+ #ifdef CONFIG_MT7915_NPU
+ 	struct {
+ 		struct mutex lock;
++		struct airoha_npu *control_npu;
+ 		u32 session, serial;
+ 		u32 generation[MT7916_WTBL_SIZE];
+ 		u32 key_generation[MT7916_WTBL_SIZE];
+-		bool active, failed;
++		bool active, failed, control_only;
++		bool live[MT7916_WTBL_SIZE];
+ 	} kite;
+ #endif
+ 	struct mt7915_hif *hif2;
+@@ -479,20 +481,29 @@
+ #ifdef CONFIG_MT7915_NPU
+ int mt7915_npu_init(struct mt7915_dev *dev);
+ int mt7915_npu_start(struct mt7915_dev *dev);
++void mt7915_npu_control_reset(struct mt7915_dev *dev);
++void mt7915_npu_control_attach(struct mt7915_dev *dev);
++void mt7915_npu_control_detach(struct mt7915_dev *dev);
+ int mt7915_npu_control_open(struct mt7915_dev *dev);
+ int mt7915_npu_control_resume(struct mt7915_dev *dev);
+ int mt7915_npu_sta_add(struct mt7915_dev *dev, struct mt7915_sta *msta);
+ int mt7915_npu_port(struct mt7915_dev *dev, struct mt7915_sta *msta, bool authorized);
++void mt7915_npu_key_commit(struct mt7915_dev *dev, struct mt76_wcid *wcid,
++			  struct ieee80211_key_conf *key);
+ int mt7915_npu_key(struct mt7915_dev *dev, struct mt76_wcid *wcid,
+ 		   struct ieee80211_key_conf *key, bool install);
+ int mt7915_npu_ba_set(struct mt7915_dev *dev, u8 band, u16 wcid,
+ 		      u8 tid, u16 ssn, u16 win_size);
+ int mt7915_npu_sta_del(struct mt7915_dev *dev, u8 band, u16 wcid);
+ #else
++static inline void mt7915_npu_control_reset(struct mt7915_dev *dev) {}
++static inline void mt7915_npu_control_detach(struct mt7915_dev *dev) {}
+ static inline int mt7915_npu_sta_add(struct mt7915_dev *dev,
+ 				     struct mt7915_sta *msta) { return 0; }
+ static inline int mt7915_npu_port(struct mt7915_dev *dev,
+ 				struct mt7915_sta *msta, bool authorized) { return 0; }
++static inline void mt7915_npu_key_commit(struct mt7915_dev *dev,
++		struct mt76_wcid *wcid, struct ieee80211_key_conf *key) {}
+ static inline int mt7915_npu_key(struct mt7915_dev *dev, struct mt76_wcid *wcid,
+ 			       struct ieee80211_key_conf *key, bool install) { return 0; }
+ 
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1,13 +1,30 @@
+ // SPDX-License-Identifier: ISC
+ /* GET/SET33 control transactions. This does not grant DMA ownership. */
+ #include <linux/delay.h>
++#include <linux/of.h>
+ #include <linux/of_reserved_mem.h>
+ #include "mt7915.h"
+ #include "kite-control.h"
+ 
++/* Protected by kite.lock or probe/remove serialization. control_npu owns
++ * one supplier reference and never implies packet/DMA ownership. */
++static struct airoha_npu *mt7915_kite_npu(struct mt7915_dev *dev)
++{
++	return dev->kite.control_only ? dev->kite.control_npu :
++		rcu_access_pointer(dev->mt76.mmio.npu);
++}
++
++/* Mirroring is advisory while mac80211 owns all RX/PN decisions. After
++ * any uncertain transaction stop mirroring, without failing host Wi-Fi. */
++static bool mt7915_kite_skip(struct mt7915_dev *dev)
++{
++	return !dev->kite.active ||
++	       (dev->kite.control_only && dev->kite.failed);
++}
++
+ static int mt7915_kite_status(struct mt7915_dev *dev, u32 *s)
+ {
+-	struct airoha_npu *npu = rcu_access_pointer(dev->mt76.mmio.npu);
++	struct airoha_npu *npu = mt7915_kite_npu(dev);
+ 	__le32 wire[KITE_CTL_WORDS];
+ 	int i, ret;
+ 
+@@ -20,7 +37,7 @@
+ 	for (i = 0; i < KITE_CTL_WORDS; i++)
+ 		s[i] = le32_to_cpu(wire[i]);
+ 	if (s[0] != KITE_CTL_MAGIC || s[1] != KITE_CTL_WORDS ||
+-	    s[8] != KITE_CTL_WCIDS || s[9] != KITE_CTL_DRAM_BYTES || s[15])
++	    s[8] != KITE_CTL_WCIDS || s[9] != KITE_CTL_DRAM_BYTES || s[15] > KITE_CTL_MODE_CONTROL_ONLY)
+ 		return -EPROTO;
+ 	return 0;
+ }
+@@ -41,7 +58,7 @@
+ static int mt7915_kite_command(struct mt7915_dev *dev, u32 op,
+ 			       const u32 *args, unsigned int nargs)
+ {
+-	struct airoha_npu *npu = rcu_access_pointer(dev->mt76.mmio.npu);
++	struct airoha_npu *npu = mt7915_kite_npu(dev);
+ 	__le32 wire[KITE_CTL_WORDS] = {};
+ 	u32 s[KITE_CTL_WORDS];
+ 	int i, ret;
+@@ -65,7 +82,10 @@
+ 	ret = mt7915_kite_status(dev, s);
+ 	if (ret)
+ 		return ret;
+-	if (s[3] != dev->kite.session || s[4] != dev->kite.serial)
++	if (s[3] != dev->kite.session || s[4] != dev->kite.serial ||
++	    (!s[5] && op != KITE_CTL_CLOSE &&
++	     s[15] != (dev->kite.control_only ?
++		       KITE_CTL_MODE_CONTROL_ONLY : KITE_CTL_MODE_DATA)))
+ 		return -EPROTO;
+ 	return mt7915_kite_result(s[5]);
+ }
+@@ -93,17 +113,35 @@
+ {
+ 	dev->kite.failed = true;
+ 	dev_err(dev->mt76.dev,
+-		"Kite control failed (%d), session %u command %u; control halted, DMA drain unconfirmed\n",
+-		ret, dev->kite.session, dev->kite.serial);
++		"Kite control failed (%d), session %u command %u; %s\n",
++		ret, dev->kite.session, dev->kite.serial,
++		dev->kite.control_only ?
++		"mirror halted; WiFi RX/PN remain host-owned" :
++		"control halted, DMA drain unconfirmed");
+ 	return ret;
+ }
+ 
++static int mt7915_kite_host_result(struct mt7915_dev *dev, int ret)
++{
++	if (!dev->kite.control_only)
++		return ret;
++	if (ret && !dev->kite.failed) {
++		mutex_lock(&dev->kite.lock);
++		if (!dev->kite.failed)
++			mt7915_kite_fault(dev, ret);
++		mutex_unlock(&dev->kite.lock);
++	}
++	return 0;
++}
++
+ int mt7915_npu_control_open(struct mt7915_dev *dev)
+ {
+-	struct airoha_npu *npu = rcu_access_pointer(dev->mt76.mmio.npu);
+-	u32 s[KITE_CTL_WORDS], args[2];
++	struct airoha_npu *npu = mt7915_kite_npu(dev);
++	u32 s[KITE_CTL_WORDS], args[3];
++	__le32 addr;
+ 	struct resource res;
+-	int ret;
++	struct device_node *pool;
++	int ret, index;
+ 
+ 	if (!npu)
+ 		return 0;
+@@ -120,16 +158,35 @@
+ 						       "ba", &res);
+ 	if (ret)
+ 		goto out;
+-	if (!res.start || res.start & 4095 || res.end >= SZ_1G ||
+-	    resource_size(&res) != SZ_2M) {
++	if (!kite_ctl_pool_valid(res.start, resource_size(&res))) {
+ 		ret = -EINVAL;
+ 		goto out;
+ 	}
++	index = of_property_match_string(npu->dev->of_node,
++					 "memory-region-names", "ba");
++	pool = of_parse_phandle(npu->dev->of_node, "memory-region", index);
++	ret = pool && of_property_read_bool(pool, "no-map") &&
++	      !of_property_read_bool(pool, "reusable") ? 0 : -EINVAL;
++	of_node_put(pool);
++	if (ret)
++		goto out;
+ 	args[0] = res.start;
+ 	args[1] = resource_size(&res);
++	args[2] = dev->kite.control_only ? KITE_CTL_MODE_CONTROL_ONLY :
++					KITE_CTL_MODE_DATA;
++	/* Install only BA storage. Do not initialize pkt pools, force-CPU,
++	 * host rings or the NPU packet DMA device for a control-only session. */
++	if (dev->kite.control_only) {
++		addr = cpu_to_le32(args[0]);
++		ret = airoha_npu_wlan_send_msg(npu, 0,
++			WLAN_FUNC_SET_WAIT_DRAM_BA_NODE_ADDR, &addr,
++			sizeof(addr), GFP_KERNEL);
++		if (ret)
++			goto out;
++	}
+ 	dev->kite.session = s[3] + 1;
+ 	dev->kite.serial = 0;
+-	ret = mt7915_kite_command(dev, KITE_CTL_OPEN, args, 2);
++	ret = mt7915_kite_command(dev, KITE_CTL_OPEN, args, 3);
+ 	if (!ret) {
+ 		dev->kite.active = true;
+ 		ret = mt7915_kite_wait_parked(dev);
+@@ -138,7 +195,9 @@
+ 		mt7915_kite_fault(dev, ret);
+ 	else
+ 		dev_info(dev->mt76.dev,
+-			 "Kite control ABI 1: 544 WCIDs, generation/key fences, workers parked; DMA drain not implied\n");
++			 "Kite control ABI 2: mode=%s BA=%pa, 544 WCIDs; workers parked\n",
++			 dev->kite.control_only ? "control-only" : "data-development",
++			 &res.start);
+ out:
+ 	mutex_unlock(&dev->kite.lock);
+ 	return ret;
+@@ -184,10 +243,10 @@
+ 	u32 idx = msta->wcid.idx, args[4];
+ 	int ret = 0;
+ 
+-	if (!dev->kite.active)
++	if (mt7915_kite_skip(dev))
+ 		return 0;
+ 	if (!idx || idx >= KITE_CTL_WCIDS)
+-		return -ERANGE;
++		return mt7915_kite_host_result(dev, -ERANGE);
+ 	mutex_lock(&dev->kite.lock);
+ 	if (dev->kite.generation[idx] == U32_MAX) {
+ 		ret = mt7915_kite_fault(dev, -EOVERFLOW);
+@@ -198,11 +257,13 @@
+ 	args[2] = msta->vif->phy->mt76->band_idx;
+ 	args[3] = msta->vif->mt76.idx;
+ 	ret = mt7915_kite_update(dev, KITE_CTL_STA_ADD, args, 4);
+-	if (!ret)
++	if (!ret) {
+ 		dev->kite.key_generation[idx] = 0;
++		dev->kite.live[idx] = true;
++	}
+ out:
+ 	mutex_unlock(&dev->kite.lock);
+-	return ret;
++	return mt7915_kite_host_result(dev, ret);
+ }
+ 
+ int mt7915_npu_sta_del(struct mt7915_dev *dev, u8 band, u16 wcid)
+@@ -210,16 +271,22 @@
+ 	u32 args[2];
+ 	int ret;
+ 
+-	if (!dev->kite.active)
++	if (mt7915_kite_skip(dev))
+ 		return 0;
+ 	if (!wcid || wcid >= KITE_CTL_WCIDS)
+-		return -ERANGE;
+-	mutex_lock(&dev->kite.lock);
++		return mt7915_kite_host_result(dev, -ERANGE);
++	mutex_lock(&dev->kite.lock);
++	if (dev->kite.control_only && !dev->kite.live[wcid]) {
++		mutex_unlock(&dev->kite.lock);
++		return 0;
++	}
+ 	args[0] = wcid;
+ 	args[1] = dev->kite.generation[wcid];
+ 	ret = mt7915_kite_update(dev, KITE_CTL_STA_DEL, args, 2);
+-	mutex_unlock(&dev->kite.lock);
+-	return ret;
++	if (!ret)
++		dev->kite.live[wcid] = false;
++	mutex_unlock(&dev->kite.lock);
++	return mt7915_kite_host_result(dev, ret);
+ }
+ 
+ int mt7915_npu_port(struct mt7915_dev *dev, struct mt7915_sta *msta,
+@@ -228,34 +295,42 @@
+ 	u32 idx = msta->wcid.idx, args[3];
+ 	int ret;
+ 
+-	if (!dev->kite.active)
++	if (mt7915_kite_skip(dev))
+ 		return 0;
+ 	if (!idx || idx >= KITE_CTL_WCIDS)
+-		return -ERANGE;
+-	mutex_lock(&dev->kite.lock);
++		return mt7915_kite_host_result(dev, -ERANGE);
++	mutex_lock(&dev->kite.lock);
++	if (dev->kite.control_only && !dev->kite.live[idx]) {
++		mutex_unlock(&dev->kite.lock);
++		return 0;
++	}
+ 	args[0] = idx;
+ 	args[1] = dev->kite.generation[idx];
+ 	args[2] = authorized;
+ 	ret = mt7915_kite_update(dev, KITE_CTL_PORT, args, 3);
+ 	mutex_unlock(&dev->kite.lock);
+-	return ret;
+-}
+-
+-int mt7915_npu_key(struct mt7915_dev *dev, struct mt76_wcid *wcid,
++	return mt7915_kite_host_result(dev, ret);
++}
++
++static int mt7915_kite_key(struct mt7915_dev *dev, struct mt76_wcid *wcid,
+ 		   struct ieee80211_key_conf *key, bool install)
+ {
+ 	u32 idx = wcid->idx, args[5];
+ 	int ret;
+ 
+-	if (!dev->kite.active)
++	if (mt7915_kite_skip(dev))
+ 		return 0;
+ 	/* Group/management key replay stays entirely in mac80211. */
+ 	if (!(key->flags & IEEE80211_KEY_FLAG_PAIRWISE) ||
+ 	    key->cipher == WLAN_CIPHER_SUITE_AES_CMAC)
+ 		return 0;
+ 	if (!idx || idx >= KITE_CTL_WCIDS)
+-		return -ERANGE;
+-	mutex_lock(&dev->kite.lock);
++		return mt7915_kite_host_result(dev, -ERANGE);
++	mutex_lock(&dev->kite.lock);
++	if (dev->kite.control_only && !dev->kite.live[idx]) {
++		mutex_unlock(&dev->kite.lock);
++		return 0;
++	}
+ 	if (dev->kite.key_generation[idx] == U32_MAX) {
+ 		ret = mt7915_kite_fault(dev, -EOVERFLOW);
+ 		goto out;
+@@ -270,7 +345,24 @@
+ 	ret = mt7915_kite_update(dev, KITE_CTL_KEY, args, 5);
+ out:
+ 	mutex_unlock(&dev->kite.lock);
+-	return ret;
++	return mt7915_kite_host_result(dev, ret);
++}
++
++int mt7915_npu_key(struct mt7915_dev *dev, struct mt76_wcid *wcid,
++		   struct ieee80211_key_conf *key, bool install)
++{
++	/* In mirror mode an install is recorded only after the Wi-Fi MCU
++	 * accepted it. Data mode retains its pre-change fence. */
++	if (dev->kite.control_only && install)
++		return 0;
++	return mt7915_kite_key(dev, wcid, key, install);
++}
++
++void mt7915_npu_key_commit(struct mt7915_dev *dev, struct mt76_wcid *wcid,
++			  struct ieee80211_key_conf *key)
++{
++	if (dev->kite.control_only)
++		mt7915_kite_key(dev, wcid, key, true);
+ }
+ 
+ int mt7915_npu_ba_set(struct mt7915_dev *dev, u8 band, u16 wcid,
+@@ -279,12 +371,16 @@
+ 	u32 args[5];
+ 	int ret;
+ 
+-	if (!dev->kite.active)
++	if (mt7915_kite_skip(dev))
+ 		return 0;
+ 	if (!wcid || wcid >= KITE_CTL_WCIDS || tid >= KITE_CTL_TIDS ||
+ 	    win_size > 256 || ssn > 4095 || (!win_size && ssn))
+-		return -ERANGE;
+-	mutex_lock(&dev->kite.lock);
++		return mt7915_kite_host_result(dev, -ERANGE);
++	mutex_lock(&dev->kite.lock);
++	if (dev->kite.control_only && !dev->kite.live[wcid]) {
++		mutex_unlock(&dev->kite.lock);
++		return 0;
++	}
+ 	args[0] = wcid;
+ 	args[1] = dev->kite.generation[wcid];
+ 	args[2] = tid;
+@@ -292,5 +388,107 @@
+ 	args[4] = ssn;
+ 	ret = mt7915_kite_update(dev, KITE_CTL_BA, args, 5);
+ 	mutex_unlock(&dev->kite.lock);
+-	return ret;
+-}
++	return mt7915_kite_host_result(dev, ret);
++}
++
++/* Probe failure and unbind use the same release path. A failed mailbox
++ * result is never "recovered" by a speculative RESUME/CLOSE. BA memory is
++ * a no-map DT reservation for the whole boot; releasing this reference
++ * cannot return firmware-owned memory to Linux's allocator. */
++void mt7915_npu_control_detach(struct mt7915_dev *dev)
++{
++	struct airoha_npu *npu;
++	int ret = 0;
++
++	mutex_lock(&dev->kite.lock);
++	npu = dev->kite.control_npu;
++	if (!npu)
++		goto out;
++	if (dev->kite.active && !dev->kite.failed) {
++		ret = mt7915_kite_command(dev, KITE_CTL_PARK, NULL, 0);
++		if (!ret)
++			ret = mt7915_kite_wait_parked(dev);
++		if (!ret)
++			ret = mt7915_kite_command(dev, KITE_CTL_CLOSE, NULL, 0);
++		if (ret)
++			mt7915_kite_fault(dev, ret);
++	}
++	if (dev->kite.failed)
++		dev_warn(dev->mt76.dev,
++			 "Kite mirror detached with unconfirmed session; BA reservation retained, reopen requires closed firmware session\n");
++	dev->kite.active = false;
++	dev->kite.control_npu = NULL;
++	airoha_npu_put(npu);
++out:
++	mutex_unlock(&dev->kite.lock);
++}
++
++void mt7915_npu_control_attach(struct mt7915_dev *dev)
++{
++	struct airoha_npu *npu;
++	struct device_node *np;
++	int ret;
++
++	if (!is_mt7916(&dev->mt76) || !dev->mt76.dev->of_node)
++		return;
++	np = of_parse_phandle(dev->mt76.dev->of_node, "airoha,npu", 0);
++	if (!np)
++		return;
++	ret = of_property_read_bool(np, "airoha,clanker-kite-abi");
++	of_node_put(np);
++	if (!ret)
++		return;
++	npu = airoha_npu_get(dev->mt76.dev);
++	if (IS_ERR(npu)) {
++		dev_warn(dev->mt76.dev, "Kite mirror unavailable: %ld; host WiFi active\n",
++			 PTR_ERR(npu));
++		return;
++	}
++	dev->kite.control_only = true;
++	dev->kite.control_npu = npu;
++	ret = mt7915_npu_control_open(dev);
++	if (!ret)
++		ret = mt7915_npu_control_resume(dev);
++	if (ret) {
++		dev_warn(dev->mt76.dev, "Kite mirror startup failed: %d; host WiFi active\n", ret);
++		mt7915_npu_control_detach(dev);
++		return;
++	}
++	dev_info(dev->mt76.dev,
++		 "Kite control mirror running: STA/key/port/BA sync; data=host, replay=host, PPE offload=disabled\n");
++}
++
++/* Full Wi-Fi reset destroys peer state. With host-only data ownership we
++ * can close the healthy mirror and open a fresh session before mac80211
++ * rebuilds peers. An already uncertain session is never auto-recovered. */
++void mt7915_npu_control_reset(struct mt7915_dev *dev)
++{
++	int ret;
++
++	if (!dev->kite.control_only || !dev->kite.control_npu ||
++	    !dev->kite.active || dev->kite.failed)
++		return;
++	mutex_lock(&dev->kite.lock);
++	ret = mt7915_kite_command(dev, KITE_CTL_PARK, NULL, 0);
++	if (!ret)
++		ret = mt7915_kite_wait_parked(dev);
++	if (!ret)
++		ret = mt7915_kite_command(dev, KITE_CTL_CLOSE, NULL, 0);
++	if (ret)
++		mt7915_kite_fault(dev, ret);
++	else {
++		dev->kite.active = false;
++		memset(dev->kite.live, 0, sizeof(dev->kite.live));
++	}
++	mutex_unlock(&dev->kite.lock);
++	if (ret)
++		return;
++	ret = mt7915_npu_control_open(dev);
++	if (!ret)
++		ret = mt7915_npu_control_resume(dev);
++	if (ret && !dev->kite.failed) {
++		mutex_lock(&dev->kite.lock);
++		mt7915_kite_fault(dev, ret);
++		mutex_unlock(&dev->kite.lock);
++	}
++}
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -21,6 +21,9 @@
+  * Keep normal mt7915 RX as the default until that protocol is complete.
+  */
+ static bool npu_enable;
++static bool npu_control = true;
++module_param(npu_control, bool, 0400);
++MODULE_PARM_DESC(npu_control, "Mirror STA/key/port/BA state to Clanker (WiFi data stays on host)");
+ module_param(npu_enable, bool, 0400);
+ MODULE_PARM_DESC(npu_enable, "Kite RX request (ownership protocol currently unavailable)");
+ 
+@@ -93,6 +96,8 @@
+ int mt7915_npu_init(struct mt7915_dev *dev)
+ {
+ 	mutex_init(&dev->kite.lock);
++	if (npu_control)
++		mt7915_npu_control_attach(dev);
+ 	if (!mt7915_npu_present(dev))
+ 		return 0;
+ 

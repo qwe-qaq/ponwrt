@@ -1,0 +1,67 @@
+Subject: netfilter: preserve both directions of routed Kite neighbour keys
+
+An inet flowtable installs one rule for each direction.  The previous routed
+key augmentation only marked a tuple as Kite when its ingress path was a
+station.  The reply tuple enters from the WAN and exits through the station,
+so it lost its exact Ethernet key even though the egress endpoint was valid.
+Resolve the current tuple's egress neighbour as well, and retain the key when
+either side is a Kite path.  This lets PPE construct the reverse downlink
+FOE while leaving ordinary routed traffic unchanged.
+
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -849,11 +849,12 @@
+ 
+ 	{
+ 		struct net_device_path_stack stack;
+-		struct net_device *indev;
++		struct net_device *indev, *outdev;
+ 		unsigned char ingress_mac[ETH_ALEN] = {}, egress_mac[ETH_ALEN] = {};
+ 		const struct flow_offload_tuple *route_tuple = tuple;
+ 		const void *daddr;
+ 		bool have_macs = false, kite = false;
++		bool ingress_kite = false, egress_kite = false;
+ 
+ 		/* A DIRECT tuple already carries both Ethernet addresses. */
+ 		if (other_tuple->xmit_type == FLOW_OFFLOAD_XMIT_DIRECT &&
+@@ -863,12 +864,8 @@
+ 			ether_addr_copy(egress_mac, other_tuple->out.h_source);
+ 			have_macs = true;
+ 		} else if (other_tuple->xmit_type == FLOW_OFFLOAD_XMIT_NEIGH &&
+-			   other_tuple->dst_cache &&
+-			   is_valid_ether_addr(other_tuple->dst_cache->dev->dev_addr)) {
+-			/* For a routed reply, dst_cache points at the Wi-Fi netdev.
+-			 * Resolve the station neighbor exactly as the normal route
+-			 * action does. The current tuple still supplies the
+-			 * original packet's routed egress neighbor. */
++			   other_tuple->dst_cache) {
++			/* The opposite route supplies this packet's L2 source. */
+ 			struct neighbour *n;
+ 
+ 			if (other_tuple->l3proto == AF_INET)
+@@ -890,8 +887,7 @@
+ 			}
+ 		}
+ 
+-		/* A routed original tuple needs the real upstream next-hop MAC.
+-		 * Do not substitute the LAN device address from the reply route. */
++		/* The current route supplies this packet's L2 destination. */
+ 		if (other_tuple->xmit_type == FLOW_OFFLOAD_XMIT_NEIGH &&
+ 		    route_tuple->xmit_type == FLOW_OFFLOAD_XMIT_NEIGH &&
+ 		    route_tuple->dst_cache) {
+@@ -923,8 +919,14 @@
+ 			indev = dev_get_by_index_rcu(net, tuple->iifidx);
+ 			if (indev && !dev_fill_forward_path(indev, ingress_mac,
+ 							    &stack) && stack.num_paths)
+-				kite = stack.path[stack.num_paths - 1].type ==
++				ingress_kite = stack.path[stack.num_paths - 1].type ==
+ 					DEV_PATH_AIROHA_NPU;
++			outdev = dev_get_by_index_rcu(net, tuple->ifidx);
++			if (outdev && !dev_fill_forward_path(outdev, egress_mac,
++							     &stack) && stack.num_paths)
++				egress_kite = stack.path[stack.num_paths - 1].type ==
++					DEV_PATH_AIROHA_NPU;
++			kite = ingress_kite || egress_kite;
+ 			rcu_read_unlock();
+ 		}
+ 		if (kite) {

@@ -1,0 +1,88 @@
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1095,6 +1095,18 @@
+ 				tx_failed = tx_retries +
+ 					!!FIELD_GET(MT_TX_FREE_STAT, info);
+ 			}
++#ifdef CONFIG_MT7915_NPU
++   /* MPDU status covers native and Kite TX alike. Keep final failure
++    * separate from iw's historical retries+failure tx_failed metric. */
++   if (wcid->phy_idx < 2 &&
++       ((v3 && (info & MT_TX_FREE_MPDU_HEADER_V3)) ||
++        (!v3 && (info & MT_TX_FREE_MPDU_HEADER)))) {
++    unsigned int band = wcid->phy_idx;
++    batch.mpdu[band]++;
++    batch.retries[band] += tx_retries;
++    batch.final_failed[band] += tx_failed - tx_retries;
++   }
++#endif
+ 			wcid->stats.tx_retries += tx_retries;
+ 			wcid->stats.tx_failed += tx_failed;
+ 		}
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -332,10 +332,14 @@
+  u32 serial, event, wcid, raw, generation, key_generation;
+  u32 request, blocked, issued, consumed;
+ };
+-struct mt7915_kite_wa_batch { u16 token[32]; u32 count, events; u64 start_ns; };
++struct mt7915_kite_wa_batch {
++ u16 token[32]; u32 count, events; u64 start_ns;
++ u32 mpdu[2], retries[2], final_failed[2];
++};
+ struct mt7915_kite_wa_stats {
+  u64 reports, events, batches, errors, total_ns, max_ns, publish_ns, publish_max_ns;
+  u64 age[8];
++ u64 mpdu[2], retries[2], final_failed[2], no_status_reports;
+ };
+ struct mt7915_kite_napi_stats { u64 polls, budget, packets, total_ns, max_ns; };
+ struct mt7915_kite_trace_event {
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1990,7 +1990,7 @@
+ 	ret = mt7915_kite_command(dev, KITE_CTL_DP_BIND, args, 3);
+ 	if (!ret)
+ 		dev_info(dev->mt76.dev,
+-			 "Kite datapath r69 ABI12 bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
++			 "Kite datapath r70 ABI12 bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
+ 			 s->session, s->epoch, sizeof(*s), s->perf.flags, npu_amsdu);
+ out:
+ 	if (ret)
+--- a/mt7915/npu-r59-observe.inc
++++ b/mt7915/npu-r59-observe.inc
+@@ -54,6 +54,11 @@
+  seq_printf(m, "r59_wa reports=%llu events=%llu batches=%llu errors=%llu total_ns=%llu max_ns=%llu publish_ns=%llu publish_max_ns=%llu\n",
+             wa.reports, wa.events, wa.batches, wa.errors, wa.total_ns,
+             wa.max_ns, wa.publish_ns, wa.publish_max_ns);
++ seq_printf(m, "r70_observe age_valid=%u profile_shift=%u no_status_reports=%llu\n",
++  READ_ONCE(s->perf.sample_shift) != 0, READ_ONCE(s->perf.sample_shift), wa.no_status_reports);
++ for (b = 0; b < 2; b++)
++  seq_printf(m, "r70_txstatus%u mpdu=%llu retries=%llu final_failed=%llu\n",
++   b, wa.mpdu[b], wa.retries[b], wa.final_failed[b]);
+  seq_puts(m, "r59_wa_age");
+  for (i = 0; i < 8; i++) seq_printf(m, " bin%u=%llu", i, wa.age[i]);
+  seq_putc(m, '\n');
+--- a/mt7915/npu-wa.inc
++++ b/mt7915/npu-wa.inc
+@@ -62,7 +62,7 @@
+ }
+ void mt7915_npu_wa_begin(struct mt7915_kite_wa_batch *b)
+ {
+- b->count = b->events = 0; b->start_ns = ktime_get_mono_fast_ns();
++ memset(b, 0, sizeof(*b)); b->start_ns = ktime_get_mono_fast_ns();
+ }
+ bool mt7915_npu_wa_add(struct mt7915_dev *dev, struct mt7915_kite_wa_batch *b, u16 token)
+ {
+@@ -84,6 +84,12 @@
+  while (i < 7 && elapsed > ns[i]) i++;
+  spin_lock_irqsave(&dev->kite.dp_done_lock, flags);
+  dev->kite.wa.reports++; dev->kite.wa.events += b->events;
++ if (!b->mpdu[0] && !b->mpdu[1]) dev->kite.wa.no_status_reports++;
++ for (u32 band = 0; band < 2; band++) {
++  dev->kite.wa.mpdu[band] += b->mpdu[band];
++  dev->kite.wa.retries[band] += b->retries[band];
++  dev->kite.wa.final_failed[band] += b->final_failed[band];
++ }
+  dev->kite.wa.total_ns += elapsed; dev->kite.wa.age[i]++;
+  if (elapsed > dev->kite.wa.max_ns) dev->kite.wa.max_ns = elapsed;
+  spin_unlock_irqrestore(&dev->kite.dp_done_lock, flags);

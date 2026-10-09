@@ -1,0 +1,54 @@
+Subject: mt7915: retry transient Kite stop transactions before quarantine
+
+A mailbox timeout during a reset can be transient while the firmware is
+finishing the same PARK/DATA_STOP transaction. The first failed command
+must keep all DMA and token ownership, but immediately quarantining the
+device strands both PHYs on a recoverable timeout. Retry the proof-only
+halt a small bounded number of times; quarantine remains the result when
+a fresh status never proves the stop boundary.
+
+--- a/mt7915/dma.c
++++ b/mt7915/dma.c
+@@ -662,17 +662,38 @@
+  * Call with NAPI disabled. A failed proof is sticky for this driver instance. */
+ int mt7915_dma_quiesce(struct mt7915_dev *dev)
+ {
+-	int ret;
++	int ret, attempt;
+ 
+ 	if (dev->mt76.npu_quarantine)
+ 		dev_info(dev->mt76.dev,
+ 			 "retrying Kite DMA stop after a previous unproven attempt\n");
+ 	mt76_npu_disable_irqs(&dev->mt76);
+-	ret = mt7915_npu_tx_halt(dev);
++	ret = -EIO;
++	for (attempt = 0; attempt < 3; attempt++) {
++		ret = mt7915_npu_tx_halt(dev);
++		if (!ret)
++			break;
++		/* A failed proof never releases ownership. Give a firmware
++		 * STOPPING transaction a short chance to become observable before
++		 * the next status/recovery transaction. */
++		if (!mt76_npu_device_active(&dev->mt76) ||
++		    (ret != -ETIMEDOUT && ret != -EIO && ret != -EBUSY))
++			break;
++		usleep_range(5000, 10000);
++	}
+ 	if (!ret)
+ 		ret = mt7915_dma_disable(dev, false);
+-	if (!ret)
+-		ret = mt7915_npu_data_stop(dev);
++	if (!ret) {
++		for (attempt = 0; attempt < 3; attempt++) {
++			ret = mt7915_npu_data_stop(dev);
++			if (!ret)
++				break;
++			if (!mt76_npu_device_active(&dev->mt76) ||
++			    (ret != -ETIMEDOUT && ret != -EIO && ret != -EBUSY))
++				break;
++			usleep_range(5000, 10000);
++		}
++	}
+ 	if (ret) {
+ 		if (mt76_npu_device_active(&dev->mt76))
+ 			dev->mt76.npu_quarantine = true;

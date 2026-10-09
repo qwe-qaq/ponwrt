@@ -1,0 +1,120 @@
+From: ponwrt maintainers
+Subject: [PATCH] r79 cached hart4 load, CPI and PC histogram diagnostics
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -600,7 +600,11 @@
+ 	int path_error;
+ 	unsigned long path_updated;
+ 	bool path_valid;
+-	u32 feed[CLANKER_DIAG_WORDS];
++	u32 prof[6][CLANKER_DIAG_WORDS];
++ int prof_error[6];
++ unsigned long prof_updated[6];
++ bool prof_valid[6];
++ u32 feed[CLANKER_DIAG_WORDS];
+ 	int feed_error;
+ 	unsigned long feed_updated,feed_advanced;
+ 	bool feed_valid;
+@@ -907,6 +911,8 @@
+   d->queue_valid ? jiffies_to_msecs(jiffies-d->queue_updated) : 0,
+   d->queue_valid ? jiffies_to_msecs(jiffies-d->queue_advanced) : 0,
+   v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9],v[10],v[11],v[48],v[49]);
++ if (d->queue_valid && v[0] && v[4]>=79)
++  n+=sysfs_emit_at(buf,n,"hart4_load busy_loops=%u idle_loops=%u counter_bits=32 scope=all_service_loops_no_timing\n",v[50],v[51]);
+  if (d->queue_valid && v[0]) for (b=0;b<2;b++) {
+   const u32 *p=v+12+b*18;
+   n+=sysfs_emit_at(buf,n,"queue_band%u pending=%u peak=%u demand=%u credit_hold=%u no_buffer=%u wait_kind=%u wait_at=%u no_buffer_cycles=%u credit_cycles=%u released=%u dma_wait=%u wa_wait=%u ready_wait=%u owner_wcid=%u owner_pending=%u sta_peak=%u no_buffer_cycles_hi=%u credit_cycles_hi=%u\n",
+@@ -936,7 +942,57 @@
+ }
+ static DEVICE_ATTR_RO(clanker_feed_status);
+ 
++/* KI1: worker measurements cached by the existing 10-second monitor.
++ * Read-only sysfs access performs no mailbox IO and never runs benchmarks. */
++static ssize_t clanker_prof_status_show(struct device *dev,
++                                       struct device_attribute *attr,char *buf)
++{
++ struct airoha_clanker_diag *d=((struct airoha_npu *)dev_get_drvdata(dev))->clanker;
++ ssize_t n=0;const u32 *v;
++ mutex_lock(&d->lock);v=d->prof[0]+4;
++ n+=sysfs_emit_at(buf,n,"prof available=%u error=%d age_ms=%u enabled=%u session=%u epoch=%u mhz=%u pc_base=0x%08x shift=%u samples=%u outside=%u sampler=%u target=%u\n",
++  d->prof_valid[0],d->prof_error[0],d->prof_valid[0]?jiffies_to_msecs(jiffies-d->prof_updated[0]):0,
++  v[0]==79,v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[28]?v[28]-1:0,v[29]);
++ if (d->prof_valid[0] && v[0]==79) {
++  static const char * const kinds[]={"sram","dram_cached_warm","dram_uncached","wifi_pcie_index","dram_cached_cold_lines"};
++  for (u32 i=0;i<5;i++) n+=sysfs_emit_at(buf,n,"memory kind=%s reads=%u cycles=%u instret=%u sink=%x\n",
++   kinds[i],v[8+i*4],v[9+i*4],v[10+i*4],v[11+i*4]);
++  for (u32 b=0;b<2;b++) {
++   const u32 *c=d->prof[b+1]+4;
++   n+=sysfs_emit_at(buf,n,"cpi_band%u available=%u error=%d valid=%u seq=%u session=%u epoch=%u\n",
++    b,d->prof_valid[b+1],d->prof_error[b+1],c[0]==79,c[1],c[2],c[3]);
++   if (!d->prof_valid[b+1] || c[0]!=79) continue;
++   for (u32 j=0;j<12;j++) n+=sysfs_emit_at(buf,n,"cpi%u_%u samples=%u cycles=%u instret=%u\n",
++    b,j,c[4+j*3],c[5+j*3],c[6+j*3]);
++  }
++ }
++ n+=sysfs_emit_at(buf,n,"scope=diagnostic_only CPI=delta_cycles/delta_instret memory_includes_CSR_loop_overhead_no_subtraction cold_probe=64_distinct_cache_lines_each_invalidated_before_read no_hardware_cache_miss_counter\n");
++ mutex_unlock(&d->lock);return n;
++}
++static DEVICE_ATTR_RO(clanker_prof_status);
++static ssize_t clanker_pc_status_show(struct device *dev,
++                                     struct device_attribute *attr,char *buf)
++{
++ struct airoha_clanker_diag *d=((struct airoha_npu *)dev_get_drvdata(dev))->clanker;
++ ssize_t n=0;
++ mutex_lock(&d->lock);
++ for (u32 p=3;p<6;p++) {
++  const u32 *v=d->prof[p]+4;
++  n+=sysfs_emit_at(buf,n,"pc_page=%u available=%u error=%d age_ms=%u valid=%u samples=%u start=%u count=%u base=0x%08x shift=%u\n",
++   p+10,d->prof_valid[p],d->prof_error[p],d->prof_valid[p]?jiffies_to_msecs(jiffies-d->prof_updated[p]):0,
++   v[0]==79,v[1],v[2],v[3],v[4],v[5]);
++  if (!d->prof_valid[p] || v[0]!=79 || v[3]>48 || v[5]>16) continue;
++  for (u32 i=0;i<v[3];i++) if (v[8+i])
++   n+=sysfs_emit_at(buf,n,"pc %08x %u\n",v[4]+((v[2]+i)<<v[5]),v[8+i]);
++ }
++ n+=sysfs_emit_at(buf,n,"scope=asynchronous_cumulative_u32_histogram_128byte_bins_use_this_image_ELF never_add_sample_counts_across_pages\n");
++ mutex_unlock(&d->lock);return n;
++}
++static DEVICE_ATTR_RO(clanker_pc_status);
++
+ static struct attribute *airoha_clanker_attrs[] = {
++ &dev_attr_clanker_prof_status.attr,
++ &dev_attr_clanker_pc_status.attr,
+  &dev_attr_clanker_feed_status.attr,
+ 	&dev_attr_clanker_queue_status.attr,
+ 	&dev_attr_clanker_cost_status.attr,
+@@ -1080,7 +1136,7 @@
+    queue_error=airoha_npu_wlan_msg_get(npu,7,
+     (enum airoha_npu_wlan_get_cmd)32,path,sizeof(path),GFP_KERNEL);
+    if (!queue_error && (path[0]!=CLANKER_DIAG_MAGIC || path[1]!=7 ||
+-       path[61]!=0x4b460001 || (path[4] && path[8]!=76 && path[8]!=77))) queue_error=-EPROTO;
++       path[61]!=0x4b460001 || (path[4] && path[8]!=76 && path[8]!=77 && path[8]!=79))) queue_error=-EPROTO;
+   }
+   mutex_lock(&d->lock);
+   d->queue_error=queue_error;
+@@ -1111,6 +1167,25 @@
+   }
+   mutex_unlock(&d->lock);
+  }
++ /* Profile0 uses just page9 capability; PROF=1 additionally exports the
++  * stage CPI and PC histogram pages. Never run a benchmark from this reader. */
++ for (i=0;i<6;i++) {
++  u32 page=i<3?9+i:10+i;
++  int e=err;
++  if (!i || (d->prof_valid[0] && d->prof[0][4]==79)) {
++   if (!e) {
++    memset(path,0,sizeof(path));
++    e=airoha_npu_wlan_msg_get(npu,page,(enum airoha_npu_wlan_get_cmd)32,
++                            path,sizeof(path),GFP_KERNEL);
++    if (!e && (path[0]!=CLANKER_DIAG_MAGIC || path[1]!=page ||
++               path[61]!=0x4b490001)) e=-EPROTO;
++   }
++   mutex_lock(&d->lock);d->prof_error[i]=e;
++   if (!e) {memcpy(d->prof[i],path,sizeof(path));d->prof_valid[i]=true;d->prof_updated[i]=jiffies;}
++   mutex_unlock(&d->lock);
++  }
++ }
++
+ 	mutex_lock(&d->lock);
+ 	previous_error = d->error;
+ 	d->error = err;

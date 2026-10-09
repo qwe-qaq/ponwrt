@@ -1,0 +1,89 @@
+From: ponwrt maintainers
+Subject: [PATCH] r73: Cache independent KC1 cost pages outside sysfs reads.
+
+Native incremental patch on release72. Ownership and datapath ABI unchanged.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -600,6 +600,10 @@
+ 	int path_error;
+ 	unsigned long path_updated;
+ 	bool path_valid;
++	u32 cost[2][CLANKER_DIAG_WORDS];
++	int cost_error[2];
++	unsigned long cost_updated[2];
++	bool cost_valid[2];
+ 	u32 control[CLANKER_CTL_WORDS];
+ 	unsigned long control_updated;
+ 	int control_error;
+@@ -849,7 +853,38 @@
+ }
+ static DEVICE_ATTR_RO(clanker_rx_status);
+ 
++
++/* Cached KC1 pages; no mailbox transaction from a sysfs reader. */
++static ssize_t clanker_cost_status_show(struct device *dev,
++                                       struct device_attribute *attr, char *buf)
++{
++ struct airoha_clanker_diag *d = ((struct airoha_npu *)dev_get_drvdata(dev))->clanker;
++ static const char * const names[] = {
++  "entry", "descriptor", "route", "station", "parse", "policy",
++  "tid_token", "txwi", "metadata", "commit", "push", "publish",
++ };
++ ssize_t n = 0;
++ unsigned int b, i;
++ mutex_lock(&d->lock);
++ for (b = 0; b < 2; b++) {
++  const u32 *v = d->cost[b] + 4;
++  n += sysfs_emit_at(buf, n, "cost_band%u available=%u last_error=%d age_ms=%u valid=%u seq=%u session=%u epoch=%u mhz=%u shift=%u revision=%u\n",
++   b, d->cost_valid[b], d->cost_error[b],
++   d->cost_valid[b] ? jiffies_to_msecs(jiffies - d->cost_updated[b]) : 0,
++   v[0], v[1], v[2], v[3], v[4], v[5], v[7]);
++  if (!d->cost_valid[b] || !v[0]) continue;
++  for (i = 0; i < ARRAY_SIZE(names); i++)
++   n += sysfs_emit_at(buf, n, "cost%u_%u name=%s samples=%u cycles=%u units=%u max_cycles=%u\n",
++    b, i, names[i], v[8+i*4], v[9+i*4], v[10+i*4], v[11+i*4]);
++ }
++ n += sysfs_emit_at(buf, n, "scope=sampled_worker_loops stage_populations_differ publish_units=PPE_packets cumulative_u32 no_ownership_meaning\n");
++ mutex_unlock(&d->lock);
++ return n;
++}
++static DEVICE_ATTR_RO(clanker_cost_status);
++
+ static struct attribute *airoha_clanker_attrs[] = {
++	&dev_attr_clanker_cost_status.attr,
+ 	&dev_attr_clanker_status.attr,
+ 	&dev_attr_clanker_rx_status.attr,
+ 	&dev_attr_clanker_host_status.attr,
+@@ -954,6 +989,31 @@
+ 		d->control_updated = jiffies;
+ 		d->control_valid = true;
+ 	}
++	/* Optional independent KC1 pages. Reuse the already-cached path
++	 * temporary. Do not hold the cache lock while waiting on firmware. */
++	mutex_unlock(&d->lock);
++	for (i = 0; i < 2; i++) {
++		int cost_error = err;
++
++		if (!err) {
++			memset(path, 0, sizeof(path));
++			cost_error = airoha_npu_wlan_msg_get(npu, 5 + i,
++				(enum airoha_npu_wlan_get_cmd)32, path, sizeof(path), GFP_KERNEL);
++			if (!cost_error && (path[0] != CLANKER_DIAG_MAGIC ||
++			    path[1] != 5+i || path[61] != 0x4b430001 ||
++			    (path[4] && (path[10] != i || path[11] != 73))))
++				cost_error = -EPROTO;
++		}
++		mutex_lock(&d->lock);
++		d->cost_error[i] = cost_error;
++		if (!cost_error) {
++			memcpy(d->cost[i], path, sizeof(path));
++			d->cost_updated[i] = jiffies;
++			d->cost_valid[i] = true;
++		}
++		mutex_unlock(&d->lock);
++	}
++	mutex_lock(&d->lock);
+ 	previous_error = d->error;
+ 	d->error = err;
+ 	spin_lock_bh(&core->lock);

@@ -1,0 +1,143 @@
+Subject: [PATCH] r58 single-hart completion, policy publication and local BA contracts
+
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -797,6 +797,23 @@
+ /* A removed last owner leaves a deny guard until STA/session revocation.
+  * PARK alone does not prove TDMA/PPE empty. Keeping its MAC identity prevents
+  * already captured frames being mistaken for ordinary routed downlink. */
++/* flow_offload_mutex serializes every writer. Exhaustion sticks at odd,
++ * forcing software fallback until a stopped rebind, never ABA reuse. */
++static void airoha_kite_bucket_begin(struct kdp_shared *s, u32 slot)
++{
++ u32 *p = &s->tuning.bucket_seq[slot / KDP_FLOW_WAYS];
++ u32 seq = READ_ONCE(*p);
++ WRITE_ONCE(*p, !seq || seq >= U32_MAX - 2 ? U32_MAX : seq + 1);
++ dma_wmb();
++}
++static void airoha_kite_bucket_end(struct kdp_shared *s, u32 slot)
++{
++ u32 *p = &s->tuning.bucket_seq[slot / KDP_FLOW_WAYS];
++ u32 seq = READ_ONCE(*p);
++ dma_wmb();
++ if (seq != U32_MAX) WRITE_ONCE(*p, seq + 1);
++}
++
+ static void airoha_kite_capture_clear(struct airoha_ppe *ppe, u32 wcid)
+ {
+ 	u32 i;
+@@ -805,8 +822,10 @@
+ 		if ((f->type != KDP_FLOW_BRIDGE_CAPTURE && f->type != KDP_FLOW_BRIDGE_GUARD) ||
+ 		    (wcid && f->wcid != wcid))
+ 			continue;
++		airoha_kite_bucket_begin(ppe->kite_dp, i);
+ 		WRITE_ONCE(f->version, 0);
+ 		ppe->kite_capture_refs[i] = 0;
++		airoha_kite_bucket_end(ppe->kite_dp, i);
+ 	}
+ }
+ 
+@@ -848,12 +867,16 @@
+ {
+ 	if (!e->kite_in_wcid)
+ 		return;
++	airoha_kite_bucket_begin(ppe->kite_dp, e->kite_policy);
+ 	WRITE_ONCE(ppe->kite_dp->flow[e->kite_policy].version, 0);
++	airoha_kite_bucket_end(ppe->kite_dp, e->kite_policy);
+ 	if (e->kite_capture_policy != KDP_SLOT_NONE) {
+ 		u32 slot = e->kite_capture_policy;
+ 		if (ppe->kite_capture_refs[slot] && !--ppe->kite_capture_refs[slot]) {
+ 			/* Workers are parked, so the guard transition is atomic to them. */
++			airoha_kite_bucket_begin(ppe->kite_dp, slot);
+ 			WRITE_ONCE(ppe->kite_dp->flow[slot].type, KDP_FLOW_BRIDGE_GUARD);
++			airoha_kite_bucket_end(ppe->kite_dp, slot);
+ 			atomic64_inc(&ppe->kite_capture_guarded);
+ 		}
+ 		e->kite_capture_policy = KDP_SLOT_NONE; /* retry-safe retirement */
+@@ -880,6 +903,7 @@
+ 			if (ppe->kite_capture_refs[slot]++) {
+ 				atomic64_inc(&ppe->kite_capture_shared);
+ 			} else {
++				airoha_kite_bucket_begin(ppe->kite_dp, slot);
+ 				dst = &ppe->kite_dp->flow[slot];
+ 				if (READ_ONCE(dst->version)) {
+ 					/* Reuse a same-key guard without any absent-record window.
+@@ -890,9 +914,11 @@
+ 				}
+ 				dma_wmb();
+ 				WRITE_ONCE(dst->version, ++ppe->kite_version);
++				airoha_kite_bucket_end(ppe->kite_dp, slot);
+ 				atomic64_inc(&ppe->kite_capture_new);
+ 			}
+ 		}
++		airoha_kite_bucket_begin(ppe->kite_dp, e->kite_policy);
+ 		dst = &ppe->kite_dp->flow[e->kite_policy];
+ 		/* Apply the same transactional publication to the exact Lpolicy. */
+ 		WRITE_ONCE(dst->version, 0);
+@@ -900,6 +926,7 @@
+ 		memcpy(dst, &e->kite_key, sizeof(*dst));
+ 		dma_wmb();
+ 		WRITE_ONCE(dst->version, ++ppe->kite_version);
++		airoha_kite_bucket_end(ppe->kite_dp, e->kite_policy);
+ 	}
+ 	dma_wmb();
+ 	WRITE_ONCE(e->kite_published, true);
+--- a/include/linux/soc/airoha/kite-datapath.h
++++ b/include/linux/soc/airoha/kite-datapath.h
+@@ -9,8 +9,8 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_ABI_VERSION 8u
+-#define KDP_MAGIC 0x4b440008u
++#define KDP_ABI_VERSION 9u
++#define KDP_MAGIC 0x4b440009u
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -292,6 +292,31 @@
+ struct kdp_service {
+  unsigned int seq, loop_samples, loop_cycles, loop_packets, loop_max_cycles;
+  struct kdp_service_band band[2];
++};
++
++/* ABI9: tail only. bucket_seq is serialized by the PPE flow mutex;
++ * odd means updating, zero means cache disabled permanently until rebind.
++ * BA request fields are ARM-owned; ACK belongs only to hart4. Request/ACK
++ * occur at complete batch boundaries. Token TID precedes WIFI publication. */
++struct kdp_ba_gate {
++ unsigned int request, ack, wcid, tids, generation, key_generation;
++};
++#define KDP_SERVICE_REAP 0u
++#define KDP_SERVICE_DMA 1u
++#define KDP_SERVICE_SUBMIT 2u
++#define KDP_SERVICE_PUBLISH 3u
++struct kdp_tune_stats {
++ unsigned int seq, pending_peak, pressure_events, pressure_pending;
++ unsigned int dma_wait, wa_wait, ready_wait, done_backlog, oldest_ticks;
++ unsigned int wan_hit, wan_miss, wan_retry, local_hold, bitmap_fault;
++ struct kdp_observe_time stage[4];
++};
++struct kdp_tuning {
++ unsigned int publish_batch; /* load time: 8 baseline, 16 comparison */
++ unsigned int bucket_seq[KDP_FLOW_BUCKETS];
++ struct kdp_ba_gate ba;
++ unsigned char token_tid[KDP_TOKENS];
++ struct kdp_tune_stats stats;
+ };
+ 
+ struct kdp_shared {
+@@ -318,9 +343,10 @@
+ 	struct kdp_done_queue done;
+ 	struct kdp_tx_activity activity[KDP_WCIDS];
+ 	struct kdp_service service;
+-};
+-
+-/* ABI8 extends the tail, never the header or DMA regions. Magic and bytes
++	struct kdp_tuning tuning;
++};
++
++/* ABI9 extends the tail, never the header or DMA regions. Magic and bytes
+  * are both checked so a mixed driver/firmware fails before DMA admission. */
+ _Static_assert(sizeof(struct kdp_perf_control) == 64, "Kite perf control");
+ _Static_assert(sizeof(struct kdp_perf_band) == 64, "Kite perf counters");

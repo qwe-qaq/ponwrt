@@ -1,0 +1,134 @@
+Subject: [PATCH] Kite: count completed security/fallback delivery and expose reorder fences
+
+--- a/npu_internal.h
++++ b/npu_internal.h
+@@ -798,6 +798,15 @@
+ 	NC_KITE_CHAIN_FAIL0, NC_KITE_CHAIN_FAIL1,
+ 	NC_KITE_INIT0, NC_KITE_INIT1,
+ 	NC_KITE_ROLLBACK0, NC_KITE_ROLLBACK1,
++	/* Core 3 alone counts completed host publications, once per frame. */
++	NC_KITE_META_RAW0 = 56, NC_KITE_META_RAW1,
++	NC_KITE_META_ENCRYPTED0, NC_KITE_META_ENCRYPTED1,
++	NC_KITE_META_UNKNOWN_STA0, NC_KITE_META_UNKNOWN_STA1,
++	NC_KITE_META_UNSUPPORTED0, NC_KITE_META_UNSUPPORTED1,
++	NC_KITE_META_AMSDU0, NC_KITE_META_AMSDU1,
++	NC_KITE_META_REORDER0, NC_KITE_META_REORDER1,
++	NC_KITE_META_UNKNOWN0, NC_KITE_META_UNKNOWN1,
++	NC_KITE_META_FALLBACK0, NC_KITE_META_FALLBACK1,
+ 	NC_MAX = 96,
+ };
+ 
+--- a/npu_wifi.c
++++ b/npu_wifi.c
+@@ -109,6 +109,10 @@
+ 		d[26] = wifi_band_cap;
+ 		kite_tdma_snapshot(d + 27);
+ 		kite_host_snapshot(d + 31);
++		for (i = 0; i < 16; i++)
++			d[43 + i] = ndbg->cnt[NC_KITE_META_RAW0 + i];
++		kite_ctl_reorder_snapshot(d + 59);
++		d[61] = 0x4b530001; /* KS telemetry ABI 1 */
+ 	}
+ 	return 1;
+ }
+--- a/npu_hostadpt.c
++++ b/npu_hostadpt.c
+@@ -311,6 +311,30 @@
+ 	}
+ }
+ 
++/* Only core 3 calls this after a successful publication. Retries and DMA
++ * failures are not packets; a segmented frame is counted once. */
++static void kite_host_meta_count(u32 band, u32 info)
++{
++	u32 counter;
++
++	if (band > 1 || !KITE_HOST_META_VALID(info))
++		return;
++	switch (KITE_HOST_META_REASON(info)) {
++	case KITE_HOST_META_RAW: counter = NC_KITE_META_RAW0; break;
++	case KITE_HOST_META_ENCRYPTED: counter = NC_KITE_META_ENCRYPTED0; break;
++	case KITE_HOST_META_UNAUTHORIZED: counter = NC_KITE_META_UNKNOWN_STA0; break;
++	case KITE_HOST_META_MALFORMED: counter = NC_KITE_META_UNSUPPORTED0; break;
++	case KITE_HOST_META_AMSDU: counter = NC_KITE_META_AMSDU0; break;
++	default: counter = NC_KITE_META_UNKNOWN0; break;
++	}
++	NDBG_CNT(counter + band);
++	if (KITE_HOST_META_FLAGS(info) == KITE_HOST_META_REORDERED &&
++	    KITE_HOST_META_REASON(info) == KITE_HOST_META_RAW)
++		NDBG_CNT(NC_KITE_META_REORDER0 + band);
++	else
++		NDBG_CNT(NC_KITE_META_FALLBACK0 + band);
++}
++
+ int host_ring_submit(u32 buf_addr, u16 pkt_len, u32 band,
+ 			    u16 wcid, u8 amsdu, u8 fwd_type,
+ 			    u16 orig_len, u8 is_last, u32 info)
+@@ -319,6 +343,8 @@
+ 
+ 	if (band < 2)
+ 		NDBG_CNT((ret ? NC_KITE_HOST_FAIL0 : NC_KITE_HOST0) + band);
++	if (!ret)
++		kite_host_meta_count(band, info);
+ 	return ret;
+ }
+ 
+@@ -383,6 +409,9 @@
+ 
+ 	if (band < 2)
+ 		NDBG_CNT((ret ? NC_KITE_CHAIN_FAIL0 : NC_KITE_CHAIN0) + band);
++	if (!ret)
++		kite_host_meta_count(band,
++			KITE_HOST_META_PACK(0, 0, KITE_HOST_META_MALFORMED));
+ 	return ret;
+ }
+ 
+--- a/npu_kite_control.c
++++ b/npu_kite_control.c
+@@ -23,7 +23,7 @@
+ 
+ static struct {
+ 	u32 session, serial, result, base, mode;
+-	u32 reorder;
++	u32 reorder, reorder_fences;
+ 	volatile u32 park_cookie;
+ 	u32 accepted, rejected, stations, bas, keys;
+ 	u32 last[KITE_CTL_WORDS];
+@@ -35,6 +35,13 @@
+ #define ctl_fence() __asm__ volatile("fence iorw,iorw" ::: "memory")
+ 
+ /* The worker loops call these helpers at complete-unit boundaries. */
++
++/* GET32 page1 words59..60: requested mode alone does not imply active BA. */
++void kite_ctl_reorder_snapshot(u32 *out)
++{
++	out[0] = ctl.mode == KITE_CTL_MODE_DATA_REORDER && ctl.reorder;
++	out[1] = ctl.reorder_fences;
++}
+ 
+ int kite_ctl_active(void)
+ {
+@@ -240,9 +247,11 @@
+ 			 * performs the full DATA_STOP drain, permanently fall back to
+ 			 * raw host delivery for this session. A fresh OPEN is required
+ 			 * before NPU reorder can be negotiated again. */
+-			if (ctl.mode == KITE_CTL_MODE_DATA_REORDER &&
+-			    kite_ctl_rings_live())
++			if (ctl.mode == KITE_CTL_MODE_DATA_REORDER && ctl.reorder &&
++			    kite_ctl_rings_live()) {
+ 				ctl.reorder = 0;
++				ctl.reorder_fences++;
++			}
+ 			ctl.park_cookie = d[4];
+ 			for (i = 1; i <= 3; i++)
+ 				ctl.ack[i] = 0;
+--- a/kite-control.h
++++ b/kite-control.h
+@@ -99,6 +99,7 @@
+ int kite_ctl_get(u32 *msg, u32 bytes);
+ int kite_ctl_pausepoint(u32 hart);
+ u32 kite_ctl_ba_address(u32 band, u32 wcid, u32 tid);
++void kite_ctl_reorder_snapshot(u32 *out);
+ int kite_ctl_active(void);
+ int kite_ctl_sta_matches(u32 band, u32 wcid, u32 bss);
+ int kite_ctl_rx_meta(u32 band, u32 wcid, u32 bss, u32 *generation,

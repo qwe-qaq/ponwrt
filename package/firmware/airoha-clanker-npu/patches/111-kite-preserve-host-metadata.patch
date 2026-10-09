@@ -1,0 +1,13 @@
+Subject: [PATCH] Kite: preserve the full metadata word through host delivery
+
+--- a/npu_wifi_fwd.c
++++ b/npu_wifi_fwd.c
+@@ -332,7 +332,7 @@
+ 				       *(u8 *)((u32)entry + 10) >> 2,
+ 				       *(u16 *)((u32)entry + 8),
+ 				       (*(u8 *)((u32)entry + 10) >> 1) & 1,
+-				       *(u8 *)((u32)entry + 12));
++				       *(u32 *)((u32)entry + 12));
+ 		if (ret == KITE_HOST_HOLD)
+ 			return; /* retain node and source until DMA completion is proven */
+ 		wifi_cnt_inc(band == 1, ret ? 108 : 48);

@@ -1,0 +1,104 @@
+Subject: [PATCH] re-enter bridge policy misses through mac80211 software TX
+
+--- a/mt7915/kite-host.h
++++ b/mt7915/kite-host.h
+@@ -21,4 +21,13 @@
++#define KDP_HOST_FWD_WIFI_TX 1u
++#define KDP_HOST_FALLBACK_MAGIC 0xd74b0000u
++#define KDP_HOST_FALLBACK_VALID(v) (((v) & 0xffff0000u) == KDP_HOST_FALLBACK_MAGIC)
++#define KDP_HOST_FALLBACK_BAND(v) (((v) >> 10) & 1u)
++#define KDP_HOST_FALLBACK_WCID(v) ((v) & 0x3ffu)
++#define KDP_STAT_BRIDGE_HIT 0u
++#define KDP_STAT_BRIDGE_MISS 1u
++#define KDP_STAT_HOST_FALLBACK 2u
++#define KDP_STAT_HOST_FALLBACK_DROP 3u
+ #define KITE_HOST_META_VALID(v) (((v) >> 24) == KITE_HOST_META_MAGIC)
+ #define KITE_HOST_META_GENERATION(v) (((v) >> 8) & 0xffffu)
+ #define KITE_HOST_META_FLAGS(v) (((v) >> 4) & 0xfu)
+ #define KITE_HOST_META_REASON(v) ((v) & 0xfu)
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1211,7 +1211,65 @@
++struct mt7915_kite_host_tx {
++	struct sk_buff *skb;
++	u8 band;
++	bool sent;
++};
++
++static void mt7915_kite_host_tx_iter(void *data, u8 *mac,
++				      struct ieee80211_vif *vif)
++{
++	struct mt7915_kite_host_tx *ctx = data;
++	struct mt76_vif_link *mlink;
++	struct wireless_dev *wdev;
++
++	if (ctx->sent || vif->type != NL80211_IFTYPE_AP)
++		return;
++	mlink = mt76_vif_link(NULL, vif, 0);
++	if (!mlink || mlink->band_idx != ctx->band)
++		return;
++	wdev = ieee80211_vif_to_wdev(vif);
++	if (!wdev || !wdev->netdev || !netif_running(wdev->netdev))
++		return;
++	ctx->skb->dev = wdev->netdev;
++	ctx->skb->protocol = eth_hdr(ctx->skb)->h_proto;
++	skb_reset_network_header(ctx->skb);
++	skb_reset_transport_header(ctx->skb);
++	ctx->sent = true;
++	dev_queue_xmit(ctx->skb);
++}
++
++static bool mt7915_kite_host_tx(struct mt7915_dev *dev, struct sk_buff *skb,
++				 u32 meta)
++{
++	struct mt7915_kite_host_tx ctx = {
++		.skb = skb,
++		.band = KDP_HOST_FALLBACK_BAND(meta),
++	};
++
++	if (!KDP_HOST_FALLBACK_VALID(meta) || skb->len < ETH_HLEN ||
++		ctx.band > 1 || KDP_HOST_FALLBACK_WCID(meta) >= MT7916_WTBL_SIZE)
++		return false;
++	ieee80211_iterate_active_interfaces_atomic(dev->mt76.hw,
++		IEEE80211_IFACE_ITER_NORMAL, mt7915_kite_host_tx_iter, &ctx);
++	if (!ctx.sent)
++		dev_kfree_skb(skb);
++	return true;
++}
++
+ void mt7915_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
+ 			 struct sk_buff *skb, u32 *info)
+ {
+ 	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
+-	__le32 *rxd = (__le32 *)skb->data;
++	__le32 *rxd;
++
++	/* A bridge-policy miss is already a complete Ethernet frame. Re-enter
++	 * the selected AP interface so mac80211 performs normal station lookup,
++	 * encryption and software TX. It must never be parsed as an MT7916 RXD. */
++	if (info && KDP_HOST_FALLBACK_VALID(info[0])) {
++		if (!mt7915_kite_host_tx(dev, skb, info[0]))
++			dev_kfree_skb(skb);
++		return;
++	}
++
++	rxd = (__le32 *)skb->data;
+ 	__le32 *end = (__le32 *)&skb->data[skb->len];
+ 	enum rx_pkt_type type;
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1348,9 +1348,13 @@
+ 		dev->mt76.kite_pn_accept, dev->mt76.kite_pn_proof, dev->mt76.kite_pn_reject);
+ 	spin_unlock_bh(&dev->mt76.rx_lock);
+ 	for (b = 0; b < 2; b++)
+-		seq_printf(m, "band%u rx_ppe=%u rx_bytes=%u rx_host=%u rx_return=%u rx_free_only=%u rx_replay=%u rx_stale=%u rx_unsupported=%u rx_policy_hit=%u rx_policy_miss=%u rx_tdma_full=%u tx_sent=%u tx_bytes=%u tx_freed=%u tx_drop=%u tx_stale=%u tx_full=%u tx_aborted=%u\n",
++		seq_printf(m, "band%u rx_ppe=%u rx_bytes=%u rx_host=%u rx_return=%u rx_free_only=%u rx_replay=%u rx_stale=%u rx_unsupported=%u rx_policy_hit=%u rx_policy_miss=%u rx_tdma_full=%u bridge_hit=%u bridge_miss=%u host_fallback=%u host_fallback_drop=%u tx_sent=%u tx_bytes=%u tx_freed=%u tx_drop=%u tx_stale=%u tx_full=%u tx_aborted=%u\n",
+ 			b, s->rx_ppe[b], s->stats[b].rx_bytes, s->rx_host[b], s->rx_miss[b],
+ 			s->rx_free[b], s->rx_replay[b], s->rx_stale[b], s->rx_unsupported[b],
+ 			s->stats[b].rx_policy_hit, s->stats[b].rx_policy_miss, s->stats[b].rx_tdma_full,
++			s->stats[b].reserved[KDP_STAT_BRIDGE_HIT],
++			s->stats[b].reserved[KDP_STAT_BRIDGE_MISS],
++			s->stats[b].reserved[KDP_STAT_HOST_FALLBACK],
++			s->stats[b].reserved[KDP_STAT_HOST_FALLBACK_DROP],
+ 			s->tx_sent[b], s->stats[b].tx_bytes, s->tx_freed[b], s->tx_drop[b],
+			s->stats[b].tx_stale, s->stats[b].tx_full, s->tx_aborted[b]);

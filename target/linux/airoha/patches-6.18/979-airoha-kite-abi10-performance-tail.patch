@@ -1,0 +1,63 @@
+Subject: [PATCH] r59 single-hart TX, bounded PS fallback and completion observations
+
+--- a/include/linux/soc/airoha/kite-datapath.h
++++ b/include/linux/soc/airoha/kite-datapath.h
+@@ -9,8 +9,8 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_ABI_VERSION 9u
+-#define KDP_MAGIC 0x4b440009u
++#define KDP_ABI_VERSION 10u
++#define KDP_MAGIC 0x4b44000au
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -151,6 +151,11 @@
+ #define KDP_TOKEN_TDMA 1u
+ #define KDP_TOKEN_WIFI 2u
+ #define KDP_TOKEN_QUARANTINE 3u
++/* Host-copy source is neither TDMA-owned nor a Wi-Fi TX completion. */
++#define KDP_TOKEN_HOST 4u
++#define KDP_TX_BLOCK_PS 1u
++#define KDP_TX_BLOCK_WAKE 8u
++#define KDP_TX_BLOCK_SOFTWARE (KDP_TX_BLOCK_PS | KDP_TX_BLOCK_WAKE)
+ 
+ #define KDP_RX_TOKENS 5600u
+ #define KDP_RX_MAGIC 0x4b520000u
+@@ -319,6 +324,27 @@
+  struct kdp_tune_stats stats;
+ };
+ 
++/* ABI10 diagnostic tail. Hart4 owns this seqlock snapshot; host reads only.
++ * Histograms: <=64us, <=256us, <=1ms, <=4ms, <=16ms, <=64ms,
++ * <=256ms, larger. DMA/WA/free/ready are sampled token ages, not RF ACK.
++ * hot: fetch, admission, parse, policy, build, commit (disjoint scopes). */
++#define KDP_HOT_FETCH 0u
++#define KDP_HOT_ADMIT 1u
++#define KDP_HOT_PARSE 2u
++#define KDP_HOT_POLICY 3u
++#define KDP_HOT_BUILD 4u
++#define KDP_HOT_COMMIT 5u
++struct kdp_r59_band {
++ unsigned int age[4][8];
++ unsigned int fallback_enqueued, fallback_completed, fallback_failed;
++ unsigned int fallback_full, fallback_pending, fallback_peak;
++ unsigned int fallback_ticks, fallback_max_ticks, ps_fallback;
++};
++struct kdp_r59 {
++ unsigned int seq, revision;
++ struct kdp_observe_time hot[6];
++ struct kdp_r59_band band[2];
++};
+ struct kdp_shared {
+ 	unsigned int magic, bytes, session, epoch;
+ 	unsigned int enabled, fault, gate, stopped;
+@@ -344,6 +370,7 @@
+ 	struct kdp_tx_activity activity[KDP_WCIDS];
+ 	struct kdp_service service;
+ 	struct kdp_tuning tuning;
++ struct kdp_r59 r59;
+ };
+ 
+ /* ABI9 extends the tail, never the header or DMA regions. Magic and bytes

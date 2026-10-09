@@ -1,0 +1,221 @@
+--- a/mt76.h
++++ b/mt76.h
+@@ -757,6 +757,7 @@
+ 
+ 	u8 phy_idx:2;
+ 	u8 aggr:1;
++	u8 npu_reordered:1;
+ 	u8 qos_ctl;
+ 	u16 seqno;
+ 
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1576,10 +1576,13 @@
+ 	__skb_queue_head_init(&frames);
+ 
+ 	while ((skb = __skb_dequeue(&dev->rx_skb[q])) != NULL) {
++		struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
++
+ 		mt76_check_sta(dev, skb);
+-		/* Kite fallback includes protected/A-MSDU frames that the firmware
+-		 * has not reordered. Keep the software BA -> PN ordering intact. */
+-		if (mtk_wed_device_active(&dev->mmio.wed) ||
++		/* Only a validated, plaintext mode-2 record may skip software BA.
++		 * Protected/A-MSDU/unknown metadata stays on the host reorder path. */
++		if (status->npu_reordered ||
++		    mtk_wed_device_active(&dev->mmio.wed) ||
+ 		    (mt76_npu_device_active(dev) &&
+ 		     dev->mmio.npu_type != MT76_NPU_TYPE_KITE))
+ 			__skb_queue_tail(&frames, skb);
+--- a/npu.c
++++ b/npu.c
+@@ -188,6 +188,10 @@
+ 
+ 	if (!mt76_npu_device_active(dev))
+ 		return;
++	/* Kite word1/word2 metadata is not the Eagle FOE/reason contract.  A
++	 * Kite packet must never reach PPE learning through this generic helper. */
++	if (dev->mmio.npu_type == MT76_NPU_TYPE_KITE)
++		return;
+ 
+ 	rcu_read_lock();
+ 
+--- a/mt7915/kite-control.h
++++ b/mt7915/kite-control.h
+@@ -22,11 +22,17 @@
+ #define KITE_CTL_CAP_KEY_FENCE 8u
+ #define KITE_CTL_CAP_CONTROL_ONLY 16u
+ #define KITE_CTL_CAP_ARM_PA 32u
+-#define KITE_CTL_CAPS 63u
+ #define KITE_CTL_CAP_HOST_RING 64u /* optional explicit bind/unbind, not DMA ownership */
+ #define KITE_CTL_CAP_DATA_LIFECYCLE 128u
++#define KITE_CTL_CAP_SECURITY_FALLBACK 256u
++#define KITE_CTL_CAP_RX_REORDER 512u
++#define KITE_CTL_CAP_META 1024u
++#define KITE_CTL_CAPS 2047u
+ #define KITE_CTL_MODE_DATA 0u
+ #define KITE_CTL_MODE_CONTROL_ONLY 1u
++#define KITE_CTL_MODE_DATA_REORDER 2u
++#define KITE_CTL_DATA_MODE(m) ((m) == KITE_CTL_MODE_DATA || \
++				    (m) == KITE_CTL_MODE_DATA_REORDER)
+ 
+ /* ARM physical DDR: 0x80000000..0xbfffffff. Never accept a bare
+  * offset or the NPU uncached alias as an ARM address. No wrap allowed. */
+--- a/mt7915/kite-host.h
++++ b/mt7915/kite-host.h
+@@ -8,6 +8,20 @@
+ #define KITE_HOST_DIAG_MAGIC 0x4b480001u
+ #define KITE_HOST_RING_COUNT 512u
+ #define KITE_HOST_RING_BYTES (KITE_HOST_RING_COUNT * 24u)
++#define KITE_HOST_META_MAGIC 0xA5u
++#define KITE_HOST_META_REORDERED 0x1u /* bit 0 of the packed flags nibble */
++#define KITE_HOST_META_RAW 0x01u
++#define KITE_HOST_META_ENCRYPTED 0x02u
++#define KITE_HOST_META_UNAUTHORIZED 0x03u
++#define KITE_HOST_META_MALFORMED 0x04u
++#define KITE_HOST_META_AMSDU 0x05u
++#define KITE_HOST_META_FRAGMENT 0x06u
++#define KITE_HOST_META_UNKNOWN 0x0fu
++#define KITE_HOST_CLASSIFY_REORDERED (-3)
++#define KITE_HOST_META_VALID(v) (((v) >> 24) == KITE_HOST_META_MAGIC)
++#define KITE_HOST_META_GENERATION(v) (((v) >> 8) & 0xffffu)
++#define KITE_HOST_META_FLAGS(v) (((v) >> 4) & 0xfu)
++#define KITE_HOST_META_REASON(v) ((v) & 0xfu)
+ 
+ static inline int kite_host_ring_valid(unsigned long long addr)
+ {
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -8,9 +8,42 @@
+ #include "../dma.h"
+ #include "mac.h"
+ #include "mcu.h"
++#include "kite-host.h"
+ 
+ #define to_rssi(field, rcpi)	((FIELD_GET(field, rcpi) - 220) / 2)
+ 
++static bool mt7915_kite_meta_reordered(struct mt7915_dev *dev,
++					       struct mt76_rx_status *status,
++					       u32 info, __le16 fc, u16 seq_ctrl)
++{
++#if IS_ENABLED(CONFIG_MT7915_NPU)
++	u16 idx;
++
++	if (dev->mt76.mmio.npu_type != MT76_NPU_TYPE_KITE ||
++	    !dev->kite.reorder || !KITE_HOST_META_VALID(info) ||
++	    !(KITE_HOST_META_FLAGS(info) & KITE_HOST_META_REORDERED) ||
++	    KITE_HOST_META_REASON(info) != KITE_HOST_META_RAW ||
++	    !status->wcid || (status->flag & RX_FLAG_DECRYPTED) ||
++	    status->amsdu || (seq_ctrl & IEEE80211_SCTL_FRAG))
++		return false;
++
++	/* mt7915_mac_fill_rx publishes the wcid pointer in this union.  The
++	 * numeric index is therefore taken from the object, not by reinterpreting
++	 * the pointer bits as wcid_idx. */
++	idx = status->wcid->idx;
++	if (idx >= MT7916_WTBL_SIZE || !dev->kite.live[idx] ||
++	    !dev->kite.generation[idx] ||
++	    dev->kite.generation[idx] > 0xffffu ||
++	    (dev->kite.generation[idx] & 0xffff) !=
++	    KITE_HOST_META_GENERATION(info) || dev->kite.key_generation[idx])
++		return false;
++	status->npu_reordered = 1;
++	return true;
++#else
++	return false;
++#endif
++}
++
+ static const struct mt7915_dfs_radar_spec etsi_radar_specs = {
+ 	.pulse_th = { 110, -10, -80, 40, 5200, 128, 5200 },
+ 	.radar_pattern = {
+@@ -539,6 +572,7 @@
+ 		       !ieee80211_is_qos_nullfunc(fc);
+ 	status->qos_ctl = qos_ctl;
+ 	status->seqno = IEEE80211_SEQ_TO_SN(seq_ctrl);
++	mt7915_kite_meta_reordered(dev, status, *info, fc, seq_ctrl);
+ 
+ 	return 0;
+ }
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -269,6 +269,7 @@
+ 		u32 generation[MT7916_WTBL_SIZE];
+ 		u32 key_generation[MT7916_WTBL_SIZE];
+ 		bool active, failed, control_only, host_bound, npu_quarantine;
++		bool reorder;
+ 		bool live[MT7916_WTBL_SIZE];
+ 	} kite;
+ #endif
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -38,7 +38,8 @@
+ 	for (i = 0; i < KITE_CTL_WORDS; i++)
+ 		s[i] = le32_to_cpu(wire[i]);
+ 	if (s[0] != KITE_CTL_MAGIC || s[1] != KITE_CTL_WORDS ||
+-	    s[8] != KITE_CTL_WCIDS || s[9] != KITE_CTL_DRAM_BYTES || s[15] > KITE_CTL_MODE_CONTROL_ONLY)
++	    s[8] != KITE_CTL_WCIDS || s[9] != KITE_CTL_DRAM_BYTES ||
++	    s[15] > KITE_CTL_MODE_DATA_REORDER)
+ 		return -EPROTO;
+ 	return 0;
+ }
+@@ -86,7 +87,9 @@
+ 	if (s[3] != dev->kite.session || s[4] != dev->kite.serial ||
+ 	    (!s[5] && op != KITE_CTL_CLOSE &&
+ 	     s[15] != (dev->kite.control_only ?
+-		       KITE_CTL_MODE_CONTROL_ONLY : KITE_CTL_MODE_DATA)))
++		       KITE_CTL_MODE_CONTROL_ONLY :
++		       (dev->kite.reorder ? KITE_CTL_MODE_DATA_REORDER :
++				     KITE_CTL_MODE_DATA))))
+ 		return -EPROTO;
+ 	return mt7915_kite_result(s[5]);
+ }
+@@ -174,7 +177,13 @@
+ 		goto out;
+ 	if ((s[2] & KITE_CTL_CAPS) != KITE_CTL_CAPS ||
+ 	    (!dev->kite.control_only &&
+-	     !(s[2] & KITE_CTL_CAP_DATA_LIFECYCLE)) ||
++	     ((s[2] & (KITE_CTL_CAP_DATA_LIFECYCLE |
++		       KITE_CTL_CAP_SECURITY_FALLBACK |
++		       KITE_CTL_CAP_META)) !=
++	      (KITE_CTL_CAP_DATA_LIFECYCLE |
++	       KITE_CTL_CAP_SECURITY_FALLBACK |
++	       KITE_CTL_CAP_META) ||
++	      (dev->kite.reorder && !(s[2] & KITE_CTL_CAP_RX_REORDER)))) ||
+ 	    s[6] != KITE_CTL_CLOSED || s[3] == U32_MAX) {
+ 		ret = -EOPNOTSUPP;
+ 		goto out;
+@@ -198,7 +207,8 @@
+ 	args[0] = res.start;
+ 	args[1] = resource_size(&res);
+ 	args[2] = dev->kite.control_only ? KITE_CTL_MODE_CONTROL_ONLY :
+-					KITE_CTL_MODE_DATA;
++					(dev->kite.reorder ? KITE_CTL_MODE_DATA_REORDER :
++					 KITE_CTL_MODE_DATA);
+ 	/* Install only BA storage. Do not initialize pkt pools, force-CPU,
+ 	 * host rings or the NPU packet DMA device for a control-only session. */
+ 	if (dev->kite.control_only) {
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -22,10 +22,13 @@
+  */
+ static bool npu_enable;
+ static bool npu_control = true;
++static bool npu_reorder;
+ module_param(npu_control, bool, 0400);
+ MODULE_PARM_DESC(npu_control, "Mirror STA/key/port/BA state to Clanker (WiFi data stays on host)");
+ module_param(npu_enable, bool, 0400);
+ MODULE_PARM_DESC(npu_enable, "Enable experimental Kite RX data mode with stop/drain recovery ABI");
++module_param(npu_reorder, bool, 0400);
++MODULE_PARM_DESC(npu_reorder, "Enable candidate plaintext NPU BA/reorder path; PN/security remain host-owned");
+ 
+ static struct airoha_npu *mt7915_npu(struct mt7915_dev *dev)
+ {
+@@ -96,6 +99,7 @@
+ int mt7915_npu_init(struct mt7915_dev *dev)
+ {
+ 	mutex_init(&dev->kite.lock);
++	dev->kite.reorder = npu_reorder;
+ 	if (npu_control && !npu_enable)
+ 		mt7915_npu_control_attach(dev);
+ 	if (!mt7915_npu_present(dev))

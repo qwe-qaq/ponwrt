@@ -1,0 +1,25 @@
+Subject: net: airoha: invalidate Kite policy before replacing records
+
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -679,6 +679,10 @@
+ 		 * capture without the exact policy safely falls back to the host. */
+ 		if (e->kite_capture_policy != KDP_SLOT_NONE) {
+ 			dst = &ppe->kite_dp->flow[e->kite_capture_policy];
++			/* Invalidate before changing any field. Readers must never
++			 * observe a partially replaced capture record. */
++			WRITE_ONCE(dst->version, 0);
++			dma_wmb();
+ 			memcpy(dst, &e->kite_key, sizeof(*dst));
+ 			dst->type = KDP_FLOW_BRIDGE_CAPTURE;
+ 			dst->src[0] = dst->src[1] = dst->src[2] = dst->src[3] = 0;
+@@ -688,6 +692,9 @@
+ 			WRITE_ONCE(dst->version, ++ppe->kite_version);
+ 		}
+ 		dst = &ppe->kite_dp->flow[e->kite_policy];
++		/* Apply the same transactional publication to the exact Lpolicy. */
++		WRITE_ONCE(dst->version, 0);
++		dma_wmb();
+ 		memcpy(dst, &e->kite_key, sizeof(*dst));
+ 		dma_wmb();
+ 		WRITE_ONCE(dst->version, ++ppe->kite_version);

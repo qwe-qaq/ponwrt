@@ -1,0 +1,46 @@
+Subject: [PATCH] bind bridge fallback to the owning AP VIF
+
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1210,7 +1210,9 @@
+ 
+ struct mt7915_kite_host_tx {
+ 	struct sk_buff *skb;
++	struct mt7915_vif *vif;
+ 	u8 band;
++	u16 wcid;
+ 	bool sent;
+ };
+ 
+@@ -1225,6 +1227,8 @@
+ 		return;
+ 	mlink = mt76_vif_link(NULL, vif, 0);
+ 	if (!mlink || mlink->band_idx != ctx->band)
++		return;
++	if (ctx->vif && container_of(mlink, struct mt7915_vif, mt76) != ctx->vif)
+ 		return;
+ 	wdev = ieee80211_vif_to_wdev(vif);
+ 	if (!wdev || !wdev->netdev || !netif_running(wdev->netdev))
+@@ -1243,11 +1247,21 @@
+ 	struct mt7915_kite_host_tx ctx = {
+ 		.skb = skb,
+ 		.band = KDP_HOST_FALLBACK_BAND(meta),
++		.wcid = KDP_HOST_FALLBACK_WCID(meta),
+ 	};
++	struct mt76_wcid *wcid;
++	struct mt7915_sta *msta;
+ 
+ 	if (!KDP_HOST_FALLBACK_VALID(meta) || skb->len < ETH_HLEN ||
+-		ctx.band > 1 || KDP_HOST_FALLBACK_WCID(meta) >= MT7916_WTBL_SIZE)
++		ctx.band > 1 || ctx.wcid >= MT7916_WTBL_SIZE)
+ 		return false;
++	wcid = mt76_wcid_ptr(dev, ctx.wcid);
++	if (!wcid || !wcid->sta)
++		return false;
++	msta = container_of(wcid, struct mt7915_sta, wcid);
++	if (!msta->vif)
++		return false;
++	ctx.vif = msta->vif;
+ 	ieee80211_iterate_active_interfaces_atomic(dev->mt76.hw,
+ 		IEEE80211_IFACE_ITER_NORMAL, mt7915_kite_host_tx_iter, &ctx);
+ 	if (!ctx.sent)

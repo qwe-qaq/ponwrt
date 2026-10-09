@@ -1,0 +1,369 @@
+--- a/kite-fast.inc
++++ b/kite-fast.inc
+@@ -17,9 +17,41 @@
+  u32 seq, bucket, session, epoch, generation, key_generation, tag, bss, dsfield;
+  struct dp_l2_hash key;
+ };
++/* TX-only private prefix: shared RX PN and its locks are never copied. */
++struct dp_sta_tx {
++	unsigned int generation, key_generation, enabled, band;
++	unsigned int bss, cipher, keyid, authorized;
++	unsigned int omac, wmm, wme, amsdu;
++	unsigned int host_tids, reserved_sta;
++	unsigned int tx_tag;
++	unsigned char addr[6];
++	unsigned char tx_blocked, qos_valid;
++	unsigned char qos_map[64];
++};
++_Static_assert(sizeof(struct dp_sta_tx) == __builtin_offsetof(struct kdp_sta, pn),
++ "TX prefix preserves every shared field offset");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, generation) == __builtin_offsetof(struct kdp_sta, generation), "TX prefix generation");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, key_generation) == __builtin_offsetof(struct kdp_sta, key_generation), "TX prefix key_generation");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, enabled) == __builtin_offsetof(struct kdp_sta, enabled), "TX prefix enabled");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, band) == __builtin_offsetof(struct kdp_sta, band), "TX prefix band");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, bss) == __builtin_offsetof(struct kdp_sta, bss), "TX prefix bss");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, cipher) == __builtin_offsetof(struct kdp_sta, cipher), "TX prefix cipher");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, keyid) == __builtin_offsetof(struct kdp_sta, keyid), "TX prefix keyid");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, authorized) == __builtin_offsetof(struct kdp_sta, authorized), "TX prefix authorized");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, omac) == __builtin_offsetof(struct kdp_sta, omac), "TX prefix omac");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, wmm) == __builtin_offsetof(struct kdp_sta, wmm), "TX prefix wmm");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, wme) == __builtin_offsetof(struct kdp_sta, wme), "TX prefix wme");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, amsdu) == __builtin_offsetof(struct kdp_sta, amsdu), "TX prefix amsdu");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, host_tids) == __builtin_offsetof(struct kdp_sta, host_tids), "TX prefix host_tids");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, reserved_sta) == __builtin_offsetof(struct kdp_sta, reserved_sta), "TX prefix reserved_sta");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, tx_tag) == __builtin_offsetof(struct kdp_sta, tx_tag), "TX prefix tx_tag");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, addr) == __builtin_offsetof(struct kdp_sta, addr), "TX prefix addr");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, tx_blocked) == __builtin_offsetof(struct kdp_sta, tx_blocked), "TX prefix tx_blocked");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, qos_valid) == __builtin_offsetof(struct kdp_sta, qos_valid), "TX prefix qos_valid");
++_Static_assert(__builtin_offsetof(struct dp_sta_tx, qos_map) == __builtin_offsetof(struct kdp_sta, qos_map), "TX prefix qos_map");
+ struct dp_sta_cache {
+  u32 valid, wcid;
+- struct kdp_sta value;
++ struct dp_sta_tx value;
+  struct kdp_txwi_template txwi;
+ };
+ struct dp_ipv4_key { u32 src, dst, ports, protocol, mac[3]; };
+@@ -32,6 +64,7 @@
+  struct dp_sta_cache sta[2][4];
+  struct dp_l2_hash l2[2][4];
+  struct dp_wan_cache wan[2][4];
++ u32 context_valid, context_session, context_epoch;
+  u32 last_hint[2]; /* tail keeps all r64 cache offsets; index + 1, not authority */
+ } dp_private __attribute__((section(".kite_private"), aligned(64)));
+ _Static_assert(sizeof(dp_private) <= 8192, "private cache budget");
+@@ -39,6 +72,26 @@
+ #define dp_hint dp_private.hint
+ #define dp_hint_next dp_private.next
+ static u32 dp_private_needs_init;
++/* Immutable mapping identity is proved at TX begin and invalidated at end.
++ * Direct/non-transaction helper callers still validate shared identity. */
++static u32 dp_policy_session(volatile struct kdp_shared *s)
++{
++ return dp_private.context_valid && s == dp ? dp_private.context_session : s->session;
++}
++static u32 dp_policy_epoch(volatile struct kdp_shared *s)
++{
++ return dp_private.context_valid && s == dp ? dp_private.context_epoch : s->epoch;
++}
++static unsigned int dp_sta_tid(const struct dp_sta_tx *sta,
++                              const struct kdp_packet *p)
++{
++ if (!sta->wme) return 0;
++ if (p->vlan != KDP_SLOT_NONE && (p->vlan >> 13)) return p->vlan >> 13;
++ if (sta->qos_valid && (p->type == KDP_FLOW_IPV4 || p->type == KDP_FLOW_IPV6))
++  return sta->qos_map[p->dsfield >> 2];
++ return kdp_packet_tid(p);
++}
++
+ 
+ /* r68 D-cache header read. Hooks are overridable so host fixtures can model
+  * a non-snooping write-back cache; on the NPU they are the vendor op 0xFC2. */
+@@ -191,7 +244,7 @@
+  h->cap_version = cv; /* only private publication; shared versions checked on every use */
+  dp_hint_next[band][set] = (way + 1) % DP_HINT_WAYS;
+ }
+-static __attribute__((noinline)) int dp_hint_matches(volatile struct kdp_shared *s, volatile struct kdp_sta *sta,
++static __attribute__((noinline)) int dp_hint_matches(volatile struct kdp_shared *s, const struct dp_sta_tx *sta,
+                           const struct kdp_packet *p, u32 wcid, u32 band)
+ {
+  u32 key = dp_hint_key(p, wcid), set = key & (DP_HINT_SETS - 1), i;
+@@ -203,7 +256,7 @@
+   if (s->flow[h->capture].version != h->cap_version ||
+       s->flow[h->exact].version != h->exact_version) continue;
+   KDP_BARRIER();
+-  if (p->type != KDP_FLOW_IPV4 || h->session != s->session ||
++  if (p->type != KDP_FLOW_IPV4 || h->session != dp_policy_session(s) ||
+       h->generation != sta->generation || h->key_generation != sta->key_generation ||
+       h->tag != sta->tx_tag || h->wcid != wcid || h->band != band || h->bss != sta->bss ||
+       ((h->vlan == KDP_SLOT_NONE) != (p->vlan == KDP_SLOT_NONE)) ||
+@@ -284,7 +337,7 @@
+ _Static_assert(__builtin_offsetof(struct kdp_sta, addr) % 4 == 0,
+  "STA MAC word alignment");
+ static int dp_compact_destination(const struct dp_ipv4_key *p,
+-                                  const struct kdp_sta *s)
++                                  const struct dp_sta_tx *s)
+ {
+  const kdp_word *mac=(const void *)s->addr;
+  return p->mac[0] == mac[0] && (p->mac[1] & 0xffffu) == (mac[1] & 0xffffu);
+@@ -313,7 +366,7 @@
+  return c->bucket;
+ }
+ 
+-static int dp_wan_matches(volatile struct kdp_shared *s, volatile struct kdp_sta *sta,
++static int dp_wan_matches(volatile struct kdp_shared *s, const struct dp_sta_tx *sta,
+  const struct kdp_packet *p, u32 wi, u32 band)
+ {
+  struct dp_wan_cache *c = &dp_private.wan[band][wi & 3];
+@@ -325,7 +378,7 @@
+  KDP_BARRIER();
+  if (c->key.wcid != wi || c->key.vlan != p->vlan || c->dsfield != p->dsfield ||
+      c->key.mac[0] != mac[0] || c->key.mac[1] != mac[1] || c->key.mac[2] != mac[2] ||
+-     c->session != s->session || c->epoch != s->epoch ||
++     c->session != dp_policy_session(s) || c->epoch != dp_policy_epoch(s) ||
+      c->generation != sta->generation || c->key_generation != sta->key_generation ||
+      c->tag != sta->tx_tag || c->bss != sta->bss) return 0;
+  KDP_BARRIER();
+@@ -333,7 +386,7 @@
+  dp_tune.wan_hit++;
+  return 1; /* domain classification only: no new routing authorization */
+ }
+-static void dp_wan_save(volatile struct kdp_shared *s, volatile struct kdp_sta *sta,
++static void dp_wan_save(volatile struct kdp_shared *s, const struct dp_sta_tx *sta,
+  const struct kdp_packet *p, u32 wi, u32 band, u32 bucket, u32 seq)
+ {
+  struct dp_wan_cache *c = &dp_private.wan[band][wi & 3];
+@@ -349,7 +402,7 @@
+  if (s->tuning.bucket_seq[bucket] == seq) c->seq = seq;
+ }
+ 
+-static int dp_hint_ipv4(volatile struct kdp_shared *s, const struct kdp_sta *sta,
++static int dp_hint_ipv4(volatile struct kdp_shared *s, const struct dp_sta_tx *sta,
+                        const struct dp_ipv4_key *p, u32 wcid, u32 band)
+ {
+  u32 hash = 0, way = 0, index, last = dp_private.last_hint[band];
+@@ -383,7 +436,7 @@
+      h->vlan!=KDP_SLOT_NONE || (h->cap_ds & h->cap_mask) ||
+      (h->exact_ds & h->exact_mask) || h->wcid!=wcid || h->band!=band ||
+      h->generation!=sta->generation || h->key_generation!=sta->key_generation ||
+-     h->tag!=sta->tx_tag || h->bss!=sta->bss || h->session!=s->session) goto next;
++     h->tag!=sta->tx_tag || h->bss!=sta->bss || h->session!=dp_policy_session(s)) goto next;
+  /* Private exact data is valid only while both live publications agree.
+   * Lifecycle changes PARK hart4; host policy versions never ABA. */
+  KDP_BARRIER();
+@@ -393,7 +446,7 @@
+  dp_bridge_delta[band]++; return 1;
+  return 0;
+ }
+-static int dp_wan_ipv4(volatile struct kdp_shared *s, const struct kdp_sta *sta,
++static int dp_wan_ipv4(volatile struct kdp_shared *s, const struct dp_sta_tx *sta,
+                       const struct dp_ipv4_key *p, u32 wi, u32 band)
+ {
+  struct dp_wan_cache *c=&dp_private.wan[band][wi & 3];
+@@ -403,7 +456,7 @@
+   * uncached WAN bucket reads/fences. A match still checks both versions. */
+  if (c->key.wcid!=wi || c->key.vlan!=KDP_SLOT_NONE || c->dsfield ||
+      c->key.mac[0]!=p->mac[0] || c->key.mac[1]!=p->mac[1] || c->key.mac[2]!=p->mac[2] ||
+-     c->session!=s->session || c->epoch!=s->epoch || c->generation!=sta->generation ||
++     c->session!=dp_policy_session(s) || c->epoch!=dp_policy_epoch(s) || c->generation!=sta->generation ||
+      c->key_generation!=sta->key_generation || c->tag!=sta->tx_tag || c->bss!=sta->bss) return 0;
+  seq=s->tuning.bucket_seq[c->bucket];
+  if (!seq || (seq&1) || seq!=c->seq) return 0;
+--- a/kite-observe.inc
++++ b/kite-observe.inc
+@@ -33,6 +33,7 @@
+ static u32 dp_pressure_armed, dp_pressure_at, dp_pressure_period, dp_pressure_valid, dp_pressure_due;
+ static u32 dp_diag[6] __attribute__((section(".kite_observe")));
+ static u32 dp_observe_tick(void);
++static u32 dp_observe_mask;
+ static u32 dp_born[KDP_TOKENS] __attribute__((section(".kite_observe")));
+ static void dp_pressure(u32 peak)
+ {
+@@ -49,7 +50,7 @@
+  dp_tune.pressure_events++; dp_tune.pressure_pending = dp_wait_count;
+  dp_tune.dma_wait = dp_tune.wa_wait = dp_tune.ready_wait = dp_tune.oldest_ticks = 0;
+  dp_tune.done_backlog = dp->done.producer - dp->done.consumer;
+- now = (u32)csr_read(mcycle) >> 8;
++ now = dp_observe_mask ? (u32)csr_read(mcycle) >> 8 : 0;
+  for (i = 0; i < KDP_TOKENS; i++) {
+   u32 pending = !!(dp_pending[i >> 5] & (1u << (i & 31)));
+   if (pending != (dp->token[i].state == KDP_TOKEN_WIFI)) {
+@@ -58,7 +59,7 @@
+   if (!pending) continue;
+   volatile struct kdp_token *t = &dp->token[i];
+   u32 seq = t->submitted, dma = t->dma_done, wa = t->wa_done;
+-  u32 age = (now - dp_born[i]) & 0xffffffu;
++  u32 age = dp_observe_mask ? (now - dp_born[i]) & 0xffffffu : 0;
+   dp_tune.dma_wait += dma != seq; dp_tune.wa_wait += wa != seq;
+   dp_tune.ready_wait += dma == seq && wa == seq;
+   if (age > dp_tune.oldest_ticks) dp_tune.oldest_ticks = age;
+@@ -75,7 +76,7 @@
+ }
+ static u32 dp_observe_needs_init, dp_prepare_at[2];
+ static u32 dp_loop_stamp, dp_loop_sent, dp_loop_sampling;
+-static u32 dp_observe_mask, dp_observe_loop, dp_observe_published, dp_snapshot_poll;
++static u32 dp_observe_loop, dp_observe_published, dp_snapshot_poll;
+ static u32 dp_observe_serial[2];
+ struct dp_observe_token {
+  u32 start, ready_at, prepare_at, wire_at;
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -38,6 +38,8 @@
+ /* Statistics only, never token/ownership authority. Flush at every bounded
+  * TDMA batch and at every transport tail, including held/full tails. */
+ static u32 dp_sent_delta[2], dp_bytes_delta[2], dp_bridge_delta[2];
++static u32 dp_freed_delta[2], dp_freed_defer;
++static void dp_publish_freed(void);
+ struct dp_parse_cache {
+ 	u32 valid, token, len, tag;
+ 	int parsed, fast;
+@@ -123,8 +125,15 @@
+  dp_batch_valid = dp_identity();
+  if (dp_batch_valid && dp_observe_needs_init) dp_observe_init();
+  if (dp_private_needs_init) kite_dp_cache_invalidate();
+-}
+-void kite_dp_tx_end(void) { dp_batch_valid = 0; }
++ dp_private.context_valid = dp_batch_valid;
++ dp_private.context_session = dp_session; dp_private.context_epoch = dp_epoch;
++ dp_freed_defer = 1;
++}
++void kite_dp_tx_end(void)
++{
++ dp_publish_freed(); dp_freed_defer = 0;
++ dp_private.context_valid = 0; dp_batch_valid = 0;
++}
+ static volatile struct kdp_shared *dp_tx_shared(void)
+ {
+  return (dp_batch_valid || dp_identity()) && !kdp_failed(dp) ? dp : 0;
+@@ -277,6 +286,7 @@
+ 		dp_freeq[i] = i;
+ 	dp_private_needs_init = 1; /* hart4 initializes its own cached DRAM */
+  npu_memset(dp_sent_delta,0,sizeof(dp_sent_delta));
++ npu_memset(dp_freed_delta,0,sizeof(dp_freed_delta)); dp_freed_defer = 0;
+  npu_memset(dp_bytes_delta,0,sizeof(dp_bytes_delta));
+  npu_memset(dp_bridge_delta,0,sizeof(dp_bridge_delta));
+  npu_memset((void *)dp_host, 0, sizeof(dp_host));
+@@ -328,7 +338,7 @@
+ static void dp_rearm(u32 band, u32 token);
+ 
+ static __attribute__((noinline)) int dp_bridge_policy(volatile struct kdp_shared *s,
+-	volatile struct kdp_sta *sta, const struct kdp_packet *packet,
++	const struct dp_sta_tx *sta, const struct kdp_packet *packet,
+ 	int parsed, u32 wcid, u32 band)
+ {
+ 	u32 base, i, capture = 0, version;
+@@ -413,7 +423,7 @@
+  }
+ }
+ static void dp_host_bridge_fallback_record(u32 band, u32 token, u32 addr, u32 len,
+-                                    u32 wcid, const volatile struct kdp_sta *sta,
++                                    u32 wcid, const struct dp_sta_tx *sta,
+                                     u32 request, u32 slot)
+ {
+  volatile struct kdp_token *t = &dp->token[token];
+@@ -444,7 +454,7 @@
+ }
+ 
+ static void dp_host_bridge_fallback(u32 band, u32 token, u32 addr, u32 len,
+- u32 wcid, const volatile struct kdp_sta *sta)
++ u32 wcid, const struct dp_sta_tx *sta)
+ {
+  dp_host_bridge_fallback_record(band,token,addr,len,wcid,sta,0,KDP_SLOT_NONE);
+ }
+@@ -471,7 +481,7 @@
+ /* Cold PS path: retained original five-tuple authorization only. Before
+  * suspend publication retain the ordered TDMA head rather than drop it. */
+ static __attribute__((noinline)) int dp_ps_fallback(u32 band,u32 token,u32 addr,
+- u32 len,u32 wi,const volatile struct kdp_sta *sta)
++ u32 len,u32 wi,const struct dp_sta_tx *sta)
+ {
+  struct kdp_packet packet;
+  u32 request=dp->r60.ps[wi].request,slot,before;
+@@ -562,6 +572,18 @@
+  if (q->count == dp_publish_limit) kite_dp_tx_flush(band);
+ }
+ 
++/* Only proved completions enter this accumulator. Token state/free queue
++ * are still updated immediately; host progress must not wait for a snapshot.
++ * Both normal and fault exits of TX/reap pass through this publication. */
++static void dp_publish_freed(void)
++{
++ if (!dp) return;
++ for (u32 b = 0; b < 2; b++) if (dp_freed_delta[b]) {
++  KDP_BARRIER();
++  dp->tx_freed[b] += dp_freed_delta[b]; dp_freed_delta[b] = 0;
++ }
++}
++
+ /* One decision and one observer invocation per actual completion event.
+  * A stale notification can never release a new incarnation of a token. */
+ static int dp_complete(u32 id, u32 seq, u32 band, u32 dma, u32 wa)
+@@ -576,7 +598,8 @@
+   dp_tune.bitmap_fault++; dp->fault = 4; return 0;
+  }
+  dp_performance[band].reserved[KDP_PERF_TX_READY]++;
+- dp->tx_freed[band]++;
++ if (dp_freed_defer) dp_freed_delta[band]++;
++ else dp->tx_freed[band]++;
+  dp_account.reap_ready++;
+  dp_wait_count--;
+  dp_pending[id >> 5] &= ~(1u << (id & 31));
+@@ -603,7 +626,7 @@
+  KDP_BARRIER(); /* WA producer publication precedes buffer reuse */
+  return dp_complete(id, seq, band, dma, wa);
+ }
+-void kite_dp_tx_reap(void)
++static void dp_tx_reap_inner(void)
+ {
+  u32 i, prod, cons, stamp = 0, units = 0, now, stale = 0;
+  if (!dp_tx_shared()) return;
+@@ -660,6 +683,13 @@
+  if (scanned) dp->done.scans += scanned;
+  if (ready) dp->done.scan_ready += ready;
+  dp_observe_time(0, KDP_OBS_REAP, stamp, units);
++}
++
++void kite_dp_tx_reap(void)
++{
++ u32 deferred = dp_freed_defer;
++ dp_freed_defer = 1; dp_tx_reap_inner();
++ dp_publish_freed(); dp_freed_defer = deferred;
+ }
+ 
+ /* Only called after WFDMA doorbell/readback. Publish a batched per-TID
+@@ -927,7 +957,7 @@
+ 		}
+ 	}
+  tid = compact_valid ? (sc->value.wme && sc->value.qos_valid ? sc->value.qos_map[0] : 0) :
+-       kdp_sta_tid(&sc->value, packet);
++       dp_sta_tid(&sc->value, packet);
+  if (tid>7) { dp->quality[band].txwi_drop++; goto drop; }
+  if (dp_ba_tids && dp_ba_wcid == wcid &&
+      dp_ba_generation == sc->value.generation && dp_ba_key_generation == sc->value.key_generation &&
+@@ -935,7 +965,8 @@
+   dp_tune.local_hold++;
+   return 0; /* retain ordered TDMA head; no drops/replacement/ownership */
+  }
+-	if (t->submitted == 0xffffffffu) {
++ u32 submitted = t->submitted; /* hart4 is the sole sequence writer */
++	if (submitted == 0xffffffffu) {
+ 		t->state = KDP_TOKEN_QUARANTINE;
+ 		dp->fault = 5;
+ 		return 0;
+@@ -973,7 +1004,7 @@
+ 	t->wcid = wcid;
+ 	t->band = band;
+ 	dp->tuning.token_tid[token] = tid;
+-	t->submitted++;
++	t->submitted = submitted + 1;
+ 	t->dma_done = t->wa_done = 0;
+ 	KDP_BARRIER();
+ 	t->state = KDP_TOKEN_WIFI;
+@@ -1015,7 +1046,7 @@
+  }
+  dp_wait_count++;
+  dp_pending[token >> 5] |= 1u << (token & 31);
+- dp_born[token] = (u32)csr_read(mcycle) >> 8;
++ if (dp_observe_mask) dp_born[token] = (u32)csr_read(mcycle) >> 8;
+  if (dp_wait_count > dp_tune.pending_peak) {
+   dp_tune.pending_peak = dp_wait_count;
+   if (!(dp_wait_count & 127)) dp_pressure(1);

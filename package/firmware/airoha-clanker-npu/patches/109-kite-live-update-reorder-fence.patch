@@ -1,0 +1,18 @@
+--- a/npu_kite_control.c
++++ b/npu_kite_control.c
+@@ -234,6 +234,15 @@
+ 		return KITE_CTL_STALE;
+ 	if (op == KITE_CTL_PARK) {
+ 		if (!kite_ctl_rx_held()) {
++			/* A live mode-2 RX ring may still contain descriptors that have
++			 * not reached a worker. Generation metadata cannot identify
++			 * those descriptors after a STA/key update. Unless the caller
++			 * performs the full DATA_STOP drain, permanently fall back to
++			 * raw host delivery for this session. A fresh OPEN is required
++			 * before NPU reorder can be negotiated again. */
++			if (ctl.mode == KITE_CTL_MODE_DATA_REORDER &&
++			    kite_ctl_rings_live())
++				ctl.reorder = 0;
+ 			ctl.park_cookie = d[4];
+ 			for (i = 1; i <= 3; i++)
+ 				ctl.ack[i] = 0;

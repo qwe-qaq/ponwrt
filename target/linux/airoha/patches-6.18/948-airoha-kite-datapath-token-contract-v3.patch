@@ -1,0 +1,42 @@
+From: ponwrt development <noreply@local>
+Subject: [PATCH] airoha: require Kite datapath token contract v3
+
+boot.log showed unreturned PPE TX tokens followed by a host fence error
+that poisoned the firmware stop identity. Preserve physical-stop proofs
+and keep token producers disjoint inside the native MT7916 range.
+
+--- a/include/linux/soc/airoha/kite-datapath.h
++++ b/include/linux/soc/airoha/kite-datapath.h
+@@ -9,7 +9,8 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_MAGIC 0x4b440002u
++#define KDP_ABI_VERSION 3u
++#define KDP_MAGIC 0x4b440003u
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -19,7 +20,10 @@
+ #define KDP_FLOW_BUCKETS (KDP_FLOWS / KDP_FLOW_WAYS)
+ #define KDP_RX_COUNT 256u
+ #define KDP_TOKENS 1024u
+-#define KDP_TOKEN_BASE 0x7000u
++/* Keep both producers inside the native MT7916 8192-token contract.
++ * The host reserves the upper 1024 before enabling any TX queue. */
++#define KDP_TOKEN_LIMIT 8192u
++#define KDP_TOKEN_BASE (KDP_TOKEN_LIMIT - KDP_TOKENS)
+ #define KDP_BUFFER_BYTES 2048u
+ #define KDP_TXWI_BYTES 128u
+ #define KDP_PN_SPINS 4096u
+@@ -215,7 +219,9 @@
+ 			(tid << 20) | wcid);
+ 	kdp_put_le32(p + 8, 0x20u | (wme ? 8u : 0u));
+ 	kdp_put_le32(p + 12, (15u << 11) | (encrypted ? 2u : 0u));
+-	/* PID 0: payload completion is WA TX-free, not an skb TX-status request. */
++	/* Native unicast without an skb TX-status request uses NO_SKB (1).
++	 * NO_ACK (0) is reserved for frames that do not require peer ACK. */
++	kdp_put_le32(p + 20, 1u);
+ 	kdp_put_le32(p + 28, (2u << 20) | (wme ? 8u << 16 : 0u) |
+ 			 (amsdu ? 1u << 10 : 0u));
+ 	kdp_put_le16(p + 32, 0x81u | (encrypted ? 0u : 8u));

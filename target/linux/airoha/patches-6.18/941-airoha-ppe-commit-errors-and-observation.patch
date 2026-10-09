@@ -1,0 +1,225 @@
+Subject: airoha: propagate PPE errors and expose host/QDMA counters
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -723,6 +723,18 @@
+ 	struct airoha_foe_stats *foe_stats;
+ 	dma_addr_t foe_stats_dma;
+ 
++	/* Counters are evidence of host requests/commits, not hardware hits. */
++	atomic64_t setup_attempts;
++	atomic64_t setup_ok;
++	atomic64_t setup_fail;
++	atomic64_t replace_ok;
++	atomic64_t replace_fail;
++	atomic64_t destroy_ok;
++	atomic64_t destroy_fail;
++	atomic64_t learn_requests;
++	atomic64_t bind_ok;
++	atomic64_t bind_fail;
++	int setup_errno, replace_errno, bind_errno;
+ 	struct dentry *debugfs_dir;
+ };
+ 
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -913,6 +913,12 @@
+ 		err = airoha_ppe_foe_commit_sram_entry(ppe, hash);
+ unlock:
+ 	rcu_read_unlock();
++	if (err) {
++		atomic64_inc(&ppe->bind_fail);
++		WRITE_ONCE(ppe->bind_errno, err);
++	} else {
++		atomic64_inc(&ppe->bind_ok);
++	}
+ 
+ 	return err;
+ }
+@@ -1008,7 +1014,7 @@
+ 	u32 mask = AIROHA_FOE_IB1_BIND_PACKET_TYPE | AIROHA_FOE_IB1_BIND_UDP;
+ 	struct airoha_foe_entry *hwe_p, hwe;
+ 	struct airoha_flow_table_entry *f;
+-	int type;
++	int type, err;
+ 
+ 	hwe_p = airoha_ppe_foe_get_entry_locked(ppe, hash);
+ 	if (!hwe_p)
+@@ -1018,7 +1024,6 @@
+ 	if (!f)
+ 		return -ENOMEM;
+ 
+-	hlist_add_head(&f->l2_subflow_node, &e->l2_flows);
+ 	f->type = FLOW_TYPE_L2_SUBFLOW;
+ 	f->hash = hash;
+ 
+@@ -1054,7 +1059,12 @@
+ 
+ 	hwe.bridge.data = e->data.bridge.data;
+ commit:
+-	airoha_ppe_foe_commit_entry(ppe, &hwe, hash, rx_wlan);
++	err = airoha_ppe_foe_commit_entry(ppe, &hwe, hash, rx_wlan);
++	if (err) {
++		kfree(f);
++		return err;
++	}
++	hlist_add_head(&f->l2_subflow_node, &e->l2_flows);
+ 
+ 	return 0;
+ }
+@@ -1100,7 +1110,8 @@
+ 		if (!airoha_ppe_foe_compare_entry(e, hwe))
+ 			continue;
+ 
+-		airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan);
++		if (airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan))
++			goto unlock;
+ 		commit_done = true;
+ 		e->hash = hash;
+ 	}
+@@ -1578,8 +1589,6 @@
+ 	int i, err = 0;
+ 
+ 	for (i = 0; i < sram_num_entries; i++) {
+-		int err;
+-
+ 		memset(&hwe[i], 0, sizeof(*hwe));
+ 		err = airoha_ppe_foe_commit_sram_entry(ppe, i);
+ 		if (err)
+@@ -1668,6 +1677,7 @@
+ {
+ 	struct airoha_ppe *ppe = dev->priv;
+ 	struct airoha_eth *eth = ppe->eth;
++	struct flow_cls_offload *f = type_data;
+ 	int err = 0;
+ 
+ 	/* Netfilter flowtable can try to offload flower rules while not all
+@@ -1679,10 +1689,30 @@
+ 
+ 	mutex_lock(&flow_offload_mutex);
+ 
+-	if (!eth->npu)
++	if (!eth->npu) {
++		atomic64_inc(&ppe->setup_attempts);
+ 		err = airoha_ppe_offload_setup(eth);
++		WRITE_ONCE(ppe->setup_errno, err);
++		if (err)
++			atomic64_inc(&ppe->setup_fail);
++		else
++			atomic64_inc(&ppe->setup_ok);
++	}
+ 	if (!err)
+ 		err = airoha_ppe_flow_offload_cmd(eth, type_data);
++	if (f->command == FLOW_CLS_REPLACE) {
++		if (err) {
++			atomic64_inc(&ppe->replace_fail);
++			WRITE_ONCE(ppe->replace_errno, err);
++		} else {
++			atomic64_inc(&ppe->replace_ok);
++		}
++	} else if (f->command == FLOW_CLS_DESTROY) {
++		if (err)
++			atomic64_inc(&ppe->destroy_fail);
++		else
++			atomic64_inc(&ppe->destroy_ok);
++	}
+ 
+ 	mutex_unlock(&flow_offload_mutex);
+ 
+@@ -1705,6 +1735,7 @@
+ 		return;
+ 
+ 	ppe->foe_check_time[hash] = now;
++	atomic64_inc(&ppe->learn_requests);
+ 	airoha_ppe_foe_insert_entry(ppe, skb, hash, rx_wlan);
+ }
+ 
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -164,11 +164,16 @@
+ 		*((__be32 *)h_source) = cpu_to_be32(l2->src_mac_hi);
+ 
+ 		seq_printf(m, " eth=%pM->%pM etype=%04x data=%08x"
+-			      " vlan=%d,%d ib1=%08x ib2=%08x"
+-			      " packets=%llu bytes=%llu\n",
++			      " vlan=%d,%d ib1=%08x ib2=%08x timestamp=%u",
+ 			   h_source, h_dest, l2->etype, data,
+ 			   l2->vlan1, l2->vlan2, hwe->ib1, ib2,
+-			   stats.packets, stats.bytes);
++			   (u32)FIELD_GET(AIROHA_FOE_IB1_BIND_TIMESTAMP, hwe->ib1));
++		if (IS_ENABLED(CONFIG_NET_AIROHA_FLOW_STATS) &&
++		    !(airoha_is_7581(ppe->eth) && type == PPE_PKT_TYPE_BRIDGE))
++			seq_printf(m, " packets=%llu bytes=%llu\n",
++				   stats.packets, stats.bytes);
++		else
++			seq_puts(m, " packets=unavailable bytes=unavailable\n");
+ 	}
+ 
+ 	return 0;
+@@ -185,6 +190,48 @@
+ 	return airoha_ppe_debugfs_foe_show(m, private, true);
+ }
+ DEFINE_SHOW_ATTRIBUTE(airoha_ppe_debugfs_foe_bind);
++
++static int airoha_ppe_debugfs_status_show(struct seq_file *m, void *private)
++{
++	struct airoha_ppe *ppe = m->private;
++	unsigned int i, channel;
++
++	seq_printf(m, "abi=1 npu_attached=%u flow_stats=%u\n",
++		   !!rcu_access_pointer(ppe->eth->npu),
++		   IS_ENABLED(CONFIG_NET_AIROHA_FLOW_STATS));
++	seq_printf(m, "setup_attempts=%lld\n", atomic64_read(&ppe->setup_attempts));
++	seq_printf(m, "setup_ok=%lld\n", atomic64_read(&ppe->setup_ok));
++	seq_printf(m, "setup_fail=%lld\n", atomic64_read(&ppe->setup_fail));
++	seq_printf(m, "replace_ok=%lld\n", atomic64_read(&ppe->replace_ok));
++	seq_printf(m, "replace_fail=%lld\n", atomic64_read(&ppe->replace_fail));
++	seq_printf(m, "destroy_ok=%lld\n", atomic64_read(&ppe->destroy_ok));
++	seq_printf(m, "destroy_fail=%lld\n", atomic64_read(&ppe->destroy_fail));
++	seq_printf(m, "learn_requests=%lld\n", atomic64_read(&ppe->learn_requests));
++	seq_printf(m, "bind_ok=%lld\n", atomic64_read(&ppe->bind_ok));
++	seq_printf(m, "bind_fail=%lld\n", atomic64_read(&ppe->bind_fail));
++	seq_printf(m, "setup_errno=%d replace_errno=%d bind_errno=%d\n",
++		   READ_ONCE(ppe->setup_errno), READ_ONCE(ppe->replace_errno),
++		   READ_ONCE(ppe->bind_errno));
++	seq_puts(m, "scope=host_requests_and_commits_not_hardware_hits\n");
++	/* Already configured by airoha_qdma_init_qos_stats(); read only.
++	 * Values wrap at 32 bits. Never reset/reprogram shared QoS counters.
++	 */
++	for (i = 0; i < ARRAY_SIZE(ppe->eth->qdma); i++) {
++		struct airoha_qdma *qdma = &ppe->eth->qdma[i];
++
++		if (!qdma->regs)
++			continue;
++		for (channel = 0; channel < AIROHA_NUM_QOS_CHANNELS; channel++)
++			seq_printf(m, "qdma%u_channel%u cpu=%u fwd=%u cpu_cfg=%08x fwd_cfg=%08x\n",
++				   i, channel,
++				   airoha_qdma_rr(qdma, REG_CNTR_VAL(channel << 1)),
++				   airoha_qdma_rr(qdma, REG_CNTR_VAL((channel << 1) + 1)),
++				   airoha_qdma_rr(qdma, REG_CNTR_CFG(channel << 1)),
++				   airoha_qdma_rr(qdma, REG_CNTR_CFG((channel << 1) + 1)));
++	}
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(airoha_ppe_debugfs_status);
+ 
+ static int airoha_ppe_debugfs_config_show(struct seq_file *m, void *private)
+ {
+@@ -215,7 +262,7 @@
+ 		seq_printf(m, "ppe%u_table_cfg: %08x\n", i,
+ 			   airoha_fe_rr(eth, REG_PPE_TB_CFG(i)));
+ 		seq_printf(m, "ppe%u_gdm2_default_cpu_port: %u\n", i,
+-			   FIELD_GET(DFT_CPORT_MASK(AIROHA_GDM2_IDX), cport));
++			   (u32)FIELD_GET(DFT_CPORT_MASK(AIROHA_GDM2_IDX), cport));
+ 	}
+ 
+ 	return 0;
+@@ -225,6 +272,8 @@
+ int airoha_ppe_debugfs_init(struct airoha_ppe *ppe)
+ {
+ 	ppe->debugfs_dir = debugfs_create_dir("ppe", NULL);
++	debugfs_create_file("status", 0444, ppe->debugfs_dir, ppe,
++			    &airoha_ppe_debugfs_status_fops);
+ 	debugfs_create_file("config", 0444, ppe->debugfs_dir, ppe,
+ 			    &airoha_ppe_debugfs_config_fops);
+ 	debugfs_create_file("entries", 0444, ppe->debugfs_dir, ppe,

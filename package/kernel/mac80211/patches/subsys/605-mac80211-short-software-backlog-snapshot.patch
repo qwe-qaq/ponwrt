@@ -1,0 +1,101 @@
+Subject: [PATCH] r61 bounded PS software probe and fixed DMA prefix
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -7913,15 +7913,26 @@
+ bool ieee80211_txq_may_transmit(struct ieee80211_hw *hw,
+ 				struct ieee80211_txq *txq);
+ 
+-/**
+- * ieee80211_sta_tx_pending - conservative software/airtime drain probe
++/* Software backlog only. AQL includes frames already submitted to hardware. */
++enum ieee80211_sta_tx_pending_reason {
++ IEEE80211_STA_TX_PS = BIT(0),
++ IEEE80211_STA_TX_PS_BUFFER = BIT(1),
++ IEEE80211_STA_TX_FILTERED = BIT(2),
++ IEEE80211_STA_TX_TXQ = BIT(3),
++ IEEE80211_STA_TX_FRAG = BIT(4),
++ IEEE80211_STA_TX_LOCAL = BIT(5),
++ IEEE80211_STA_TX_QDISC = BIT(6),
++};
++/**
++ * ieee80211_sta_tx_pending - short software backlog snapshot
+  * @sta: live station, protected by the caller's station lifetime lock
+  *
+- * Caller must stop its TX dequeue worker first and retain its external
+- * offload admission fence. This can sleep; it does not close admission or
+- * replace driver DMA/completion accounting. True means remain in software.
+- */
+-bool ieee80211_sta_tx_pending(struct ieee80211_sta *sta);
++ * Caller stops its TX dequeue worker and retains offload admission fencing.
++ * This is a snapshot, not an ingress barrier or hardware completion proof.
++ * Return: mask of enum ieee80211_sta_tx_pending_reason; zero permits the
++ * driver to capture a finite DMA prefix, not to free any payload.
++ */
++u32 ieee80211_sta_tx_pending(struct ieee80211_sta *sta);
+ 
+ /**
+  * ieee80211_txq_get_depth - get pending frame/byte count of given txq
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -6663,25 +6663,23 @@
+ 	return 0;
+ }
+ 
+-/* Used only at an offload wake boundary, not on the packet path. Stop the
+- * tasklet and drain pre-existing net/RCU readers before looking for backlog,
+- * so a packet cannot disappear between mac80211 and the stopped driver. */
+-bool ieee80211_sta_tx_pending(struct ieee80211_sta *pub)
++/* Never wait for an RCU grace period with dequeue stopped: continuous
++ * ingress would build backlog while this observer prevents its draining. */
++u32 ieee80211_sta_tx_pending(struct ieee80211_sta *pub)
+ {
+  struct sta_info *sta=container_of(pub,struct sta_info,sta);
+  struct ieee80211_local *local=sta->sdata->local;
+- bool pending=false;
++ u32 pending=0;
+  int i;
+  tasklet_disable(&local->tx_pending_tasklet);
+- synchronize_net();
+  spin_lock_bh(&sta->ps_lock);
+- pending=test_sta_flag(sta,WLAN_STA_PS_STA) ||
+-         test_sta_flag(sta,WLAN_STA_PS_DRIVER) ||
+-         test_sta_flag(sta,WLAN_STA_PS_DELIVER);
+- for (i=0;i<IEEE80211_NUM_ACS;i++)
+-  pending |= !skb_queue_empty(&sta->ps_tx_buf[i]) ||
+-             !skb_queue_empty(&sta->tx_filtered[i]) ||
+-             atomic_read(&sta->airtime[i].aql_tx_pending);
++ if (test_sta_flag(sta,WLAN_STA_PS_STA) ||
++     test_sta_flag(sta,WLAN_STA_PS_DRIVER) ||
++     test_sta_flag(sta,WLAN_STA_PS_DELIVER)) pending |= IEEE80211_STA_TX_PS;
++ for (i=0;i<IEEE80211_NUM_ACS;i++) {
++  if (!skb_queue_empty(&sta->ps_tx_buf[i])) pending |= IEEE80211_STA_TX_PS_BUFFER;
++  if (!skb_queue_empty(&sta->tx_filtered[i])) pending |= IEEE80211_STA_TX_FILTERED;
++ }
+  spin_unlock_bh(&sta->ps_lock);
+  spin_lock_bh(&local->fq.lock);
+  for (i=0;i<IEEE80211_NUM_TIDS+1;i++) {
+@@ -6689,19 +6687,16 @@
+   struct txq_info *qi;
+   if (!q) continue;
+   qi=to_txq_info(q);
+-  pending |= qi->tin.backlog_packets || !skb_queue_empty(&qi->frags);
++  if (qi->tin.backlog_packets) pending |= IEEE80211_STA_TX_TXQ;
++  if (!skb_queue_empty(&qi->frags)) pending |= IEEE80211_STA_TX_FRAG;
+  }
+  spin_unlock_bh(&local->fq.lock);
+- /* Pending tasklet queues are shared: be conservative about other STAs. */
+  for (i=0;i<local->hw.queues;i++)
+-  pending |= !skb_queue_empty(&local->pending[i]);
+- /* dev_queue_xmit may still own a fallback frame in the VIF qdisc.
+-  * An empty mac80211 TXQ alone is not proof of that handoff draining. */
++  if (!skb_queue_empty(&local->pending[i])) pending |= IEEE80211_STA_TX_LOCAL;
+  rcu_read_lock();
+- smp_mb();
+  for (i=0;i<sta->sdata->dev->real_num_tx_queues;i++) {
+   struct Qdisc *q=rcu_dereference(netdev_get_tx_queue(sta->sdata->dev,i)->qdisc);
+-  if (q) pending |= !qdisc_is_empty(q) || qdisc_is_running(q);
++  if (q && (!qdisc_is_empty(q) || qdisc_is_running(q))) pending |= IEEE80211_STA_TX_QDISC;
+  }
+  rcu_read_unlock();
+  tasklet_enable(&local->tx_pending_tasklet);

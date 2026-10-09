@@ -1,0 +1,2188 @@
+Subject: [PATCH] Integrate Kite shared security and native PPE endpoint
+
+--- a/dma.h
++++ b/dma.h
+@@ -51,6 +51,14 @@
+ static inline bool
+ mt76_dma_handle_read(struct mt76_queue *q, u32 offset, u32 *val)
+ {
++	/* ABI2 publishes completion in host-input order. The physical WFDMA
++	 * DMA index also includes PPE descriptors and cannot reclaim host slots. */
++	if (q->kite_tx && offset == offsetof(struct mt76_queue_regs, dma_idx)) {
++		*val = le32_to_cpu((__force __le32)READ_ONCE(q->kite_tx->completed));
++		dma_rmb();
++		return true;
++	}
++
+ #if IS_ENABLED(CONFIG_NET_MEDIATEK_SOC_WED)
+ 	if (q->flags & MT_QFLAG_WED) {
+ 		*val = mtk_wed_device_reg_read(q->wed, q->wed_regs + offset);
+--- /dev/null
++++ b/kite-datapath.h
+@@ -0,0 +1,230 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PONWRT_KITE_DATAPATH_H
++#define PONWRT_KITE_DATAPATH_H
++
++/* Host/NPU wire ABI. Little-endian 32-bit words, no pointers or atomics
++ * requiring the RISC-V A extension. Mapping must be uncached on both ends.
++ * KDP_BARRIER must be a full interconnect barrier (not a compiler barrier).
++ * Host PN callers serialize locally; a WCID has exactly one NPU RX owner.
++ */
++#include "kite-reorder.h"
++
++#define KDP_MAGIC 0x4b440001u
++#define KDP_WCIDS 544u
++#define KDP_ROUTES 2048u
++#define KDP_ROUTE_MAX 0x1ffffu
++#define KDP_TIDS 17u
++#define KDP_FLOWS 512u
++#define KDP_FLOW_WAYS 8u
++#define KDP_FLOW_BUCKETS (KDP_FLOWS / KDP_FLOW_WAYS)
++#define KDP_RX_COUNT 256u
++#define KDP_TOKENS 1024u
++#define KDP_TOKEN_BASE 0x7000u
++#define KDP_BUFFER_BYTES 2048u
++#define KDP_TXWI_BYTES 128u
++#define KDP_PN_SPINS 4096u
++#define KDP_CIPHER_CCMP 0x000fac04u
++
++struct kdp_pn {
++	unsigned int want[2], turn;
++	unsigned int generation, key_generation;
++	unsigned int low, high;
++};
++
++/* One PN counter for both accelerated frames and host fallback. An expired
++ * lock attempt fails closed; it does not clear the other participant's flag.
++ * Never reset this object until both participants have stopped using it.
++ */
++#ifdef KDP_BARRIER
++static inline int kdp_pn_lock(volatile struct kdp_pn *p, unsigned int who)
++{
++	unsigned int peer = who ^ 1u, n;
++	p->want[who] = 1;
++	KDP_BARRIER();
++	p->turn = peer;
++	KDP_BARRIER();
++	for (n = 0; n < KDP_PN_SPINS; n++) {
++		if (!p->want[peer] || p->turn != peer) {
++			KDP_BARRIER();
++			return 1;
++		}
++		KDP_BARRIER();
++	}
++	p->want[who] = 0;
++	KDP_BARRIER();
++	return 0;
++}
++
++static inline void kdp_pn_unlock(volatile struct kdp_pn *p, unsigned int who)
++{
++	KDP_BARRIER();
++	p->want[who] = 0;
++	KDP_BARRIER();
++}
++
++/* 1 accepted, 0 replay, -1 unavailable/stale. A-MSDU subframes must be
++ * assembled/validated as ONE MPDU before this function, never allow equal
++ * PN just because a descriptor says it is another subframe.
++ */
++static inline int kdp_pn_accept(volatile struct kdp_pn *p, unsigned int who,
++	unsigned int generation, unsigned int key_generation,
++	unsigned int low, unsigned int high)
++{
++	int result = -1;
++	if (who > 1 || high > 0xffff || !generation || !key_generation ||
++	    !kdp_pn_lock(p, who))
++		return -1;
++	if (p->generation != generation || p->key_generation != key_generation)
++		goto out;
++	result = high > p->high || (high == p->high && low > p->low);
++	if (result) {
++		p->low = low;
++		p->high = high;
++	}
++out:
++	kdp_pn_unlock(p, who);
++	return result;
++}
++#endif
++
++/* Exact ingress policy installed from an accepted Linux flow rule. Version
++ * is zero while being replaced. Firmware samples version twice, including
++ * after matching: replacement/revocation can only cause a slow-path miss.
++ * Never derive a physical PPE slot from this software table's index/hash.
++ */
++struct kdp_flow {
++	unsigned int version, session, generation, key_generation;
++	unsigned int wcid, band, bss, type;
++	unsigned int src[4], dst[4], ports, protocol;
++	unsigned char smac[6], dmac[6];
++	unsigned int vlan, hw_slot, cookie_lo, cookie_hi, dsfield, dsmask;
++};
++#define KDP_FLOW_IPV4 1u
++#define KDP_FLOW_IPV6 2u
++#define KDP_FLOW_BRIDGE 3u
++#define KDP_SLOT_NONE 0xffffffffu
++
++struct kdp_sta {
++	unsigned int generation, key_generation, enabled, band;
++	unsigned int bss, cipher, keyid, authorized;
++	unsigned int omac, wmm, wme, amsdu;
++	unsigned int host_tids, reserved_sta;
++	unsigned int tx_tag;
++	unsigned char addr[6];
++	unsigned char tx_blocked, reserved;
++	struct kdp_pn pn[KDP_TIDS];
++};
++
++/* PPE etype WCID bits and ACTDP low 6 bits transport an opaque 17-bit
++ * route incarnation, never a physical WTBL index. Tags never wrap within
++ * the PPE driver's lifetime; old queued packets cannot acquire a new key.
++ * The NPU recovers the real WCID/BSS from this host-published route. */
++struct kdp_route { unsigned int tag, wcid; };
++struct kdp_tdma_desc { unsigned int word[8]; };
++struct kdp_token {
++	unsigned int state, submitted, dma_done, wa_done;
++	unsigned int generation, key_generation, wcid, band;
++};
++#define KDP_TOKEN_FREE 0u
++#define KDP_TOKEN_TDMA 1u
++#define KDP_TOKEN_WIFI 2u
++#define KDP_TOKEN_QUARANTINE 3u
++
++#define KDP_RX_TOKENS 5600u
++#define KDP_RX_MAGIC 0x4b520000u
++#define KDP_RX_REORDERED 1u
++#define KDP_RX_PN 2u
++#define KDP_RX_PPE_RETURN 4u
++struct kdp_rx_token {
++	unsigned int generation, key_generation, flags;
++	unsigned short next, wcid, len, offset;
++	unsigned char tid, bss, band, reserved;
++};
++
++struct kdp_band_stats {
++	unsigned int tx_bytes, rx_bytes, tx_stale, tx_full;
++	unsigned int reserved[12];
++};
++struct kdp_shared {
++	unsigned int magic, bytes, session, epoch;
++	unsigned int enabled, fault, gate, stopped;
++	unsigned int tx_sent[2], tx_freed[2], tx_drop[2], tx_bad_done;
++	unsigned int rx_ppe[2], rx_host[2], rx_replay[2], rx_stale[2];
++	unsigned int rx_miss[2], rx_free[2], rx_unsupported[2], tx_aborted[2], reserved[1];
++	struct kdp_sta sta[KDP_WCIDS];
++	struct kdp_route route[KDP_ROUTES];
++	struct kdp_flow flow[KDP_FLOWS];
++	struct kdp_token token[KDP_TOKENS];
++	unsigned short ba_index[KDP_WCIDS][8]; /* session index + 1 */
++	struct kdp_ba ba[KDP_BA_SESSIONS];
++	struct kdp_rx_token rx[KDP_RX_TOKENS];
++	struct kdp_tdma_desc tdma[2][KDP_RX_COUNT];
++	unsigned char txwi[KDP_TOKENS][KDP_TXWI_BYTES];
++	unsigned char payload[KDP_TOKENS][KDP_BUFFER_BYTES];
++	struct kdp_band_stats stats[2];
++};
++
++static inline unsigned int kdp_get_le32(const unsigned char *p)
++{
++	return (unsigned int)p[0] | (unsigned int)p[1] << 8 |
++	       (unsigned int)p[2] << 16 | (unsigned int)p[3] << 24;
++}
++static inline void kdp_put_le16(unsigned char *p, unsigned int v)
++{
++	p[0] = v;
++	p[1] = v >> 8;
++}
++static inline void kdp_put_le32(unsigned char *p, unsigned int v)
++{
++	kdp_put_le16(p, v);
++	kdp_put_le16(p + 2, v >> 16);
++}
++
++/* MT7916 connac2 normal cut-through TXD + firmware TXP, NOT Eagle's
++ * zero-TXD WED format. WTBL owns TX PN and sequence for both TX producers:
++ * PN_VALID/SN_VALID remain clear. Layout mirrors mt76_connac2_mac_write_txwi
++ * and mt7915_tx_prepare_skb for a unicast, Ethernet-encapsulated data frame.
++ */
++static inline int kdp_make_txwi(unsigned char *p, unsigned int pa,
++	unsigned int len, unsigned int token, unsigned int wcid,
++	unsigned int band, unsigned int bss, unsigned int omac,
++	unsigned int wmm, unsigned int tid, unsigned int encrypted,
++	unsigned int wme, unsigned int amsdu)
++{
++	static const unsigned char tid_queue[8] = { 1, 0, 0, 1, 2, 2, 3, 3 };
++	unsigned int i, q;
++	if (len < 14 || len > KDP_BUFFER_BYTES || token >= KDP_TOKENS ||
++	    !wcid || wcid >= KDP_WCIDS || band > 1 || bss > 63 || omac > 63 ||
++	    wmm > 3 || tid > 7 || pa < 0x80000000u || pa >= 0xc0000000u ||
++	    KDP_BUFFER_BYTES > 0xc0000000u - pa)
++		return 0;
++	for (i = 0; i < KDP_TXWI_BYTES; i++)
++		p[i] = 0;
++	q = wmm * 4 + tid_queue[tid];
++	kdp_put_le32(p, (len + 32) | (q << 25));
++	kdp_put_le32(p + 4, 0x80008000u | (band << 30) | (omac << 24) |
++			(tid << 20) | wcid);
++	kdp_put_le32(p + 8, 0x20u | (wme ? 8u : 0u));
++	kdp_put_le32(p + 12, (15u << 11) | (encrypted ? 2u : 0u));
++	/* PID 0: payload completion is WA TX-free, not an skb TX-status request. */
++	kdp_put_le32(p + 28, (2u << 20) | (wme ? 8u << 16 : 0u) |
++			 (amsdu ? 1u << 10 : 0u));
++	kdp_put_le16(p + 32, 0x81u | (encrypted ? 0u : 8u));
++	kdp_put_le16(p + 34, KDP_TOKEN_BASE + token);
++	p[36] = bss;
++	kdp_put_le16(p + 37, 0x3ff);
++	p[39] = 1;
++	kdp_put_le32(p + 40, pa);
++	kdp_put_le16(p + 64, len);
++	return 1;
++}
++
++/* Both independent completions are required, even if WA arrives first.
++ * Wrap is not allowed: rebind after a full hardware drain before 2^32 uses.
++ */
++static inline int kdp_token_reusable(const volatile struct kdp_token *t)
++{
++	return t->state == KDP_TOKEN_WIFI && t->submitted &&
++	       t->dma_done == t->submitted && t->wa_done == t->submitted;
++}
++#endif
+--- /dev/null
++++ b/kite-packet.h
+@@ -0,0 +1,162 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PONWRT_KITE_PACKET_H
++#define PONWRT_KITE_PACKET_H
++#include "kite-datapath.h"
++
++struct kdp_packet {
++	unsigned int src[4], dst[4], ports, protocol, type, vlan, dsfield;
++	unsigned char smac[6], dmac[6];
++};
++static inline unsigned int kdp_be16(const unsigned char *p)
++{
++	return (unsigned int)p[0] << 8 | p[1];
++}
++static inline unsigned int kdp_be32(const unsigned char *p)
++{
++	return (unsigned int)kdp_be16(p) << 16 | kdp_be16(p + 2);
++}
++/* Parse only complete unicast TCP/UDP packets suitable for a flow rule.
++ * Fragments, IPv6 extension headers and TCP connection control stay on the
++ * host. This parser cannot grant firewall or station authorization.
++ */
++static inline int kdp_parse_packet(const unsigned char *p, unsigned int len,
++	struct kdp_packet *out)
++{
++	unsigned int i, type, off = 14, end, l4;
++	if (len < 14 || (p[0] & 1) || (p[6] & 1))
++		return 0;
++	for (i = 0; i < 6; i++) {
++		out->dmac[i] = p[i];
++		out->smac[i] = p[i + 6];
++	}
++	out->vlan = KDP_SLOT_NONE;
++	type = kdp_be16(p + 12);
++	if (type == 0x8100) {
++		if (len < 18)
++			return 0;
++		out->vlan = kdp_be16(p + 14); /* PCP/DEI are policy too */
++		type = kdp_be16(p + 16);
++		off = 18;
++	}
++	for (i = 0; i < 4; i++)
++		out->src[i] = out->dst[i] = 0;
++	if (type == 0x0800) {
++		if (len - off < 20 || p[off] != 0x45 ||
++		    (kdp_be16(p + off + 6) & 0xbfff))
++			return 0;
++		end = off + kdp_be16(p + off + 2);
++		if (end > len || end < off + 20)
++			return 0;
++		out->src[0] = kdp_be32(p + off + 12);
++		out->dst[0] = kdp_be32(p + off + 16);
++		out->protocol = p[off + 9];
++		out->dsfield = p[off + 1];
++		out->type = KDP_FLOW_IPV4;
++		l4 = off + 20;
++	} else if (type == 0x86dd) {
++		if (len - off < 40 || (p[off] >> 4) != 6)
++			return 0;
++		end = off + 40 + kdp_be16(p + off + 4);
++		if (end > len)
++			return 0;
++		for (i = 0; i < 4; i++) {
++			out->src[i] = kdp_be32(p + off + 8 + i * 4);
++			out->dst[i] = kdp_be32(p + off + 24 + i * 4);
++		}
++		out->protocol = p[off + 6];
++		out->dsfield = ((p[off] & 15u) << 4) | (p[off + 1] >> 4);
++		out->type = KDP_FLOW_IPV6;
++		l4 = off + 40;
++	} else {
++		return 0;
++	}
++	if (out->protocol == 6) {
++		if (end - l4 < 20 || (p[l4 + 13] & 7) ||
++		    (p[l4 + 12] >> 4) < 5 ||
++		    (unsigned int)(p[l4 + 12] >> 4) * 4 > end - l4)
++			return 0;
++	} else if (out->protocol == 17) {
++		if (end - l4 < 8 || kdp_be16(p + l4 + 4) != end - l4)
++			return 0;
++	} else {
++		return 0;
++	}
++	out->ports = kdp_be32(p + l4);
++	return 1;
++}
++
++/* Default cfg80211 RFC8325 classifier, with an outer VLAN PCP taking
++ * precedence. Egress has already passed the kernel flow rule. */
++static inline unsigned int kdp_packet_tid(const struct kdp_packet *p)
++{
++	unsigned int dscp = p->dsfield >> 2;
++	if (p->vlan != KDP_SLOT_NONE && (p->vlan >> 13))
++		return p->vlan >> 13;
++	switch (dscp) {
++	case 10: case 12: case 14: case 16: return 0;
++	case 18: case 20: case 22: return 3;
++	case 24: case 26: case 28: case 30: return 4;
++	case 44: case 46: return 6;
++	case 48: return 7;
++	default: return p->dsfield >> 5;
++	}
++}
++
++static inline unsigned int kdp_flow_bucket(const unsigned char *smac,
++	const unsigned char *dmac, unsigned int vlan, unsigned int wcid)
++{
++	unsigned int i, h = wcid ^ vlan;
++	for (i = 0; i < 6; i++)
++		h = (h * 33u) ^ smac[i] ^ ((unsigned int)dmac[i] << 8);
++	h ^= h >> 16;
++	return (h & (KDP_FLOW_BUCKETS - 1)) * KDP_FLOW_WAYS;
++}
++
++/* Spread concurrent connections from one peer across the policy table.
++ * Bridge authorization retains its independent MAC/VLAN bucket. */
++static inline unsigned int kdp_flow_l4_bucket(unsigned int bucket,
++	const unsigned int *src, const unsigned int *dst, unsigned int ports,
++	unsigned int protocol, unsigned int type)
++{
++	unsigned int i, h = bucket ^ ports ^ (protocol << 24) ^ type;
++	for (i = 0; i < 4; i++) {
++		h = (h * 33u) ^ src[i];
++		h = (h * 33u) ^ dst[i];
++	}
++	h ^= h >> 16;
++	h *= 0x7feb352du;
++	h ^= h >> 15;
++	return (h & (KDP_FLOW_BUCKETS - 1)) * KDP_FLOW_WAYS;
++}
++
++#ifdef KDP_BARRIER
++static inline int kdp_flow_matches(const volatile struct kdp_flow *f,
++	const struct kdp_packet *p, unsigned int session, unsigned int generation,
++	unsigned int key_generation, unsigned int wcid, unsigned int band,
++	unsigned int bss)
++{
++	unsigned int i, version = f->version;
++	if (!version)
++		return 0;
++	KDP_BARRIER();
++	if (f->session != session || f->generation != generation ||
++	    f->key_generation != key_generation || f->wcid != wcid ||
++	    f->band != band || f->bss != bss || f->vlan != p->vlan ||
++	    ((p->dsfield ^ f->dsfield) & f->dsmask))
++		return 0;
++	for (i = 0; i < 6; i++)
++		if (f->smac[i] != p->smac[i] || f->dmac[i] != p->dmac[i])
++			return 0;
++	if (f->type != KDP_FLOW_BRIDGE) {
++		if (f->type != p->type || f->ports != p->ports ||
++		    f->protocol != p->protocol)
++			return 0;
++		for (i = 0; i < 4; i++)
++			if (f->src[i] != p->src[i] || f->dst[i] != p->dst[i])
++				return 0;
++	}
++	KDP_BARRIER();
++	return f->version == version;
++}
++#endif
++#endif
+--- /dev/null
++++ b/kite-reorder.h
+@@ -0,0 +1,150 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PONWRT_KITE_REORDER_H
++#define PONWRT_KITE_REORDER_H
++
++/* Fixed 12-bit sequence space; windows are at most 256 MPDUs. Storage is
++ * per negotiated BA session, not per possible WCID. A cell owns a complete
++ * A-MSDU chain or an unfinished one. Only complete MPDUs can be indicated.
++ * The caller serializes each session and supplies buffer-release callbacks.
++ */
++#define KDP_BA_SLOTS 256u
++#define KDP_BA_SESSIONS 128u
++#define KDP_BA_NONE 0xffffu
++struct kdp_mpdu {
++	unsigned int pn_low, pn_high, tick;
++	unsigned short head, tail, count, sn;
++	unsigned char complete, encrypted, reserved[2];
++};
++struct kdp_ba {
++	unsigned int generation, key_generation;
++	unsigned short wcid, tid, head, window;
++	struct kdp_mpdu slot[KDP_BA_SLOTS];
++};
++
++/* Buffers have one link while owned by this engine. A callback accepting
++ * a released MPDU becomes its owner, including when it chooses to drop it.
++ * No callback may re-enter this session.
++ */
++struct kdp_reorder_ops {
++	void (*drop)(void *ctx, unsigned short token);
++	void (*link)(void *ctx, unsigned short first, unsigned short next);
++	void (*release)(void *ctx, const struct kdp_mpdu *mpdu);
++};
++
++static inline void kdp_ba_empty(struct kdp_mpdu *m)
++{
++	m->head = m->tail = KDP_BA_NONE;
++	m->count = 0;
++	m->complete = 0;
++}
++
++static inline void kdp_ba_release(struct kdp_ba *b,
++	const struct kdp_reorder_ops *ops, void *ctx)
++{
++	struct kdp_mpdu *m = &b->slot[b->head & (KDP_BA_SLOTS - 1)];
++	if (m->count) {
++		/* release also receives incomplete chains and MUST drop them */
++		ops->release(ctx, m);
++		kdp_ba_empty(m);
++	}
++	b->head = (b->head + 1) & 4095;
++}
++
++static inline void kdp_ba_reset(struct kdp_ba *b, unsigned int ssn,
++	unsigned int window, const struct kdp_reorder_ops *ops, void *ctx)
++{
++	unsigned int i;
++	for (i = 0; i < KDP_BA_SLOTS; i++) {
++		struct kdp_mpdu *m = &b->slot[i];
++		if (m->count) {
++			m->complete = 0;
++			ops->release(ctx, m);
++		}
++		kdp_ba_empty(m);
++	}
++	b->head = ssn & 4095;
++	b->window = window <= KDP_BA_SLOTS ? window : 0;
++}
++
++/* MT7916 payload-format: 0 single, 3 first, 2 middle, 1 last.
++ * Equal PN is permitted only WITHIN one not-yet-released MPDU, with matching
++ * sequence/cipher and an actual first subframe. Replay is checked once by
++ * release, after sequence reorder, for the entire MPDU.
++ */
++static inline void kdp_ba_enqueue(struct kdp_ba *b, unsigned short token,
++	unsigned int sn, unsigned int format, unsigned int encrypted,
++	unsigned int low, unsigned int high, unsigned int tick,
++	const struct kdp_reorder_ops *ops, void *ctx)
++{
++	struct kdp_mpdu *m;
++	unsigned int delta;
++	if (!b->window || b->window > KDP_BA_SLOTS || sn > 4095 ||
++	    format > 3 || high > 0xffff || token == KDP_BA_NONE) {
++		ops->drop(ctx, token);
++		return;
++	}
++	delta = (sn - b->head) & 4095;
++	if (delta >= 2048) {
++		ops->drop(ctx, token);
++		return;
++	}
++	while (delta >= b->window) {
++		kdp_ba_release(b, ops, ctx);
++		delta--;
++	}
++	m = &b->slot[sn & (KDP_BA_SLOTS - 1)];
++	if (format == 0 || format == 3) {
++		if (m->count && m->complete) {
++			ops->drop(ctx, token);
++			return;
++		}
++		if (m->count) {
++			/* A fresh FIRST starts a fresh MPDU. Discard the entire old
++			 * unfinished chain before accepting any new subframes. */
++			ops->release(ctx, m);
++			kdp_ba_empty(m);
++		}
++		m->sn = sn;
++		m->head = m->tail = token;
++		m->count = 1;
++		m->pn_low = low;
++		m->pn_high = high;
++		m->encrypted = !!encrypted;
++		m->complete = format == 0;
++		m->tick = tick;
++		ops->link(ctx, token, KDP_BA_NONE);
++	} else {
++		if (!m->count || m->complete || m->sn != sn || m->count >= 64 ||
++		    m->encrypted != !!encrypted || m->pn_low != low ||
++		    m->pn_high != high) {
++			ops->drop(ctx, token);
++			return;
++		}
++		ops->link(ctx, m->tail, token);
++		ops->link(ctx, token, KDP_BA_NONE);
++		m->tail = token;
++		m->count++;
++		m->complete = format == 1;
++	}
++	while (b->slot[b->head & (KDP_BA_SLOTS - 1)].count &&
++	       b->slot[b->head & (KDP_BA_SLOTS - 1)].complete)
++		kdp_ba_release(b, ops, ctx);
++}
++
++static inline void kdp_ba_timeout(struct kdp_ba *b, unsigned int now,
++	unsigned int timeout, const struct kdp_reorder_ops *ops, void *ctx)
++{
++	unsigned int i, advance = 0;
++	/* Age arithmetic is modulo 2^32. Caller uses a timeout below 2^31. */
++	for (i = 0; i < b->window; i++) {
++		struct kdp_mpdu *m = &b->slot[(b->head + i) & (KDP_BA_SLOTS - 1)];
++		if (m->count && now - m->tick > timeout)
++			advance = i + 1;
++	}
++	while (advance--)
++		kdp_ba_release(b, ops, ctx);
++	while (b->slot[b->head & (KDP_BA_SLOTS - 1)].count &&
++	       b->slot[b->head & (KDP_BA_SLOTS - 1)].complete)
++		kdp_ba_release(b, ops, ctx);
++}
++#endif
+--- a/kite-tx.h
++++ b/kite-tx.h
+@@ -1,16 +1,17 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ #ifndef PONWRT_KITE_TX_H
+ #define PONWRT_KITE_TX_H
+-/* ABI 1: little endian words. One input slot maps to the same WFDMA slot.
+- * ARM writes producer and input descriptors; hart 4 writes all other progress
++/* ABI 2: little endian words. Host input and WFDMA indices are independent.
++ * ARM writes producer and input descriptors; hart 4 multiplexes host and PPE
++ * frames onto WFDMA and writes all other progress
+  * fields and the hardware descriptors. Neither index releases payload tokens.
+  * The host retains mappings until WA TX-free, or the full DMA stop barrier.
+  */
+-#define KITE_TX_MAGIC 0x4b540001u
++#define KITE_TX_MAGIC 0x4b540002u
+ #define KITE_TX_COUNT 2048u
+ #define KITE_TX_MASK (KITE_TX_COUNT - 1)
+ #define KITE_TX_HEADER 128u
+-#define KITE_TX_BYTES (KITE_TX_HEADER + KITE_TX_COUNT * 16u)
++#define KITE_TX_BYTES (KITE_TX_HEADER + KITE_TX_COUNT * 18u)
+ #define KITE_TX_BUDGET 32u
+ #define KITE_TX_FAULT_IDENTITY 1u
+ #define KITE_TX_FAULT_INDEX 2u
+@@ -23,8 +24,11 @@
+ 	unsigned int magic, session, epoch, count;
+ 	unsigned int producer, published, completed, fault;
+ 	unsigned int submitted, reaped, polls, wraps;
+-	unsigned int invalid, cancelled, reserved[18];
++	unsigned int invalid, cancelled;
++	unsigned int hw_producer, hw_completed, ppe_submitted, ppe_reaped;
++	unsigned int reserved[14];
+ 	struct kite_tx_desc input[KITE_TX_COUNT];
++	unsigned short owner[KITE_TX_COUNT]; /* NPU-only WFDMA completion ledger */
+ };
+ static inline int kite_tx_range(unsigned long long pa, unsigned int len)
+ {
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1311,7 +1311,7 @@
+ }
+ 
+ static void
+-mt76_check_ccmp_pn(struct sk_buff *skb)
++mt76_check_ccmp_pn(struct mt76_dev *dev, struct sk_buff *skb)
+ {
+ 	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
+ 	struct mt76_wcid *wcid = status->wcid;
+@@ -1354,6 +1354,8 @@
+ 		security_idx = IEEE80211_NUM_TIDS;
+ 
+ skip_hdr_check:
++	if (mt76_kite_check_pn(dev, skb, security_idx))
++		return;
+ 	BUILD_BUG_ON(sizeof(status->iv) != sizeof(wcid->rx_key_pn[0]));
+ 	ret = memcmp(status->iv, wcid->rx_key_pn[security_idx],
+ 		     sizeof(status->iv));
+@@ -1539,7 +1541,7 @@
+ 	while ((skb = __skb_dequeue(frames)) != NULL) {
+ 		struct sk_buff *nskb = skb_shinfo(skb)->frag_list;
+ 
+-		mt76_check_ccmp_pn(skb);
++		mt76_check_ccmp_pn(dev, skb);
+ 		skb_shinfo(skb)->frag_list = NULL;
+ 		mt76_rx_convert(dev, skb, &hw, &sta);
+ 		ieee80211_rx_list(hw, sta, skb, &list);
+--- a/mt76.h
++++ b/mt76.h
+@@ -24,6 +24,8 @@
+ #include <net/page_pool/helpers.h>
+ #include "util.h"
+ #include "kite-tx.h"
++#define KDP_BARRIER() mb()
++#include "kite-datapath.h"
+ #include "testmode.h"
+ 
+ #define MT_MCU_RING_SIZE	32
+@@ -763,14 +765,17 @@
+ 
+ 	u32 reorder_time;
+ 
+-	u32 ampdu_ref;
+-	u32 timestamp;
++	union {
++		struct { u32 ampdu_ref, timestamp; };
++		struct { u32 npu_generation, npu_key_generation; };
++	};
+ 
+ 	u8 iv[6];
+ 
+ 	u8 phy_idx:2;
+ 	u8 aggr:1;
+ 	u8 npu_reordered:1;
++	u8 npu_security:1, npu_pn_proof:1;
+ 	u8 qos_ctl;
+ 	u16 seqno;
+ 
+@@ -976,6 +981,8 @@
+ 	struct device *dma_dev;
+ 	/* Set when a Kite stop lost completion proof; NPU pages/descriptors
+ 	 * remain quarantined until device removal or a hardware reset. */
++	struct kdp_shared *kite_dp;
++	u64 kite_pn_accept, kite_pn_proof, kite_pn_reject;
+ 	bool npu_quarantine;
+ 	bool npu_irq_requested[2];
+ 	struct list_head npu_dma_allocations;
+@@ -1696,6 +1703,7 @@
+ int mt76_testmode_alloc_skb(struct mt76_phy *phy, u32 len);
+ 
+ #ifdef CONFIG_MT76_NPU
++bool mt76_kite_check_pn(struct mt76_dev *dev, struct sk_buff *skb, int tid);
+ void mt76_npu_check_ppe(struct mt76_dev *dev, struct sk_buff *skb,
+ 			u32 info);
+ int mt76_npu_dma_add_buf(struct mt76_phy *phy, struct mt76_queue *q,
+@@ -1719,6 +1727,8 @@
+ 			    u32 direction, u32 i_count_addr,
+ 			    u32 o_status_addr, u32 o_count_addr);
+ #else
++static inline bool mt76_kite_check_pn(struct mt76_dev *dev,
++	struct sk_buff *skb, int tid) { return false; }
+ static inline void mt76_npu_check_ppe(struct mt76_dev *dev,
+ 				      struct sk_buff *skb, u32 info)
+ {
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -1374,6 +1374,7 @@
+ unreg_dev:
+ 	mt76_unregister_device(&dev->mt76);
+ stop_hw:
++	mt7915_npu_dp_work_stop(dev);
+ 	mt7915_stop_hardware(dev);
+ 	mt7915_npu_control_detach(dev);
+ 	if (phy2)
+@@ -1383,6 +1384,7 @@
+ 
+ void mt7915_unregister_device(struct mt7915_dev *dev)
+ {
++	mt7915_npu_dp_work_stop(dev);
+ 	cancel_work_sync(&dev->dump_work);
+ 	cancel_work_sync(&dev->reset_work);
+ 	cancel_work_sync(&dev->rc_work);
+--- a/mt7915/kite-control.h
++++ b/mt7915/kite-control.h
+@@ -28,6 +28,7 @@
+ #define KITE_CTL_CAP_RX_REORDER 512u /* candidate only; PN remains host-owned */
+ #define KITE_CTL_CAP_META 1024u
+ #define KITE_CTL_CAP_TX 2048u /* OPEN arg3=1: hart4 descriptor submission */
++#define KITE_CTL_CAP_DATAPATH 4096u /* optional, requires explicit DP_BIND */
+ #define KITE_CTL_CAPS 2047u
+ #define KITE_CTL_MODE_DATA 0u
+ #define KITE_CTL_MODE_CONTROL_ONLY 1u
+@@ -72,6 +73,9 @@
+ 	KITE_CTL_DATA_RECOVER, /* stopped session: rearm retained WiFi rings */
+ 	KITE_CTL_TX_BIND, /* band, input PA, hardware ring PA, main-HIF register PA, count */
+ 	KITE_CTL_TX_UNBIND, /* PARKED, stop both TX writers before WFDMA disable */
++	KITE_CTL_DP_BIND, /* shared ARM PA, bytes, epoch; PARKED after TX_BIND */
++	KITE_CTL_DP_UNBIND, /* PPE rules revoked, gate closed, all TX complete */
++	KITE_CTL_DP_RX_PURGE, /* PARKED; readback verifies WFDMA RX disabled */
+ };
+ enum kite_ctl_result {
+ 	KITE_CTL_OK,
+@@ -108,35 +112,28 @@
+ int kite_ctl_active(void);
+ int kite_ctl_sta_matches(u32 band, u32 wcid, u32 bss);
+ int kite_ctl_rx_meta(u32 band, u32 wcid, u32 bss, u32 *generation,
+-		     u32 *key_generation);
++			    u32 *key_generation);
+ int kite_ctl_rx_held(void);
+ int kite_ctl_legacy_setup(u32 cmd, u32 band);
+ void ba_discard_entry(u32 *entry);
+ #else
+ static inline int kite_ctl_pausepoint(u32 hart) { (void)hart; return 0; }
+-static inline int kite_ctl_stop_requested(void)
+-{
+-	return 0;
+-}
++static inline int kite_ctl_stop_requested(void) { return 0; }
+ static inline int kite_ctl_active(void) { return 0; }
+ static inline int kite_ctl_rx_held(void) { return 0; }
+ /* Other Kite variants have no ABI2 station/key mirror. They must never
+  * synthesize trusted generation metadata from an absent control plane. */
+-static inline int kite_ctl_rx_meta(u32 band, u32 wcid, u32 bss, u32 *generation,
+-				   u32 *key_generation)
++static inline int kite_ctl_rx_meta(u32 band, u32 wcid, u32 bss,
++				   u32 *generation, u32 *key_generation)
+ {
+-	(void)band;
+-	(void)wcid;
+-	(void)bss;
++	(void)band; (void)wcid; (void)bss;
+ 	*generation = 0;
+ 	*key_generation = 0;
+ 	return 0;
+ }
+ static inline u32 kite_ctl_ba_address(u32 band, u32 wcid, u32 tid)
+ {
+-	(void)band;
+-	(void)wcid;
+-	(void)tid;
++	(void)band; (void)wcid; (void)tid;
+ 	return 0;
+ }
+ #endif
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -9,6 +9,9 @@
+ #include "mac.h"
+ #include "mcu.h"
+ #include "kite-host.h"
++#ifdef CONFIG_MT7915_NPU
++#include <linux/soc/airoha/airoha_kite.h>
++#endif
+ 
+ #define to_rssi(field, rcpi)	((FIELD_GET(field, rcpi) - 220) / 2)
+ 
+@@ -569,6 +572,54 @@
+ 	if (rxv && mode >= MT_PHY_TYPE_HE_SU && !(status->flag & RX_FLAG_8023))
+ 		mt76_connac2_mac_decode_he_radiotap(&dev->mt76, skb, rxv, mode);
+ 
++#ifdef CONFIG_MT7915_NPU
++	if (READ_ONCE(dev->mt76.kite_dp) && status->wcid &&
++	    (q == MT_RXQ_NPU0 || q == MT_RXQ_NPU1)) {
++		struct kdp_shared *dp = dev->mt76.kite_dp;
++		u16 wi = status->wcid->idx;
++		u32 meta = info[0];
++		if (wi >= KDP_WCIDS || (meta & 0xffff0000u) != KDP_RX_MAGIC ||
++		    (meta & ~(KDP_RX_MAGIC | KDP_RX_REORDERED | KDP_RX_PN |
++			       KDP_RX_PPE_RETURN)) ||
++		    info[1] != READ_ONCE(dp->sta[wi].generation) ||
++		    info[2] != READ_ONCE(dp->sta[wi].key_generation))
++			return -ESTALE;
++		status->npu_security = 1;
++		status->npu_generation = info[1];
++		status->npu_key_generation = info[2];
++		status->flag &= ~(RX_FLAG_AMPDU_DETAILS | RX_FLAG_MACTIME_START |
++				  RX_FLAG_MACTIME_END | RX_FLAG_MACTIME_PLCP_START);
++		if ((meta & KDP_RX_PPE_RETURN) && mt76_ppe_device_active(&dev->mt76)) {
++			struct airoha_ppe_dev *ppe = rcu_dereference(dev->mt76.mmio.ppe_dev);
++
++			if (ppe)
++				airoha_kite_learn_hint(ppe);
++		}
++		if (meta & KDP_RX_REORDERED) {
++			if (!ieee80211_is_data_qos(fc) ||
++			    ieee80211_has_morefrags(fc) || (seq_ctrl & 15))
++				return -EPROTO;
++			/* NPU already assembled and PN-checked the complete MPDU.
++			 * Each translated subframe is a standalone Ethernet skb: PPE
++			 * may have consumed its siblings, so Linux cannot reassemble
++			 * the original hardware A-MSDU chain a second time. */
++			if (status->amsdu) {
++				if (!(status->flag & RX_FLAG_8023))
++					return -EPROTO;
++				status->amsdu = status->first_amsdu = status->last_amsdu = 0;
++			}
++			status->npu_reordered = 1;
++		}
++		if (meta & KDP_RX_PN) {
++			if (!(meta & KDP_RX_REORDERED) ||
++			    !(status->flag & RX_FLAG_DECRYPTED) ||
++			    READ_ONCE(dp->sta[wi].cipher) != KDP_CIPHER_CCMP)
++				return -EPROTO;
++			status->npu_pn_proof = 1;
++		}
++	}
++#endif
++
+ 	if (!status->wcid || !ieee80211_is_data_qos(fc))
+ 		return 0;
+ 
+@@ -979,6 +1030,10 @@
+ 				msdu = FIELD_GET(MT_TX_FREE_MSDU_ID, info);
+ 			}
+ 			count++;
++#ifdef CONFIG_MT7915_NPU
++			if (mt7915_npu_dp_tx_free(dev, msdu))
++				continue;
++#endif
+ 			txwi = mt76_token_release(mdev, msdu, &wake);
+ #ifdef CONFIG_MT7915_NPU
+ 			if (!txwi && dev->kite.tx_enabled)
+@@ -1015,6 +1070,10 @@
+ 		struct mt76_txwi_cache *txwi;
+ 		u16 msdu = le16_to_cpu(info[i]);
+ 
++#ifdef CONFIG_MT7915_NPU
++		if (mt7915_npu_dp_tx_free(dev, msdu))
++			continue;
++#endif
+ 		txwi = mt76_token_release(mdev, msdu, &wake);
+ #ifdef CONFIG_MT7915_NPU
+ 		if (!txwi && dev->kite.tx_enabled)
+@@ -2426,7 +2485,9 @@
+ 	}
+ 	flow->tsf = le64_to_cpu(twt_agrt->twt);
+ 
+-	if (mt7915_mcu_twt_agrt_update(dev, msta->vif, flow, MCU_TWT_AGRT_ADD)) {
++	if (mt7915_npu_twt(dev, msta->wcid.idx, true) ||
++	    mt7915_mcu_twt_agrt_update(dev, msta->vif, flow, MCU_TWT_AGRT_ADD)) {
++		mt7915_npu_twt(dev, msta->wcid.idx, !!msta->twt.flowid_mask);
+ 		list_del(&flow->list);
+ 		goto unlock;
+ 	}
+@@ -2467,6 +2528,7 @@
+ 
+ 	list_del_init(&flow->list);
+ 	msta->twt.flowid_mask &= ~BIT(flowid);
++	mt7915_npu_twt(dev, msta->wcid.idx, !!msta->twt.flowid_mask);
+ 	dev->twt.table_mask &= ~BIT(flow->table_id);
+ 	dev->twt.n_agrt--;
+ }
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -454,6 +454,7 @@
+ 	if (!err)
+ 		mt7915_npu_key_commit(dev, wcid, key);
+ out:
++	err = mt7915_npu_key_finish(dev, wcid, key, cmd == SET_KEY, err);
+ 	/* mac80211 key removal cannot be rejected. A failed NPU fence keeps
+ 	 * admission closed and DMA ownership retained, but must not leave a
+ 	 * deleted host key index live. Installs still propagate every error.
+@@ -556,8 +557,19 @@
+ 	/* no need to update right away, we'll get BSS_CHANGED_QOS */
+ 	queue = mt76_connac_lmac_mapping(queue);
+ 	mvif->queue_params[queue] = *params;
+-
+-	return 0;
++	{
++		struct mt7915_dev *dev = mt7915_hw_dev(hw);
++		int ret;
++
++		mutex_lock(&dev->mt76.mutex);
++		if (params->acm)
++			mvif->npu_acm |= BIT(queue);
++		else
++			mvif->npu_acm &= ~BIT(queue);
++		ret = mt7915_npu_qos(dev, mvif);
++		mutex_unlock(&dev->mt76.mutex);
++		return ret;
++	}
+ }
+ 
+ static void mt7915_configure_filter(struct ieee80211_hw *hw,
+@@ -692,6 +704,13 @@
+ 		}
+ 	}
+ 
++	if (changed & BSS_CHANGED_QOS) {
++		struct mt7915_vif *mvif = (void *)vif->drv_priv;
++
++		mvif->npu_qos_custom = !!(vif->offload_flags & IEEE80211_OFFLOAD_CUSTOM_QOS);
++		mt7915_npu_qos(dev, mvif);
++	}
++
+ 	/* ensure that enable txcmd_mode after bss_info */
+ 	if (changed & (BSS_CHANGED_QOS | BSS_CHANGED_BEACON_ENABLED))
+ 		mt7915_mcu_set_tx(dev, vif);
+@@ -759,7 +778,7 @@
+ 		dev_err(dev->mt76.dev, "Wi-Fi AP start failed: band=%u error=%d\n",
+ 			phy->mt76->band_idx, err);
+ 	else if (mt76_npu_device_active(&dev->mt76))
+-		dev_info(dev->mt76.dev, "Wi-Fi AP started: band=%u; NPU RX active, host security/TX\n",
++		dev_info(dev->mt76.dev, "Wi-Fi AP started: band=%u; NPU RX active; negotiated datapath counters in kite_datapath\n",
+ 			 phy->mt76->band_idx);
+ 
+ 	return err;
+@@ -873,11 +892,13 @@
+ 		return;
+ 
+ 	msta = (struct mt7915_sta *)sta->drv_priv;
++	mutex_lock(&data->dev->mt76.mutex);
+ 	mt7915_npu_port(data->dev, msta, false);
+ 	mt7915_mcu_add_sta(data->dev, vif, sta, CONN_STATE_DISCONNECT, false);
+ 	msta->wcid.tx_info &= ~MT_WCID_TX_INFO_SET;
+ 	msta->wcid.sta_disabled = 1;
+ 	msta->wcid.sta = 0;
++	mutex_unlock(&data->dev->mt76.mutex);
+ }
+ 
+ static void
+@@ -933,30 +954,51 @@
+ 
+ 	case MT76_STA_EVENT_AUTHORIZE:
+ 		mt7915_drop_other_sta(dev, vif, sta);
++		mutex_lock(&dev->mt76.mutex);
+ 		ret = mt7915_mcu_add_sta(dev, vif, sta, CONN_STATE_PORT_SECURE, false);
+-		if (ret)
+-			return ret;
+-		return mt7915_npu_port(dev, msta, true);
++		if (!ret)
++			ret = mt7915_npu_port(dev, msta, true);
++		mutex_unlock(&dev->mt76.mutex);
++		return ret;
+ 
+ 	case MT76_STA_EVENT_DISASSOC:
+ 		/* Downward sta_state transitions must complete host/MCU cleanup.
+ 		 * NPU errors remain latched; this does not ACK its drain, release
+ 		 * mappings, or permit a new STA/authorization in the failed session.
+ 		 */
++		mutex_lock(&dev->mt76.mutex);
+ 		mt7915_npu_port(dev, msta, false);
+-		mutex_lock(&dev->mt76.mutex);
+ 		for (i = 0; i < ARRAY_SIZE(msta->twt.flow); i++)
+ 			mt7915_mac_twt_teardown_flow(dev, msta, i);
+-		mutex_unlock(&dev->mt76.mutex);
+ 
+ 		mt7915_mcu_add_sta(dev, vif, sta, CONN_STATE_DISCONNECT, false);
+ 		msta->wcid.tx_info &= ~MT_WCID_TX_INFO_SET;
+ 		msta->wcid.sta_disabled = 1;
+ 		msta->wcid.sta = 0;
++		mutex_unlock(&dev->mt76.mutex);
+ 		return 0;
+ 	}
+ 
+ 	return 0;
++}
++
++/* mac80211 revokes the controlled port before DISASSOC and key cleanup.
++ * Retire PPE at that first transition, including same-STA reauthorization. */
++static int mt7915_sta_state(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++	struct ieee80211_sta *sta, enum ieee80211_sta_state old,
++	enum ieee80211_sta_state new)
++{
++	struct mt7915_dev *dev = mt7915_hw_dev(hw);
++	struct mt7915_sta *msta = (void *)sta->drv_priv;
++
++	if (old == IEEE80211_STA_AUTHORIZED && new == IEEE80211_STA_ASSOC) {
++		mutex_lock(&dev->mt76.mutex);
++		/* Downward transition cannot prevent mac80211 cleanup. A failed
++		 * hardware fence remains latched and rejects future admission. */
++		mt7915_npu_port(dev, msta, false);
++		mutex_unlock(&dev->mt76.mutex);
++	}
++	return mt76_sta_state(hw, vif, sta, old, new);
+ }
+ 
+ void mt7915_mac_sta_remove(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+@@ -1431,6 +1473,19 @@
+ 	if (!msta->wcid.sta)
+ 		return;
+ 
++#ifdef CONFIG_MT7915_NPU
++	mutex_lock(&dev->mt76.mutex);
++	if (dev->kite.dp_bound && dev->kite.live[msta->wcid.idx]) {
++		int ret = mt7915_npu_port(dev, msta,
++			READ_ONCE(dev->mt76.kite_dp->sta[msta->wcid.idx].authorized));
++
++		if (ret) {
++			mutex_unlock(&dev->mt76.mutex);
++			return;
++		}
++	}
++	mutex_unlock(&dev->mt76.mutex);
++#endif
+ 	mt76_connac_mcu_wtbl_update_hdr_trans(&dev->mt76, vif, sta);
+ }
+ 
+@@ -1450,6 +1505,19 @@
+ 	if (!msta->wcid.sta)
+ 		return;
+ 
++#ifdef CONFIG_MT7915_NPU
++	mutex_lock(&dev->mt76.mutex);
++	if (dev->kite.dp_bound && dev->kite.live[msta->wcid.idx]) {
++		int ret = mt7915_npu_port(dev, msta,
++			READ_ONCE(dev->mt76.kite_dp->sta[msta->wcid.idx].authorized));
++
++		if (ret) {
++			mutex_unlock(&dev->mt76.mutex);
++			return;
++		}
++	}
++	mutex_unlock(&dev->mt76.mutex);
++#endif
+ 	mt76_connac_mcu_wtbl_update_hdr_trans(&dev->mt76, vif, sta);
+ }
+ 
+@@ -1911,9 +1979,35 @@
+ software:
+ #endif
+ #ifdef CONFIG_MT7915_NPU
++	{
++		struct mt7915_dev *ndev = mt7915_hw_dev(hw);
++		struct mt7915_sta *ns = (void *)sta->drv_priv;
++		struct kdp_shared *dp = READ_ONCE(ndev->mt76.kite_dp);
++		u16 wi = ns->wcid.idx;
++
++		if (dp && ndev->kite.dp_bound && !ndev->kite.failed &&
++		    wi && wi < KDP_WCIDS && vif->type == NL80211_IFTYPE_AP &&
++		    !test_bit(MT_WCID_FLAG_4ADDR, &ns->wcid.flags) &&
++		    READ_ONCE(dp->enabled) && !READ_ONCE(dp->gate) &&
++		    !READ_ONCE(dp->fault) && READ_ONCE(dp->sta[wi].enabled) &&
++		    READ_ONCE(dp->sta[wi].authorized) &&
++		    !READ_ONCE(dp->sta[wi].tx_blocked)) {
++			path->type = DEV_PATH_AIROHA_NPU;
++			path->dev = ctx->dev;
++			path->airoha_npu.session = READ_ONCE(dp->session);
++			path->airoha_npu.generation = READ_ONCE(dp->sta[wi].generation);
++			path->airoha_npu.key_generation = READ_ONCE(dp->sta[wi].key_generation);
++			path->airoha_npu.tx_tag = READ_ONCE(dp->sta[wi].tx_tag);
++			path->airoha_npu.wcid = wi;
++			path->airoha_npu.band = READ_ONCE(dp->sta[wi].band);
++			path->airoha_npu.bss = READ_ONCE(dp->sta[wi].bss);
++			ctx->dev = NULL;
++			return 0;
++		}
++	}
+ 	/* Normal Ethernet endpoint: flowtable still transmits through mac80211,
+ 	 * including current STA authorization, keys, PN and WA token ownership.
+-	 * Kite has no verified PPE/WDMA ABI; never manufacture a WDMA path.
++	 * Full Kite datapath admission was unavailable; retain mac80211 ownership.
+ 	 */
+ 	if (is_mt7916(&mt7915_hw_dev(hw)->mt76)) {
+ 		path->type = DEV_PATH_ETHERNET;
+@@ -1971,7 +2065,7 @@
+ 	.bss_info_changed = mt7915_bss_info_changed,
+ 	.start_ap = mt7915_start_ap,
+ 	.stop_ap = mt7915_stop_ap,
+-	.sta_state = mt76_sta_state,
++	.sta_state = mt7915_sta_state,
+ 	.sta_pre_rcu_remove = mt76_sta_pre_rcu_remove,
+ 	.link_sta_rc_update = mt7915_sta_rc_update,
+ 	.set_key = mt7915_set_key,
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -414,6 +414,7 @@
+ 	if (!wcid || !wcid_to_sta(wcid))
+ 		return;
+ 
++	mt7915_npu_ps(dev, wcid_idx, !!p->ps_bit);
+ 	mt76_sta_ps_transition(&dev->mt76, wcid, !!p->ps_bit);
+ }
+ 
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -181,6 +181,8 @@
+ struct mt7915_vif {
+ 	struct mt76_vif_link mt76; /* must be first */
+ 
++	bool npu_qos_custom;
++	u8 npu_acm;
+ 	struct mt7915_vif_cap cap;
+ 	struct mt7915_sta sta;
+ 	struct mt7915_phy *phy;
+@@ -269,7 +271,15 @@
+ 		u32 generation[MT7916_WTBL_SIZE];
+ 		u32 key_generation[MT7916_WTBL_SIZE];
+ 		bool active, failed, control_only, host_bound;
+-		bool reorder;
++		bool reorder, datapath, dp_bound;
++		dma_addr_t dp_dma;
++		u32 dp_epoch;
++		bool dp_attached, dp_changing, dp_rx_held;
++		u32 dp_rx_cfg[2], dp_rx_mac[2], dp_key_pending;
++		spinlock_t dp_done_lock;
++		struct work_struct dp_ps_work;
++		DECLARE_BITMAP(dp_ps_pending, KDP_WCIDS);
++		bool dp_work_stopping, dp_work_initialized;
+ 		bool tx_requested, tx_enabled, tx_bound, tx_reset_requested;
+ 		u32 tx_unknown;
+ 		unsigned long tx_log_at;
+@@ -497,6 +507,13 @@
+ int mt7915_npu_control_open(struct mt7915_dev *dev);
+ int mt7915_npu_control_resume(struct mt7915_dev *dev);
+ int mt7915_npu_tx_bind(struct mt7915_dev *dev);
++int mt7915_npu_dp_bind(struct mt7915_dev *dev);
++void mt7915_npu_dp_work_init(struct mt7915_dev *dev);
++void mt7915_npu_dp_work_stop(struct mt7915_dev *dev);
++void mt7915_npu_ps(struct mt7915_dev *dev, u16 wcid, bool ps);
++int mt7915_npu_twt(struct mt7915_dev *dev, u16 wcid, bool active);
++int mt7915_npu_qos(struct mt7915_dev *dev, struct mt7915_vif *mvif);
++bool mt7915_npu_dp_tx_free(struct mt7915_dev *dev, u16 token);
+ int mt7915_npu_tx_halt(struct mt7915_dev *dev);
+ int mt7915_npu_tx_fence(struct mt7915_dev *dev);
+ void mt7915_npu_tx_unfence(struct mt7915_dev *dev);
+@@ -512,12 +529,18 @@
+ int mt7915_npu_port(struct mt7915_dev *dev, struct mt7915_sta *msta, bool authorized);
+ void mt7915_npu_key_commit(struct mt7915_dev *dev, struct mt76_wcid *wcid,
+ 			  struct ieee80211_key_conf *key);
++int mt7915_npu_key_finish(struct mt7915_dev *dev, struct mt76_wcid *wcid,
++	struct ieee80211_key_conf *key, bool install, int result);
+ int mt7915_npu_key(struct mt7915_dev *dev, struct mt76_wcid *wcid,
+ 		   struct ieee80211_key_conf *key, bool install);
+ int mt7915_npu_ba_set(struct mt7915_dev *dev, u8 band, u16 wcid,
+ 		      u8 tid, u16 ssn, u16 win_size);
+ int mt7915_npu_sta_del(struct mt7915_dev *dev, u8 band, u16 wcid);
+ #else
++static inline int mt7915_npu_qos(struct mt7915_dev *dev, struct mt7915_vif *mvif) { return 0; }
++static inline void mt7915_npu_dp_work_stop(struct mt7915_dev *dev) {}
++static inline void mt7915_npu_ps(struct mt7915_dev *dev, u16 wcid, bool ps) {}
++static inline int mt7915_npu_twt(struct mt7915_dev *dev, u16 wcid, bool active) { return 0; }
+ static inline int mt7915_npu_tx_halt(struct mt7915_dev *dev)
+ {
+ 	return 0;
+@@ -548,6 +571,9 @@
+ 				struct mt7915_sta *msta, bool authorized) { return 0; }
+ static inline void mt7915_npu_key_commit(struct mt7915_dev *dev,
+ 		struct mt76_wcid *wcid, struct ieee80211_key_conf *key) {}
++static inline int mt7915_npu_key_finish(struct mt7915_dev *dev,
++	struct mt76_wcid *wcid, struct ieee80211_key_conf *key, bool install,
++	int result) { return result; }
+ static inline int mt7915_npu_key(struct mt7915_dev *dev, struct mt76_wcid *wcid,
+ 			       struct ieee80211_key_conf *key, bool install) { return 0; }
+ 
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -7,6 +7,7 @@
+ #include "kite-control.h"
+ #include "kite-host.h"
+ #include "../dma.h"
++#include <linux/soc/airoha/airoha_kite.h>
+ 
+ /* Protected by kite.lock or probe/remove serialization. control_npu owns
+  * one supplier reference and never implies packet/DMA ownership. */
+@@ -168,6 +169,9 @@
+ 	return 0;
+ }
+ 
++
++#include "npu-datapath.inc"
++
+ int mt7915_npu_control_open(struct mt7915_dev *dev)
+ {
+ 	struct airoha_npu *npu = mt7915_kite_npu(dev);
+@@ -230,6 +234,8 @@
+ 	dev->kite.tx_enabled = !dev->kite.control_only &&
+ 			       dev->kite.tx_requested &&
+ 			       (s[2] & KITE_CTL_CAP_TX);
++	dev->kite.datapath = dev->kite.tx_enabled &&
++			     (s[2] & KITE_CTL_CAP_DATAPATH);
+ 	args[3] = dev->kite.tx_enabled;
+ 	if (dev->kite.tx_requested && !dev->kite.tx_enabled &&
+ 	    !dev->kite.control_only)
+@@ -353,6 +359,11 @@
+ 	ret = mt7915_kite_command(dev, KITE_CTL_DATA_STOP, NULL, 0);
+ 	if (!ret)
+ 		ret = mt7915_kite_wait_stopped(dev);
++	if (!ret && dev->kite.dp_bound) {
++		ret = mt7915_kite_command(dev, KITE_CTL_DP_UNBIND, NULL, 0);
++		if (!ret)
++			dev->kite.dp_bound = false;
++	}
+ 	if (!ret)
+ 		ret = mt7915_kite_command(dev, KITE_CTL_HOST_UNBIND,
+ 					 &dev->kite.host_epoch, 1);
+@@ -427,20 +438,44 @@
+ 			     const u32 *args, unsigned int nargs)
+ {
+ 	int ret;
++	bool dp_change = dev->kite.dp_bound && op != KITE_CTL_BA;
+ 
+ 	lockdep_assert_held(&dev->kite.lock);
+-	if (op == KITE_CTL_STA_DEL || (op == KITE_CTL_PORT && !args[2])) {
++	if (!dp_change && (op == KITE_CTL_STA_DEL ||
++			   (op == KITE_CTL_PORT && !args[2]))) {
+ 		ret = mt7915_npu_tx_fence(dev);
+ 		if (ret)
+ 			return ret;
+ 	}
+-	ret = mt7915_kite_command(dev, KITE_CTL_PARK, NULL, 0);
++	ret = dp_change ? mt7915_dp_rx_pause(dev) :
++		mt7915_kite_command(dev, KITE_CTL_PARK, NULL, 0);
+ 	if (!ret)
+ 		ret = mt7915_kite_wait_parked(dev);
+ 	if (!ret)
+ 		ret = mt7915_kite_command(dev, op, args, nargs);
+-	if (!ret)
++	if (!ret && dp_change) {
++		struct kdp_sta *st = &dev->mt76.kite_dp->sta[args[0]];
++
++		spin_lock_bh(&dev->mt76.rx_lock);
++		if (op == KITE_CTL_STA_ADD) {
++			u32 tag = st->tx_tag;
++
++			memset(st, 0, sizeof(*st));
++			st->tx_tag = tag;
++			st->generation = args[1];
++			st->band = args[2];
++			st->bss = args[3];
++		} else if (op == KITE_CTL_STA_DEL) {
++			st->enabled = st->authorized = 0;
++		} else if (op == KITE_CTL_PORT) {
++			st->authorized = args[2];
++			mt7915_dp_sta_enable(st);
++		}
++		spin_unlock_bh(&dev->mt76.rx_lock);
++		ret = mt7915_dp_rx_finish(dev);
++	} else if (!ret) {
+ 		ret = mt7915_kite_command(dev, KITE_CTL_RESUME, NULL, 0);
++	}
+ 	if (ret)
+ 		mt7915_kite_fault(dev, ret);
+ 	if (op == KITE_CTL_STA_DEL || (op == KITE_CTL_PORT && !args[2]))
+@@ -457,6 +492,9 @@
+ 		return 0;
+ 	if (!idx || idx >= KITE_CTL_WCIDS)
+ 		return mt7915_kite_host_result(dev, -ERANGE);
++	ret = mt7915_dp_change_begin(dev, idx);
++	if (ret)
++		return ret;
+ 	mutex_lock(&dev->kite.lock);
+ 	if (dev->kite.generation[idx] == U32_MAX) {
+ 		ret = mt7915_kite_fault(dev, -EOVERFLOW);
+@@ -470,6 +508,8 @@
+ 	if (!ret) {
+ 		dev->kite.key_generation[idx] = 0;
+ 		dev->kite.live[idx] = true;
++		if (dev->kite.dp_bound)
++			mt7915_dp_sta_attributes(dev, msta);
+ 	}
+ out:
+ 	mutex_unlock(&dev->kite.lock);
+@@ -485,6 +525,9 @@
+ 		return 0;
+ 	if (!wcid || wcid >= KITE_CTL_WCIDS)
+ 		return mt7915_kite_host_result(dev, -ERANGE);
++	ret = mt7915_dp_change_begin(dev, wcid);
++	if (ret)
++		return ret;
+ 	mutex_lock(&dev->kite.lock);
+ 	if (dev->kite.control_only && !dev->kite.live[wcid]) {
+ 		mutex_unlock(&dev->kite.lock);
+@@ -509,11 +552,16 @@
+ 		return 0;
+ 	if (!idx || idx >= KITE_CTL_WCIDS)
+ 		return mt7915_kite_host_result(dev, -ERANGE);
++	ret = mt7915_dp_change_begin(dev, idx);
++	if (ret)
++		return ret;
+ 	mutex_lock(&dev->kite.lock);
+ 	if (dev->kite.control_only && !dev->kite.live[idx]) {
+ 		mutex_unlock(&dev->kite.lock);
+ 		return 0;
+ 	}
++	if (dev->kite.dp_bound)
++		mt7915_dp_sta_attributes(dev, msta);
+ 	args[0] = idx;
+ 	args[1] = dev->kite.generation[idx];
+ 	args[2] = authorized;
+@@ -561,6 +609,24 @@
+ int mt7915_npu_key(struct mt7915_dev *dev, struct mt76_wcid *wcid,
+ 		   struct ieee80211_key_conf *key, bool install)
+ {
++	if (dev->kite.dp_bound && (key->flags & IEEE80211_KEY_FLAG_PAIRWISE) &&
++	    key->cipher != WLAN_CIPHER_SUITE_AES_CMAC) {
++		int ret;
++
++		if (!wcid->idx || wcid->idx >= KDP_WCIDS)
++			return -ERANGE;
++		ret = mt7915_dp_change_begin(dev, wcid->idx);
++		if (ret)
++			return ret;
++		mutex_lock(&dev->kite.lock);
++		ret = mt7915_dp_rx_pause(dev);
++		if (ret)
++			mt7915_kite_fault(dev, ret);
++		else
++			dev->kite.dp_key_pending = wcid->idx;
++		mutex_unlock(&dev->kite.lock);
++		return ret;
++	}
+ 	/* In mirror mode an install is recorded only after the Wi-Fi MCU
+ 	 * accepted it. Data mode retains its pre-change fence. */
+ 	if (dev->kite.control_only && install)
+@@ -800,6 +866,13 @@
+ 	int ret, b;
+ 	if (!dev->kite.tx_bound)
+ 		return 0;
++	if (dev->kite.dp_attached) {
++		dev->kite.dp_changing = true;
++		ret = airoha_kite_detach(rcu_access_pointer(dev->mt76.mmio.ppe_dev));
++		if (ret)
++			return ret;
++		dev->kite.dp_attached = false;
++	}
+ 	mt7915_kite_tx_gate(dev, true);
+ 	mutex_lock(&dev->kite.lock);
+ 	ret = mt7915_kite_command(dev, KITE_CTL_PARK, NULL, 0);
+@@ -839,8 +912,13 @@
+ {
+ 	unsigned long until = jiffies + msecs_to_jiffies(3000);
+ 	int b;
++	unsigned int i;
+ 	if (!dev->kite.tx_bound)
+ 		return 0;
++	if (dev->kite.dp_bound) {
++		WRITE_ONCE(dev->mt76.kite_dp->gate, 1);
++		dma_wmb();
++	}
+ 	mt7915_kite_tx_gate(dev, true);
+ 	do {
+ 		bool empty = true;
+@@ -854,6 +932,16 @@
+ 			if (READ_ONCE(q->queued))
+ 				empty = false;
+ 		}
++		if (dev->kite.dp_bound) {
++			struct kdp_shared *dp = dev->mt76.kite_dp;
++
++			if (READ_ONCE(dp->fault))
++				goto fault;
++			for (i = 0; i < KDP_TOKENS; i++)
++				if (READ_ONCE(dp->token[i].state) == KDP_TOKEN_WIFI ||
++				    READ_ONCE(dp->token[i].state) == KDP_TOKEN_QUARANTINE)
++					empty = false;
++		}
+ 		if (empty && !READ_ONCE(dev->mt76.token_count))
+ 			return 0;
+ 		usleep_range(1000, 2000);
+@@ -870,8 +958,15 @@
+ void mt7915_npu_tx_unfence(struct mt7915_dev *dev)
+ {
+ 	if (dev->kite.tx_bound && !dev->kite.failed &&
+-	    !dev->kite.tx_reset_requested)
++	    !dev->kite.tx_reset_requested) {
+ 		mt7915_kite_tx_gate(dev, false);
++		if (dev->kite.dp_bound && !dev->kite.dp_changing &&
++		    READ_ONCE(dev->mt76.kite_dp->enabled) &&
++		    !READ_ONCE(dev->mt76.kite_dp->fault)) {
++			dma_wmb();
++			WRITE_ONCE(dev->mt76.kite_dp->gate, 0);
++		}
++	}
+ }
+ void mt7915_npu_tx_watchdog(struct mt7915_dev *dev)
+ {
+@@ -884,7 +979,8 @@
+ 	for (b = 0; b < 2; b++) {
+ 		struct mt76_queue *q = dev->kite.txq[b];
+ 		struct kite_tx_shared *s;
+-		u32 progress, submitted, reaped;
++		u32 progress, submitted, reaped, dp_pending = 0;
++		struct kdp_shared *dp = dev->kite.dp_bound ? dev->mt76.kite_dp : NULL;
+ 		if (!q || !q->kite_tx_active)
+ 			continue;
+ 		s = q->kite_tx;
+@@ -892,8 +988,18 @@
+ 		submitted = kite_tx_read(&s->submitted);
+ 		reaped = kite_tx_read(&s->reaped);
+ 		progress = reaped + READ_ONCE(q->kite_wa_freed);
++		if (dp) {
++			progress += READ_ONCE(dp->tx_freed[b]);
++			dp_pending = READ_ONCE(dp->tx_sent[b]) - READ_ONCE(dp->tx_freed[b]);
++			if (report)
++				dev_info(dev->mt76.dev,
++					 "Kite DP band%d: gate=%u fault=%u RX_ppe=%u RX_return=%u RX_free=%u replay=%u stale=%u TX_sent=%u TX_freed=%u TX_drop=%u pending=%u\n",
++					 b, dp->gate, dp->fault, dp->rx_ppe[b], dp->rx_miss[b],
++					 dp->rx_free[b], dp->rx_replay[b], dp->rx_stale[b],
++					 dp->tx_sent[b], dp->tx_freed[b], dp->tx_drop[b], dp_pending);
++		}
+ 		if (progress != q->kite_last_progress ||
+-		    (!READ_ONCE(q->queued) && !READ_ONCE(q->kite_pending))) {
++		    (!READ_ONCE(q->queued) && !READ_ONCE(q->kite_pending) && !dp_pending)) {
+ 			q->kite_progress_at = jiffies;
+ 			q->kite_last_progress = progress;
+ 		}
+@@ -911,7 +1017,7 @@
+ 				READ_ONCE(q->kite_gated),
+ 				kite_tx_read(&s->fault),
+ 				READ_ONCE(dev->mt76.token_count));
+-		if (kite_tx_read(&s->fault) ||
++		if (kite_tx_read(&s->fault) || (dp && READ_ONCE(dp->fault)) ||
+ 		    time_after(jiffies, q->kite_progress_at + 15 * HZ)) {
+ 			mt7915_kite_tx_gate(dev, true);
+ 			dev->kite.tx_reset_requested = true;
+@@ -997,8 +1103,246 @@
+ }
+ DEFINE_SHOW_ATTRIBUTE(mt7915_kite_rx);
+ DEFINE_SHOW_ATTRIBUTE(mt7915_kite_tx);
++static int mt7915_kite_datapath_show(struct seq_file *m, void *unused)
++{
++	struct mt7915_dev *dev = m->private;
++	struct kdp_shared *s = READ_ONCE(dev->mt76.kite_dp);
++	unsigned int b, i, sta = 0, flows = 0, wifi = 0, tdma = 0, quarantine = 0;
++
++	seq_printf(m, "abi=1 negotiated=%u bound=%u attached=%u changing=%u\n",
++		dev->kite.datapath, dev->kite.dp_bound, dev->kite.dp_attached,
++		dev->kite.dp_changing);
++	if (!s)
++		return 0;
++	dma_rmb();
++	seq_printf(m, "magic=%08x bytes=%u session=%u epoch=%u enabled=%u gate=%u fault=%u stopped=%u\n",
++		s->magic, s->bytes, s->session, s->epoch, s->enabled, s->gate, s->fault, s->stopped);
++	for (i = 1; i < KDP_WCIDS; i++) {
++		struct kdp_sta *peer = &s->sta[i];
++
++		sta += !!READ_ONCE(peer->enabled);
++		if (READ_ONCE(peer->generation) && READ_ONCE(dev->kite.live[i]))
++			seq_printf(m, "sta%u generation=%u key_generation=%u cipher=%08x authorized=%u enabled=%u band=%u bss=%u tx_tag=%u tx_blocked=%u host_tids=%02x\n",
++				i, peer->generation, peer->key_generation, peer->cipher,
++				peer->authorized, peer->enabled, peer->band, peer->bss,
++				peer->tx_tag, peer->tx_blocked, peer->host_tids);
++	}
++	for (i = 0; i < KDP_FLOWS; i++)
++		flows += !!READ_ONCE(s->flow[i].version);
++	for (i = 0; i < KDP_TOKENS; i++) {
++		u32 state = READ_ONCE(s->token[i].state);
++
++		wifi += state == KDP_TOKEN_WIFI;
++		tdma += state == KDP_TOKEN_TDMA;
++		quarantine += state == KDP_TOKEN_QUARANTINE;
++	}
++	seq_printf(m, "stations=%u ingress_policies=%u tokens_wifi=%u tokens_tdma=%u tokens_quarantine=%u tx_bad_done=%u\n",
++		sta, flows, wifi, tdma, quarantine, READ_ONCE(s->tx_bad_done));
++	spin_lock_bh(&dev->mt76.rx_lock);
++	seq_printf(m, "host_pn_accept=%llu host_pn_proof=%llu host_pn_reject=%llu\n",
++		dev->mt76.kite_pn_accept, dev->mt76.kite_pn_proof, dev->mt76.kite_pn_reject);
++	spin_unlock_bh(&dev->mt76.rx_lock);
++	for (b = 0; b < 2; b++)
++		seq_printf(m, "band%u rx_ppe=%u rx_bytes=%u rx_host=%u rx_return=%u rx_free_only=%u rx_replay=%u rx_stale=%u rx_unsupported=%u tx_sent=%u tx_bytes=%u tx_freed=%u tx_drop=%u tx_stale=%u tx_full=%u tx_aborted=%u\n",
++			b, s->rx_ppe[b], s->stats[b].rx_bytes, s->rx_host[b], s->rx_miss[b],
++			s->rx_free[b], s->rx_replay[b], s->rx_stale[b], s->rx_unsupported[b],
++			s->tx_sent[b], s->stats[b].tx_bytes, s->tx_freed[b], s->tx_drop[b],
++			s->stats[b].tx_stale, s->stats[b].tx_full, s->tx_aborted[b]);
++	seq_puts(m, "rx_ppe=TDMA submission; rx_free_only=buffer return, not delivery proof; tx_freed=DMA+WA completion, not peer ACK; counters wrap at 32 bits\n");
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mt7915_kite_datapath);
++
+ void mt7915_npu_tx_debugfs(struct mt7915_dev *dev, struct dentry *dir)
+ {
++	debugfs_create_file("kite_datapath", 0400, dir, dev, &mt7915_kite_datapath_fops);
+ 	debugfs_create_file("kite_tx", 0400, dir, dev, &mt7915_kite_tx_fops);
+ 	debugfs_create_file("kite_rx", 0400, dir, dev, &mt7915_kite_rx_fops);
+ }
++
++/* Shared lifetime uses the NPU allocator's existing DMA quarantine. Never
++ * publish capability from merely allocating these pages. DP_BIND must be
++ * acknowledged while workers are parked; rules/admission are separate. */
++int mt7915_npu_dp_bind(struct mt7915_dev *dev)
++{
++	struct kdp_shared *s;
++	u32 args[3];
++	int ret = 0;
++
++	if (!dev->kite.datapath)
++		return 0;
++	mutex_lock(&dev->kite.lock);
++	if (dev->kite.dp_bound || !dev->kite.tx_bound) {
++		ret = -EBUSY;
++		goto out;
++	}
++	s = dev->mt76.kite_dp;
++	if (!s) {
++		s = mt76_npu_alloc_coherent(&dev->mt76, sizeof(*s), &dev->kite.dp_dma);
++		if (!s) {
++			ret = -ENOMEM;
++			goto out;
++		}
++		dev->mt76.kite_dp = s;
++	}
++	if (!kite_tx_range(dev->kite.dp_dma, sizeof(*s)) ||
++	    (dev->kite.dp_dma & 63)) {
++		ret = -ERANGE;
++		goto out;
++	}
++	if (s->magic == KDP_MAGIC && s->session == dev->kite.session) {
++		unsigned int wi;
++
++		if (s->stopped != 2) {
++			ret = -EBUSY;
++			goto out;
++		}
++		memset(s->flow, 0, sizeof(s->flow));
++		memset(s->token, 0, sizeof(s->token));
++		memset(s->rx, 0, sizeof(s->rx));
++		for (wi = 1; wi < KDP_WCIDS; wi++)
++			mt7915_dp_sta_enable(&s->sta[wi]);
++		memset(s, 0, offsetof(struct kdp_shared, sta));
++	} else {
++		memset(s, 0, sizeof(*s));
++	}
++	s->magic = KDP_MAGIC;
++	s->bytes = sizeof(*s);
++	s->session = dev->kite.session;
++	s->epoch = dev->kite.serial + 1;
++	s->gate = 1;
++	dma_wmb();
++	args[0] = dev->kite.dp_dma;
++	args[1] = sizeof(*s);
++	args[2] = s->epoch;
++	dev->kite.dp_bound = true; /* an uncertain reply retains ownership */
++	dev->kite.dp_epoch = s->epoch;
++	ret = mt7915_kite_command(dev, KITE_CTL_DP_BIND, args, 3);
++	if (!ret)
++		dev_info(dev->mt76.dev,
++			 "Kite datapath bound: session=%u epoch=%u bytes=%zu; admission closed\n",
++			 s->session, s->epoch, sizeof(*s));
++out:
++	if (ret)
++		mt7915_kite_fault(dev, ret);
++	mutex_unlock(&dev->kite.lock);
++	if (!ret) {
++		ret = airoha_kite_attach(rcu_access_pointer(dev->mt76.mmio.ppe_dev),
++					dev->mt76.kite_dp, &mt7915_dp_ops, dev);
++		if (!ret) {
++			unsigned int wi;
++
++			dev->kite.dp_attached = true;
++			for (wi = 1; wi < KDP_WCIDS; wi++)
++				mt7915_dp_sta_enable(&dev->mt76.kite_dp->sta[wi]);
++			dev->kite.dp_changing = dev->kite.dp_rx_held = false;
++			dev->kite.dp_key_pending = 0;
++			WRITE_ONCE(dev->mt76.kite_dp->enabled, 1);
++			dma_wmb();
++			WRITE_ONCE(dev->mt76.kite_dp->gate, 0);
++		}
++	}
++	return ret;
++}
++
++/* MT7916 WA returns a 15-bit token. This reserved range is disjoint from
++ * mt76's 8192 skb tokens and 0x7fff sentinel. Consuming the message does not
++ * free the buffer: hart4 additionally requires the actual WFDMA completion.
++ * dp_done_lock serializes WA parsers across MCU queues. */
++bool mt7915_npu_dp_tx_free(struct mt7915_dev *dev, u16 token)
++{
++	struct kdp_shared *s;
++	volatile struct kdp_token *t;
++	u32 seq;
++	unsigned long flags;
++
++	if (token < KDP_TOKEN_BASE || token >= KDP_TOKEN_BASE + KDP_TOKENS)
++		return false;
++	s = READ_ONCE(dev->mt76.kite_dp);
++	if (!s || !READ_ONCE(dev->kite.dp_bound)) {
++		dev->kite.tx_unknown++;
++		return true;
++	}
++	spin_lock_irqsave(&dev->kite.dp_done_lock, flags);
++	t = &s->token[token - KDP_TOKEN_BASE];
++	dma_rmb();
++	seq = READ_ONCE(t->submitted);
++	if (READ_ONCE(s->session) != dev->kite.session ||
++	    READ_ONCE(s->epoch) != dev->kite.dp_epoch ||
++	    READ_ONCE(t->state) != KDP_TOKEN_WIFI || !seq ||
++	    READ_ONCE(t->wa_done) || READ_ONCE(t->wcid) >= KDP_WCIDS ||
++	    READ_ONCE(t->band) > 1) {
++		WRITE_ONCE(s->tx_bad_done, READ_ONCE(s->tx_bad_done) + 1);
++		WRITE_ONCE(s->gate, 1);
++		WRITE_ONCE(s->fault, 9);
++		spin_unlock_irqrestore(&dev->kite.dp_done_lock, flags);
++		return true;
++	}
++	dma_wmb();
++	WRITE_ONCE(t->wa_done, seq);
++	spin_unlock_irqrestore(&dev->kite.dp_done_lock, flags);
++	return true;
++}
++
++int mt7915_npu_key_finish(struct mt7915_dev *dev, struct mt76_wcid *wcid,
++			 struct ieee80211_key_conf *key, bool install, int result)
++{
++	struct kdp_sta *s;
++	struct ieee80211_key_seq seq;
++	u32 args[5];
++	int i, ret = result;
++
++	if (!dev->kite.dp_key_pending)
++		return result;
++	mutex_lock(&dev->kite.lock);
++	if (dev->kite.dp_key_pending != wcid->idx || ret ||
++	    dev->kite.key_generation[wcid->idx] == U32_MAX) {
++		ret = mt7915_kite_fault(dev, ret ?: -ESTALE);
++		goto out;
++	}
++	args[0] = wcid->idx;
++	args[1] = dev->kite.generation[wcid->idx];
++	args[2] = ++dev->kite.key_generation[wcid->idx];
++	args[3] = install ? key->cipher : 0;
++	args[4] = install ? key->keyidx : U32_MAX;
++	ret = mt7915_kite_command(dev, KITE_CTL_KEY, args, 5);
++	if (ret) {
++		mt7915_kite_fault(dev, ret);
++		goto out;
++	}
++	s = &dev->mt76.kite_dp->sta[wcid->idx];
++	/* RX is stopped in hardware and firmware. rx_lock also excludes host
++	 * timeout releases using the old PN object while it is replaced. */
++	spin_lock_bh(&dev->mt76.rx_lock);
++	/* Removing a pairwise key must never turn an authorized protected
++	 * STA into an open fast-path peer between mac80211 state callbacks. */
++	if (!install)
++		s->authorized = 0;
++	s->key_generation = args[2];
++	s->cipher = args[3];
++	s->keyid = args[4];
++	for (i = 0; i < KDP_TIDS; i++) {
++		struct kdp_pn *pn = &s->pn[i];
++		u8 *p = seq.ccmp.pn;
++
++		memset(&seq, 0, sizeof(seq));
++		if (install && key->cipher == WLAN_CIPHER_SUITE_CCMP)
++			ieee80211_get_key_rx_seq(key, i == 16 ? -1 : i, &seq);
++		memset(pn, 0, sizeof(*pn));
++		pn->generation = s->generation;
++		pn->key_generation = s->key_generation;
++		pn->high = (u32)p[0] << 8 | p[1];
++		pn->low = (u32)p[2] << 24 | (u32)p[3] << 16 | (u32)p[4] << 8 | p[5];
++	}
++	if (install)
++		mt7915_dp_sta_enable(s);
++	else
++		s->enabled = 0;
++	spin_unlock_bh(&dev->mt76.rx_lock);
++	ret = mt7915_dp_rx_finish(dev);
++	if (!ret)
++		dev->kite.dp_key_pending = 0;
++out:
++	mutex_unlock(&dev->kite.lock);
++	return ret;
++}
+--- /dev/null
++++ b/mt7915/npu-datapath.inc
+@@ -0,0 +1,341 @@
++/* SPDX-License-Identifier: ISC */
++/* Included after the control command/ACK helpers. Lock order:
++ * mt76.mutex -> flow_offload_mutex -> kite.lock -> rx_lock.
++ * PPE callbacks never acquire mt76.mutex.
++ */
++static int mt7915_dp_pause(void *priv)
++{
++	struct mt7915_dev *dev = priv;
++	struct kdp_shared *s = dev->mt76.kite_dp;
++	int ret;
++
++	mutex_lock(&dev->kite.lock);
++	WRITE_ONCE(s->gate, 1);
++	dma_wmb();
++	ret = mt7915_kite_command(dev, KITE_CTL_PARK, NULL, 0);
++	if (!ret)
++		ret = mt7915_kite_wait_parked(dev);
++	if (ret)
++		mt7915_kite_fault(dev, ret);
++	mutex_unlock(&dev->kite.lock);
++	return ret;
++}
++
++static int mt7915_dp_resume(void *priv)
++{
++	struct mt7915_dev *dev = priv;
++	struct kdp_shared *s = dev->mt76.kite_dp;
++	int ret;
++
++	mutex_lock(&dev->kite.lock);
++	ret = mt7915_kite_command(dev, KITE_CTL_RESUME, NULL, 0);
++	if (!ret && !dev->kite.dp_changing && READ_ONCE(s->enabled)) {
++		dma_wmb();
++		WRITE_ONCE(s->gate, 0);
++	}
++	if (ret)
++		mt7915_kite_fault(dev, ret);
++	mutex_unlock(&dev->kite.lock);
++	return ret;
++}
++
++static const struct airoha_kite_ops mt7915_dp_ops = {
++	.pause = mt7915_dp_pause,
++	.resume = mt7915_dp_resume,
++};
++
++/* Mark the affected STA unavailable before releasing the PPE mutex, so a
++ * simultaneous new TC rule cannot reinstall the just-revoked generations. */
++static int mt7915_dp_change_begin(struct mt7915_dev *dev, u32 wcid)
++{
++	int ret;
++
++	lockdep_assert_held(&dev->mt76.mutex);
++	if (!dev->kite.dp_bound)
++		return 0;
++	if (dev->kite.dp_changing)
++		return -EBUSY;
++	dev->kite.dp_changing = true;
++	WRITE_ONCE(dev->mt76.kite_dp->gate, 1);
++	dma_wmb();
++	ret = airoha_kite_revoke(rcu_access_pointer(dev->mt76.mmio.ppe_dev), wcid);
++	if (!ret)
++		ret = mt7915_npu_tx_fence(dev);
++	if (ret) {
++		WRITE_ONCE(dev->mt76.kite_dp->fault, 11);
++		return ret;
++	}
++	return 0;
++}
++
++/* MT7916 wf_pse_top: true PSE RX/SEC/RXIOC/SFD and HIF queues.
++ * Check both read-only empty bits (including band1 RXIOC) and explicit
++ * queue counts. Do not reuse PLE debugfs offsets as PSE drain evidence. */
++static bool mt7915_dp_rx_queues_empty(struct mt7915_dev *dev)
++{
++	static const u8 pid[] = { 2, 2, 2, 2, 0, 0, 0, 0, 0, 0 };
++	static const u8 qid[] = { 2, 4, 5, 7, 0, 1, 2, 3, 4, 5 };
++	unsigned int i;
++
++	if ((mt76_rr(dev, MT_KITE_PSE_EMPTY) & MT_KITE_PSE_RX_EMPTY) !=
++	    MT_KITE_PSE_RX_EMPTY)
++		return false;
++	for (i = 0; i < ARRAY_SIZE(pid); i++) {
++		mt76_wr(dev, MT_KITE_PSE_QUERY,
++			BIT(31) | ((u32)pid[i] << 10) | ((u32)qid[i] << 24));
++		if (!mt76_poll(dev, MT_KITE_PSE_QUERY, BIT(31), 0, 10) ||
++		    mt76_get_field(dev, MT_KITE_PSE_COUNT, GENMASK(11, 0)))
++			return false;
++	}
++	return true;
++}
++
++static int mt7915_dp_dma_rx_disable(struct mt7915_dev *dev)
++{
++	u32 ofs = dev->hif2 ? MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0) : 0;
++
++	mt76_clear(dev, MT_WFDMA0_GLO_CFG, MT_WFDMA0_GLO_CFG_RX_DMA_EN);
++	if (ofs)
++		mt76_clear(dev, MT_WFDMA0_GLO_CFG + ofs, MT_WFDMA0_GLO_CFG_RX_DMA_EN);
++	if (!mt76_poll(dev, MT_WFDMA0_GLO_CFG,
++			MT_WFDMA0_GLO_CFG_RX_DMA_BUSY, 0, 1000) ||
++	    (ofs && !mt76_poll(dev, MT_WFDMA0_GLO_CFG + ofs,
++			      MT_WFDMA0_GLO_CFG_RX_DMA_BUSY, 0, 1000)))
++		return -ETIMEDOUT;
++	return 0;
++}
++
++static void mt7915_dp_dma_rx_restore(struct mt7915_dev *dev)
++{
++	u32 ofs = dev->hif2 ? MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0) : 0;
++
++	if (dev->kite.dp_rx_cfg[0] & MT_WFDMA0_GLO_CFG_RX_DMA_EN)
++		mt76_set(dev, MT_WFDMA0_GLO_CFG, MT_WFDMA0_GLO_CFG_RX_DMA_EN);
++	if (ofs && (dev->kite.dp_rx_cfg[1] & MT_WFDMA0_GLO_CFG_RX_DMA_EN))
++		mt76_set(dev, MT_WFDMA0_GLO_CFG + ofs, MT_WFDMA0_GLO_CFG_RX_DMA_EN);
++}
++
++static int mt7915_dp_rx_pause(struct mt7915_dev *dev)
++{
++	u32 ofs = dev->hif2 ? MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0) : 0;
++	unsigned long until = jiffies + msecs_to_jiffies(1000);
++	int b, ret;
++
++	lockdep_assert_held(&dev->kite.lock);
++	if (!dev->kite.dp_bound)
++		return 0;
++	for (b = 0; b < 2; b++) {
++		dev->kite.dp_rx_mac[b] = mt76_rr(dev, MT_ARB_SCR(b));
++		mt76_set(dev, MT_ARB_SCR(b), MT_ARB_SCR_RX_DISABLE);
++	}
++	dev->kite.dp_rx_held = true;
++	/* Finish an already receiving HE PPDU (maximum 5.484 ms), then use
++	 * the hardware queue counts to drain the decrypt/translation/HIF path.
++	 * The elapsed delay alone is not the completion condition. */
++	usleep_range(6000, 8000);
++	while (!mt7915_dp_rx_queues_empty(dev)) {
++		if (time_after_eq(jiffies, until))
++			return -ETIMEDOUT;
++		usleep_range(1000, 2000);
++	}
++	dev->kite.dp_rx_cfg[0] = mt76_rr(dev, MT_WFDMA0_GLO_CFG);
++	if (ofs)
++		dev->kite.dp_rx_cfg[1] = mt76_rr(dev, MT_WFDMA0_GLO_CFG + ofs);
++	ret = mt7915_dp_dma_rx_disable(dev);
++	if (!ret)
++		ret = mt7915_kite_command(dev, KITE_CTL_PARK, NULL, 0);
++	if (!ret)
++		ret = mt7915_kite_wait_parked(dev);
++	if (!ret)
++		ret = mt7915_kite_command(dev, KITE_CTL_DP_RX_PURGE, NULL, 0);
++	/* WM/WA command completions share WFDMA. Restore their DMA while
++	 * keeping radio RX and both NPU RX workers stopped during MCU rekey. */
++	if (!ret)
++		mt7915_dp_dma_rx_restore(dev);
++	return ret;
++}
++
++static int mt7915_dp_rx_finish(struct mt7915_dev *dev)
++{
++	struct kdp_shared *s = dev->mt76.kite_dp;
++	int b, ret;
++
++	lockdep_assert_held(&dev->kite.lock);
++	if (!dev->kite.dp_bound || !dev->kite.dp_rx_held)
++		return 0;
++	/* Purge again while radio RX is still disabled: no unread descriptor
++	 * can acquire the replacement key's generation merely by resuming. */
++	ret = mt7915_dp_dma_rx_disable(dev);
++	if (!ret)
++		ret = mt7915_kite_command(dev, KITE_CTL_DP_RX_PURGE, NULL, 0);
++	if (!ret)
++		ret = mt7915_kite_command(dev, KITE_CTL_RESUME, NULL, 0);
++	if (ret)
++		return mt7915_kite_fault(dev, ret);
++	mt7915_dp_dma_rx_restore(dev);
++	for (b = 0; b < 2; b++)
++		if (!(dev->kite.dp_rx_mac[b] & MT_ARB_SCR_RX_DISABLE))
++			mt76_clear(dev, MT_ARB_SCR(b), MT_ARB_SCR_RX_DISABLE);
++	dev->kite.dp_rx_held = dev->kite.dp_changing = false;
++	dma_wmb();
++	if (s->enabled && !s->fault)
++		WRITE_ONCE(s->gate, 0);
++	mt7915_npu_tx_unfence(dev);
++	return 0;
++}
++
++static void mt7915_dp_sta_attributes(struct mt7915_dev *dev,
++				     struct mt7915_sta *msta)
++{
++	struct ieee80211_sta *sta = container_of((void *)msta, struct ieee80211_sta, drv_priv);
++	struct ieee80211_vif *vif = container_of((void *)msta->vif, struct ieee80211_vif, drv_priv);
++	struct kdp_sta *s = &dev->mt76.kite_dp->sta[msta->wcid.idx];
++
++	s->omac = msta->vif->mt76.omac_idx;
++	s->wmm = msta->vif->mt76.wmm_idx;
++	s->wme = sta->wme;
++	/* WTBL aggregation remains available; use standalone Ethernet MSDUs
++	 * until the per-peer A-MSDU size/lifetime contract is explicitly passed. */
++	s->amsdu = 0;
++	s->band = msta->vif->phy->mt76->band_idx;
++	s->bss = msta->vif->mt76.idx;
++	ether_addr_copy(s->addr, sta->addr);
++	/* PS/TWT notifications share this byte; preserve their bits. */
++	spin_lock_bh(&dev->kite.dp_done_lock);
++	s->tx_blocked = (s->tx_blocked & ~4u) |
++		(((vif->offload_flags & IEEE80211_OFFLOAD_CUSTOM_QOS) || msta->vif->npu_acm) ? 4 : 0);
++	spin_unlock_bh(&dev->kite.dp_done_lock);
++	s->reserved_sta = vif->type == NL80211_IFTYPE_AP &&
++		!test_bit(MT_WCID_FLAG_4ADDR, &msta->wcid.flags) &&
++		!sta->tdls && s->omac < 64 && s->wmm < 4;
++}
++
++static void mt7915_dp_sta_enable(struct kdp_sta *s)
++{
++	dma_wmb();
++	WRITE_ONCE(s->enabled, s->tx_tag && s->reserved_sta && s->authorized &&
++		(!s->cipher || (s->cipher == KDP_CIPHER_CCMP && s->key_generation)));
++}
++
++/* MCU PS notifications run in NAPI. Close admission immediately, then
++ * perform sleeping PPE invalidation on a worker. Late in-flight frames are
++ * dropped until mac80211 owns new egress; no unsignalled NPU PS queue. */
++static void mt7915_dp_block_tx(struct mt7915_dev *dev, u16 wi, u8 bit, bool set)
++{
++	unsigned long flags;
++	struct kdp_shared *s = READ_ONCE(dev->mt76.kite_dp);
++
++	if (!s || !READ_ONCE(dev->kite.dp_bound) || !wi || wi >= KDP_WCIDS)
++		return;
++	spin_lock_irqsave(&dev->kite.dp_done_lock, flags);
++	WRITE_ONCE(s->sta[wi].tx_blocked, set ? s->sta[wi].tx_blocked | bit :
++		   s->sta[wi].tx_blocked & ~bit);
++	dma_wmb();
++	spin_unlock_irqrestore(&dev->kite.dp_done_lock, flags);
++}
++
++static void mt7915_dp_ps_work(struct work_struct *work)
++{
++	struct mt7915_dev *dev = container_of(work, struct mt7915_dev, kite.dp_ps_work);
++	unsigned int wi;
++
++	mutex_lock(&dev->mt76.mutex);
++	for (wi = 1; wi < KDP_WCIDS; wi++) {
++		int ret;
++
++		if (!test_and_clear_bit(wi, dev->kite.dp_ps_pending) ||
++		    !dev->kite.dp_attached || dev->kite.failed ||
++		    !READ_ONCE(dev->mt76.kite_dp->sta[wi].tx_blocked))
++			continue;
++		ret = airoha_kite_revoke_tx(rcu_access_pointer(dev->mt76.mmio.ppe_dev), wi);
++		if (ret) {
++			mutex_lock(&dev->kite.lock);
++			mt7915_kite_fault(dev, ret);
++			mutex_unlock(&dev->kite.lock);
++			break;
++		}
++	}
++	mutex_unlock(&dev->mt76.mutex);
++}
++
++void mt7915_npu_dp_work_init(struct mt7915_dev *dev)
++{
++	INIT_WORK(&dev->kite.dp_ps_work, mt7915_dp_ps_work);
++	dev->kite.dp_work_initialized = true;
++}
++
++void mt7915_npu_dp_work_stop(struct mt7915_dev *dev)
++{
++	unsigned long flags;
++
++	if (!dev->kite.dp_work_initialized)
++		return;
++	spin_lock_irqsave(&dev->kite.dp_done_lock, flags);
++	WRITE_ONCE(dev->kite.dp_work_stopping, true);
++	spin_unlock_irqrestore(&dev->kite.dp_done_lock, flags);
++	if (dev->kite.dp_work_initialized)
++		cancel_work_sync(&dev->kite.dp_ps_work);
++}
++
++void mt7915_npu_ps(struct mt7915_dev *dev, u16 wi, bool ps)
++{
++	struct kdp_shared *s;
++	unsigned long flags;
++
++	spin_lock_irqsave(&dev->kite.dp_done_lock, flags);
++	s = READ_ONCE(dev->mt76.kite_dp);
++	if (!s || !wi || wi >= KDP_WCIDS || !READ_ONCE(dev->kite.dp_bound) ||
++	    dev->kite.dp_work_stopping)
++		goto out;
++	WRITE_ONCE(s->sta[wi].tx_blocked, ps ? s->sta[wi].tx_blocked | 1 :
++		   s->sta[wi].tx_blocked & ~1);
++	dma_wmb();
++	if (ps) {
++		set_bit(wi, dev->kite.dp_ps_pending);
++		schedule_work(&dev->kite.dp_ps_work);
++	}
++out:
++	spin_unlock_irqrestore(&dev->kite.dp_done_lock, flags);
++}
++
++int mt7915_npu_twt(struct mt7915_dev *dev, u16 wi, bool active)
++{
++	lockdep_assert_held(&dev->mt76.mutex);
++	if (!dev->kite.dp_attached)
++		return 0;
++	mt7915_dp_block_tx(dev, wi, 2, active);
++	if (active)
++		return airoha_kite_revoke_tx(rcu_access_pointer(dev->mt76.mmio.ppe_dev), wi);
++	return 0;
++}
++
++/* The default DSCP/VLAN classifier is implemented in NPU. Configured maps
++ * and ACM require mac80211 policy; revoke existing egress immediately. */
++int mt7915_npu_qos(struct mt7915_dev *dev, struct mt7915_vif *mvif)
++{
++	struct kdp_shared *s = dev->mt76.kite_dp;
++	unsigned int wi;
++	bool block = mvif->npu_qos_custom || mvif->npu_acm;
++	int ret = 0;
++
++	lockdep_assert_held(&dev->mt76.mutex);
++	if (!dev->kite.dp_attached)
++		return 0;
++	for (wi = 1; wi < KDP_WCIDS; wi++) {
++		if (!s->sta[wi].generation || s->sta[wi].bss != mvif->mt76.idx ||
++		    s->sta[wi].band != mvif->phy->mt76->band_idx)
++			continue;
++		mt7915_dp_block_tx(dev, wi, 4, block);
++		if (block) {
++			ret = airoha_kite_revoke_tx(rcu_access_pointer(dev->mt76.mmio.ppe_dev), wi);
++			if (ret)
++				break;
++		}
++	}
++	if (ret) {
++		mutex_lock(&dev->kite.lock);
++		mt7915_kite_fault(dev, ret);
++		mutex_unlock(&dev->kite.lock);
++	}
++	return ret;
++}
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -134,6 +134,8 @@
+ int mt7915_npu_init(struct mt7915_dev *dev)
+ {
+ 	mutex_init(&dev->kite.lock);
++	spin_lock_init(&dev->kite.dp_done_lock);
++	mt7915_npu_dp_work_init(dev);
+ 	dev->kite.reorder = npu_reorder;
+ 	dev->kite.tx_requested = npu_tx;
+ 	if (npu_control && !npu_enable)
+@@ -233,6 +235,9 @@
+ 	ret = mt7915_npu_tx_bind(dev);
+ 	if (ret)
+ 		return ret;
++	ret = mt7915_npu_dp_bind(dev);
++	if (ret)
++		return ret;
+ 	ret = mt7915_npu_set(dev, 0, WLAN_FUNC_SET_WAIT_PCIE_STATE, 1);
+ 	if (ret)
+ 		goto fail;
+@@ -308,6 +313,9 @@
+ 	ret = mt7915_npu_tx_bind(dev);
+ 	if (ret)
+ 		return ret;
++	ret = mt7915_npu_dp_bind(dev);
++	if (ret)
++		return ret;
+ 	ret = mt7915_npu_set(dev, 0, WLAN_FUNC_SET_WAIT_PCIE_STATE, 1);
+ 	if (!ret && dev->dbdc_support)
+ 		ret = mt7915_npu_set(dev, 1, WLAN_FUNC_SET_WAIT_PCIE_STATE, 1);
+@@ -316,7 +324,7 @@
+ 	if (!ret) {
+ 		dev_info(
+ 			mdev->dev,
+-			"Kite DATA_RECOVER complete: session=%u epoch=%u peers=%s; RX=NPU TX=%s PN=host PPE=off\n",
++			"Kite DATA_RECOVER complete: session=%u epoch=%u peers=%s; RX=NPU TX=%s; see kite_datapath for PN/PPE state\n",
+ 			dev->kite.session, dev->kite.host_epoch,
+ 			reset ? "reset" : "retained",
+ 			dev->kite.tx_enabled ? "NPU-submit/host-WA" : "host");
+--- a/mt7915/regs.h
++++ b/mt7915/regs.h
+@@ -166,6 +166,12 @@
+ 
+ #define MT_PSE_BASE			0x820c8000
+ #define MT_PSE(ofs)			(MT_PSE_BASE + (ofs))
++/* MT7916 PSE uses 0x1b0; PLE's variant offset is unrelated. */
++#define MT_KITE_PSE_EMPTY		MT_PSE(0x0b0)
++#define MT_KITE_PSE_QUERY		MT_PSE(0x1b0)
++#define MT_KITE_PSE_COUNT		MT_PSE(0x1bc)
++#define MT_KITE_PSE_RX_EMPTY		(GENMASK(15, 4) | BIT(18) | BIT(20) | \
++					 BIT(21) | BIT(23) | BIT(27))
+ 
+ /* WF MDP TOP */
+ #define MT_MDP_BASE			0x820cd000
+@@ -595,6 +601,7 @@
+ #define MT_WFDMA0_GLO_CFG		MT_WFDMA0(0x208)
+ #define MT_WFDMA0_GLO_CFG_TX_DMA_EN	BIT(0)
+ #define MT_WFDMA0_GLO_CFG_RX_DMA_EN	BIT(2)
++#define MT_WFDMA0_GLO_CFG_RX_DMA_BUSY	BIT(3)
+ #define MT_WFDMA0_GLO_CFG_OMIT_TX_INFO	BIT(28)
+ #define MT_WFDMA0_GLO_CFG_OMIT_RX_INFO	BIT(27)
+ #define MT_WFDMA0_GLO_CFG_OMIT_RX_INFO_PFET2	BIT(21)
+--- a/npu.c
++++ b/npu.c
+@@ -195,13 +195,19 @@
+ 						len, q->buf_size);
+ 		}
+ 
+-		if (!i)
++		if (!i) {
+ 			/* Kite puts the bounded security/fallback record in word2.
+ 			 * word1 remains the chain/count record consumed above; passing
+ 			 * it to mt7915 would make the host interpret packet-count bits
+ 			 * as PPE metadata and would silently lose the reorder fence. */
+-			*info = is_kite ? (nframes == 1 ? desc[index].data : 0) :
+-					  desc[index].info;
++			info[0] = is_kite ? READ_ONCE(desc[index].data) :
++					   READ_ONCE(desc[index].info);
++			if (is_kite) {
++				const u32 *wire = (const void *)&desc[index];
++				info[1] = READ_ONCE(wire[4]);
++				info[2] = READ_ONCE(wire[5]);
++			}
++		}
+ 		e->buf = NULL;
+ 		index = (index + 1) % q->ndesc;
+ 	}
+@@ -268,9 +274,9 @@
+ 		q->kite_rx_polls++;
+ 	while (done < budget) {
+ 		struct sk_buff *skb;
+-		u32 info = 0;
+-
+-		skb = mt76_npu_dequeue(dev, q, &info);
++		u32 info[3] = {};
++
++		skb = mt76_npu_dequeue(dev, q, info);
+ 		if (!skb)
+ 			break;
+ 		done++;
+@@ -278,7 +284,7 @@
+ 			if (kite)
+ 				q->kite_rx_invalid++;
+ 		} else {
+-			dev->drv->rx_skb(dev, qid, skb, &info);
++			dev->drv->rx_skb(dev, qid, skb, info);
+ 			frames++;
+ 			if (!kite)
+ 				mt76_rx_poll_complete(dev, qid, napi);
+@@ -740,3 +746,51 @@
+ 	mutex_unlock(&dev->mutex);
+ }
+ EXPORT_SYMBOL_GPL(mt76_npu_deinit);
++
++/* Called under dev->rx_lock, which serializes participant 0 across NAPI,
++ * timeout release and both bands. Firmware serializes participant 1 for
++ * each WCID. Coherent DMA memory and full mb() implement the wire lock.
++ */
++bool mt76_kite_check_pn(struct mt76_dev *dev, struct sk_buff *skb, int tid)
++{
++	struct mt76_rx_status *r = (void *)skb->cb;
++	struct kdp_shared *s = READ_ONCE(dev->kite_dp);
++	volatile struct kdp_sta *sta;
++	u32 lo, hi;
++	int ret;
++
++	lockdep_assert_held(&dev->rx_lock);
++	if (!s || !r->wcid || r->wcid->idx >= KDP_WCIDS)
++		return false;
++	sta = &s->sta[r->wcid->idx];
++	if (!READ_ONCE(sta->generation) ||
++	    READ_ONCE(sta->cipher) != KDP_CIPHER_CCMP)
++		return false;
++	/* A stale or untagged skb cannot borrow a newly installed key's PN.
++	 * Proofs are private NPU-ring metadata, never an on-air RXD flag. */
++	if (!r->npu_security || tid < 0 || tid >= KDP_TIDS ||
++	    r->npu_generation != READ_ONCE(sta->generation) ||
++	    r->npu_key_generation != READ_ONCE(sta->key_generation) ||
++	    READ_ONCE(sta->cipher) != KDP_CIPHER_CCMP || READ_ONCE(s->fault))
++		goto reject;
++	if (!r->npu_pn_proof) {
++		hi = (u32)r->iv[0] << 8 | r->iv[1];
++		lo = (u32)r->iv[2] << 24 | (u32)r->iv[3] << 16 |
++		     (u32)r->iv[4] << 8 | r->iv[5];
++		ret = kdp_pn_accept(&sta->pn[tid], 0, r->npu_generation,
++				   r->npu_key_generation, lo, hi);
++		if (ret != 1)
++			goto reject;
++		dev->kite_pn_accept++;
++	} else {
++		dev->kite_pn_proof++;
++	}
++	if (r->flag & RX_FLAG_IV_STRIPPED)
++		r->flag |= RX_FLAG_PN_VALIDATED;
++	return true;
++reject:
++	dev->kite_pn_reject++;
++	r->flag |= RX_FLAG_ONLY_MONITOR;
++	return true;
++}
++EXPORT_SYMBOL_GPL(mt76_kite_check_pn);

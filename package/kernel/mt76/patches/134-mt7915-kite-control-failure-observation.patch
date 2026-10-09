@@ -1,0 +1,32 @@
+Subject: mt7915: expose the control failure latch and report its onset once
+
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -143,9 +143,11 @@
+ 
+ static int mt7915_kite_fault(struct mt7915_dev *dev, int ret)
+ {
++	if (dev->kite.failed)
++		return ret;
+ 	dev->kite.failed = true;
+ 	dev_err(dev->mt76.dev,
+-		"Kite control failed (%d), session %u command %u; %s\n",
++		"Kite control failed (%d), session %u serial %u; %s\n",
+ 		ret, dev->kite.session, dev->kite.serial,
+ 		dev->kite.control_only ?
+ 		"mirror halted; WiFi RX/PN remain host-owned" :
+@@ -931,11 +933,12 @@
+ 	mutex_lock(&dev->mt76.mutex);
+ 	seq_printf(
+ 		seq,
+-		"tx_abi=1 requested=%u enabled=%u bound=%u session=%u tokens=%u unknown_free=%u recovery_pending=%u\n",
++		"tx_abi=1 requested=%u enabled=%u bound=%u session=%u tokens=%u unknown_free=%u recovery_pending=%u control_active=%u control_failed=%u\n",
+ 		dev->kite.tx_requested, dev->kite.tx_enabled,
+ 		dev->kite.tx_bound, dev->kite.session,
+ 		READ_ONCE(dev->mt76.token_count),
+-		READ_ONCE(dev->kite.tx_unknown), dev->kite.tx_reset_requested);
++		READ_ONCE(dev->kite.tx_unknown), dev->kite.tx_reset_requested,
++		dev->kite.active, dev->kite.failed);
+ 	for (b = 0; b < 2; b++) {
+ 		struct mt76_queue *q = dev->kite.txq[b];
+ 		struct kite_tx_shared *s;

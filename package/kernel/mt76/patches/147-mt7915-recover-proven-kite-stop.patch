@@ -1,0 +1,421 @@
+Subject: mt7915: recover Kite after a proven control timeout
+
+A mailbox timeout must stop ordinary updates, but it must not permanently
+strand a live session when a fresh status read still proves ownership.  Drive
+the documented PARK/DATA_STOP/UNBIND/DATA_RECOVER sequence, retain quarantine
+when the proof is unavailable, and clear the recovery latch only after the
+firmware accepts the rearm.
+
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -59,8 +59,9 @@
+ 	}
+ }
+ 
+-static int mt7915_kite_command(struct mt7915_dev *dev, u32 op,
+-			       const u32 *args, unsigned int nargs)
++static int __mt7915_kite_command(struct mt7915_dev *dev, u32 op,
++				 const u32 *args, unsigned int nargs,
++				 bool recovery)
+ {
+ 	struct airoha_npu *npu = mt7915_kite_npu(dev);
+ 	__le32 wire[KITE_CTL_WORDS] = {};
+@@ -68,7 +69,7 @@
+ 	int i, ret;
+ 
+ 	lockdep_assert_held(&dev->kite.lock);
+-	if (!npu || dev->kite.failed)
++	if (!npu || (dev->kite.failed && !recovery))
+ 		return -EIO;
+ 	if (nargs > KITE_CTL_WORDS - 5 || dev->kite.serial == U32_MAX)
+ 		return -EOVERFLOW;
+@@ -96,6 +97,61 @@
+ 	return mt7915_kite_result(s[5]);
+ }
+ 
++static int mt7915_kite_command(struct mt7915_dev *dev, u32 op,
++			       const u32 *args, unsigned int nargs)
++{
++	return __mt7915_kite_command(dev, op, args, nargs, false);
++}
++
++/* A failed transaction blocks ordinary updates.  Recovery may continue only
++ * after a fresh status read proves the same session is still alive and is not
++ * in a firmware FAULTED state.  This is the ownership proof that permits a
++ * PARK/DATA_STOP sequence; it never clears the failure latch by itself. */
++static int mt7915_kite_recovery_command(struct mt7915_dev *dev, u32 op,
++					const u32 *args, unsigned int nargs,
++					u32 *state)
++{
++	u32 s[KITE_CTL_WORDS];
++	int ret;
++
++	ret = mt7915_kite_status(dev, s);
++	if (ret)
++		return ret;
++	if (s[3] != dev->kite.session || s[6] == KITE_CTL_CLOSED ||
++	    s[6] == KITE_CTL_FAULTED || s[6] == KITE_CTL_FAULTED_DRAIN)
++		return -EIO;
++	dev->kite.recovery_status = s[6];
++	dev->kite.recovery_attempts++;
++	if (state)
++		*state = s[6];
++	/* Keep recovery commands inside the firmware's documented state
++	 * machine.  A valid mailbox response is not by itself proof that an
++	 * operation is meaningful in the current lifecycle state. */
++	switch (op) {
++	case KITE_CTL_PARK:
++		if (s[6] == KITE_CTL_STOPPING || s[6] == KITE_CTL_STOPPED)
++			return -EBUSY;
++		break;
++	case KITE_CTL_DATA_STOP:
++		if (s[6] != KITE_CTL_RUNNING && s[6] != KITE_CTL_PARKED)
++			return -EBUSY;
++		break;
++	case KITE_CTL_DATA_RECOVER:
++		if (s[6] != KITE_CTL_STOPPED)
++			return -EBUSY;
++		break;
++	case KITE_CTL_TX_UNBIND:
++	case KITE_CTL_DP_UNBIND:
++	case KITE_CTL_HOST_UNBIND:
++		if (s[6] != KITE_CTL_PARKED && s[6] != KITE_CTL_STOPPED)
++			return -EBUSY;
++		break;
++	default:
++		break;
++	}
++	return __mt7915_kite_command(dev, op, args, nargs, true);
++}
++
+ static int mt7915_kite_wait_parked(struct mt7915_dev *dev)
+ {
+ 	unsigned long deadline = jiffies + msecs_to_jiffies(250);
+@@ -324,13 +380,12 @@
+ 	mutex_lock(&dev->kite.lock);
+ 	if (!dev->kite.host_bound)
+ 		goto out;
+-	if (dev->kite.failed) {
+-		ret = -EIO;
+-		goto out;
+-	}
+-	if (!ret)
++	if (dev->kite.failed)
++		ret = mt7915_kite_recovery_command(dev, KITE_CTL_HOST_UNBIND,
++						   &dev->kite.host_epoch, 1, NULL);
++	else
+ 		ret = mt7915_kite_command(dev, KITE_CTL_HOST_UNBIND,
+-					 &dev->kite.host_epoch, 1);
++					   &dev->kite.host_epoch, 1);
+ 	if (!ret)
+ 		dev->kite.host_bound = false;
+ 	else
+@@ -343,38 +398,64 @@
+ 
+ int mt7915_npu_data_stop(struct mt7915_dev *dev)
+ {
++	u32 state = KITE_CTL_RUNNING;
++	bool stopped = false;
+ 	int ret;
+ 
+ 	if (!dev->kite.active || dev->kite.control_only ||
+ 	    !dev->kite.host_bound)
+ 		return 0;
+ 	mutex_lock(&dev->kite.lock);
+-	if (dev->kite.failed) {
+-		ret = -EIO;
+-		goto out;
+-	}
+ 	dev->kite.stop_discarded = 0;
+ 	dev_info(dev->mt76.dev, "Kite DATA_STOP: session=%u epoch=%u\n",
+ 		 dev->kite.session, dev->kite.host_epoch);
+-	ret = mt7915_kite_command(dev, KITE_CTL_DATA_STOP, NULL, 0);
+-	if (!ret)
+-		ret = mt7915_kite_wait_stopped(dev);
++	{
++		u32 s[KITE_CTL_WORDS];
++		ret = mt7915_kite_status(dev, s);
++		if (!ret) {
++			if (s[3] != dev->kite.session || s[6] == KITE_CTL_CLOSED ||
++			    s[6] == KITE_CTL_FAULTED || s[6] == KITE_CTL_FAULTED_DRAIN)
++				ret = -EIO;
++			else if (s[6] == KITE_CTL_STOPPED)
++				stopped = true;
++			state = s[6];
++		}
++	}
++	if (!ret && !stopped) {
++		if (dev->kite.failed)
++			ret = mt7915_kite_recovery_command(dev, KITE_CTL_DATA_STOP,
++							   NULL, 0, &state);
++		else
++			ret = mt7915_kite_command(dev, KITE_CTL_DATA_STOP, NULL, 0);
++		if (!ret)
++			ret = mt7915_kite_wait_stopped(dev);
++	}
+ 	if (!ret && dev->kite.dp_bound) {
+-		ret = mt7915_kite_command(dev, KITE_CTL_DP_UNBIND, NULL, 0);
++		if (dev->kite.failed)
++			ret = mt7915_kite_recovery_command(dev, KITE_CTL_DP_UNBIND,
++							   NULL, 0, NULL);
++		else
++			ret = mt7915_kite_command(dev, KITE_CTL_DP_UNBIND, NULL, 0);
+ 		if (!ret)
+ 			dev->kite.dp_bound = false;
+ 	}
+-	if (!ret)
+-		ret = mt7915_kite_command(dev, KITE_CTL_HOST_UNBIND,
+-					 &dev->kite.host_epoch, 1);
++	if (!ret) {
++		if (dev->kite.failed)
++			ret = mt7915_kite_recovery_command(dev, KITE_CTL_HOST_UNBIND,
++							   &dev->kite.host_epoch, 1, NULL);
++		else
++			ret = mt7915_kite_command(dev, KITE_CTL_HOST_UNBIND,
++						   &dev->kite.host_epoch, 1);
++	}
+ 	if (!ret) {
+ 		dev->kite.host_bound = false;
++		if (dev->kite.failed)
++			dev->kite.recovery_proven = true;
+ 		dev_info(dev->mt76.dev,
+ 			 "Kite DATA_STOP complete: session=%u discarded_desc=%u; host unbound\n",
+ 			 dev->kite.session, dev->kite.stop_discarded);
+ 	} else
+ 		mt7915_kite_fault(dev, ret);
+-out:
+ 	mutex_unlock(&dev->kite.lock);
+ 	return ret;
+ }
+@@ -386,14 +467,22 @@
+ 	if (!dev->kite.active || dev->kite.control_only)
+ 		return -ENODEV;
+ 	mutex_lock(&dev->kite.lock);
+-	if (dev->kite.failed) {
+-		ret = -EIO;
+-		goto out;
+-	}
+-	ret = mt7915_kite_command(dev, KITE_CTL_DATA_RECOVER, NULL, 0);
++	if (dev->kite.failed)
++		ret = mt7915_kite_recovery_command(dev, KITE_CTL_DATA_RECOVER,
++						   NULL, 0, NULL);
++	else
++		ret = mt7915_kite_command(dev, KITE_CTL_DATA_RECOVER, NULL, 0);
+ 	if (ret)
+ 		mt7915_kite_fault(dev, ret);
+-out:
++	else if (dev->kite.recovery_proven) {
++		/* STOPPED + HOST_UNBIND is the safe boundary at which a failed
++		 * transaction may be converted back into an ordinary session. */
++		dev->kite.failed = false;
++		dev->kite.recovery_proven = false;
++		dev_info(dev->mt76.dev,
++			 "Kite recovery proof accepted: session=%u workers parked; retrying bind\n",
++			 dev->kite.session);
++	}
+ 	mutex_unlock(&dev->kite.lock);
+ 	return ret;
+ }
+@@ -410,19 +499,30 @@
+ 	mutex_unlock(&dev->kite.lock);
+ 	if (ret)
+ 		return ret;
+-	if (status[6] != KITE_CTL_PARKED) {
++	if (status[6] == KITE_CTL_STOPPED) {
+ 		ret = mt7915_npu_control_data_recover(dev);
+ 		if (ret)
+ 			return ret;
++	} else if (status[6] != KITE_CTL_PARKED) {
++		ret = dev->kite.failed ? -EIO : mt7915_npu_control_data_recover(dev);
++		if (ret)
++			return ret;
+ 	}
+ 	mutex_lock(&dev->kite.lock);
+ 	ret = mt7915_kite_wait_parked(dev);
+-	if (!ret)
+-		ret = mt7915_kite_command(dev, KITE_CTL_CLOSE, NULL, 0);
++	if (!ret) {
++		if (dev->kite.failed)
++			ret = mt7915_kite_recovery_command(dev, KITE_CTL_CLOSE,
++							   NULL, 0, NULL);
++		else
++			ret = mt7915_kite_command(dev, KITE_CTL_CLOSE, NULL, 0);
++	}
+ 	if (ret)
+ 		mt7915_kite_fault(dev, ret);
+ 	else {
+ 		dev->kite.active = false;
++		dev->kite.failed = false;
++		dev->kite.recovery_proven = false;
+ 		memset(dev->kite.live, 0, sizeof(dev->kite.live));
+ 		dev_info(dev->mt76.dev, "Kite data session %u closed; peers cleared\n",
+ 			 dev->kite.session);
+@@ -867,6 +967,8 @@
+ }
+ int mt7915_npu_tx_halt(struct mt7915_dev *dev)
+ {
++	u32 s[KITE_CTL_WORDS];
++	bool stopped = false;
+ 	int ret, b;
+ 	if (!dev->kite.tx_bound)
+ 		return 0;
+@@ -879,11 +981,34 @@
+ 	}
+ 	mt7915_kite_tx_gate(dev, true);
+ 	mutex_lock(&dev->kite.lock);
+-	ret = mt7915_kite_command(dev, KITE_CTL_PARK, NULL, 0);
+-	if (!ret)
+-		ret = mt7915_kite_wait_parked(dev);
+-	if (!ret)
+-		ret = mt7915_kite_command(dev, KITE_CTL_TX_UNBIND, NULL, 0);
++	ret = mt7915_kite_status(dev, s);
++	if (!ret && (s[3] != dev->kite.session ||
++		     s[6] == KITE_CTL_CLOSED ||
++		     s[6] == KITE_CTL_FAULTED ||
++		     s[6] == KITE_CTL_FAULTED_DRAIN))
++		ret = -EIO;
++	if (!ret) {
++		stopped = s[6] == KITE_CTL_STOPPED;
++		if (s[6] == KITE_CTL_STOPPING) {
++			ret = mt7915_kite_wait_stopped(dev);
++			stopped = !ret;
++		} else if (!stopped && s[6] != KITE_CTL_PARKED) {
++			if (dev->kite.failed)
++				ret = mt7915_kite_recovery_command(dev, KITE_CTL_PARK,
++								   NULL, 0, NULL);
++			else
++				ret = mt7915_kite_command(dev, KITE_CTL_PARK, NULL, 0);
++			if (!ret)
++				ret = mt7915_kite_wait_parked(dev);
++		}
++	}
++	if (!ret) {
++		if (dev->kite.failed)
++			ret = mt7915_kite_recovery_command(dev, KITE_CTL_TX_UNBIND,
++							   NULL, 0, NULL);
++		else
++			ret = mt7915_kite_command(dev, KITE_CTL_TX_UNBIND, NULL, 0);
++	}
+ 	if (!ret) {
+ 		dev->kite.tx_bound = false;
+ 		for (b = 0; b < 2; b++) {
+@@ -899,8 +1024,16 @@
+ 				kite_tx_read(&q->kite_tx->cancelled),
+ 				READ_ONCE(q->kite_wa_freed), q->queued);
+ 		}
+-		/* RX workers must run to complete the subsequent DATA_STOP drain. */
+-		ret = mt7915_kite_command(dev, KITE_CTL_RESUME, NULL, 0);
++		/* RX workers must run to complete the subsequent DATA_STOP drain.
++		 * A session already in STOPPED has completed that drain and must
++		 * remain stopped for DATA_RECOVER. */
++		if (!stopped) {
++			if (dev->kite.failed)
++				ret = mt7915_kite_recovery_command(dev, KITE_CTL_RESUME,
++								   NULL, 0, NULL);
++			else
++				ret = mt7915_kite_command(dev, KITE_CTL_RESUME, NULL, 0);
++		}
+ 	}
+ 	if (ret)
+ 		mt7915_kite_fault(dev, ret);
+--- a/mt7915/dma.c
++++ b/mt7915/dma.c
+@@ -665,7 +665,8 @@
+ 	int ret;
+ 
+ 	if (dev->mt76.npu_quarantine)
+-		return -EIO;
++		dev_info(dev->mt76.dev,
++			 "retrying Kite DMA stop after a previous unproven attempt\n");
+ 	mt76_npu_disable_irqs(&dev->mt76);
+ 	ret = mt7915_npu_tx_halt(dev);
+ 	if (!ret)
+@@ -677,6 +678,10 @@
+ 			dev->mt76.npu_quarantine = true;
+ 		dev_err(dev->mt76.dev,
+ 			"DMA stop failed: %d; TX tokens and RX buffers retained\n", ret);
++	} else {
++		/* DATA_STOP/host-unbind is the ownership proof that permits a
++		 * subsequent ring reset. */
++		dev->mt76.npu_quarantine = false;
+ 	}
+ 	return ret;
+ }
+@@ -754,7 +759,10 @@
+ 		mt76_rmw(dev, MT_WFDMA0_EXT0_CFG, MT_WFDMA0_EXT0_RXWB_KEEP,
+ 			 MT_WFDMA0_EXT0_RXWB_KEEP);
+ 
+-	return mt7915_dma_enable(dev, !force);
++	ret = mt7915_dma_enable(dev, !force);
++	if (!ret)
++		dev->mt76.npu_quarantine = false;
++	return ret;
+ }
+ 
+ int mt7915_dma_cleanup(struct mt7915_dev *dev)
+@@ -773,5 +781,6 @@
+ 
+ 	mt76_connac2_tx_token_put(&dev->mt76);
+ 	mt76_dma_cleanup(&dev->mt76);
++	dev->mt76.npu_quarantine = false;
+ 	return 0;
+ }
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1493,9 +1493,15 @@
+ 
+ 	ret = mt7915_dma_reset(dev, true);
+ 	if (ret) {
+-		dev->recovery.failed = true;
++		if (dev->mt76.npu_quarantine)
++			dev->recovery.failed = true;
++		else
++			dev_info(dev->mt76.dev,
++				 "Kite DMA reset failed transiently: %d; recovery remains retryable\n",
++				 ret);
+ 		return ret;
+ 	}
++	dev->recovery.failed = false;
+ 	mt7915_dma_napi_enable(dev);
+ 	clear_bit(MT76_MCU_RESET, &dev->mphy.state);
+ 	clear_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
+@@ -1628,6 +1634,7 @@
+ 	i = mt76_wcid_alloc(dev->mt76.wcid_mask, MT7915_WTBL_STA);
+ 	dev->mt76.global_wcid.idx = i;
+ 	dev->recovery.hw_full_reset = false;
++	dev->recovery.failed = false;
+ 
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+@@ -1764,13 +1771,17 @@
+ 					     &phy2->mt76->mac_work,
+ 					     MT7915_WATCHDOG_TIME);
+ 	dev_info(dev->mt76.dev, "chip partial reset complete\n");
++	dev->recovery.failed = false;
+ 	return;
+ 
+ failed:
+-	dev->recovery.failed = true;
+ 	mt7915_dma_quiesce(dev);
++	if (dev->mt76.npu_quarantine)
++		dev->recovery.failed = true;
+ 	dev_err(dev->mt76.dev,
+-		"chip partial reset failed: %d; queues held, reboot required\n", ret);
++		"chip partial reset failed: %d; %s\n", ret,
++		dev->recovery.failed ? "queues held, reboot required" :
++		"NPU stop proof remains retryable");
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+ }
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -271,6 +271,9 @@
+ 		u32 generation[MT7916_WTBL_SIZE];
+ 		u32 key_generation[MT7916_WTBL_SIZE];
+ 		bool active, failed, control_only, host_bound;
++		bool recovery_proven;
++		u32 recovery_status;
++		u32 recovery_attempts;
+ 		bool reorder, datapath, dp_bound;
+ 		dma_addr_t dp_dma;
+ 		u32 dp_epoch;

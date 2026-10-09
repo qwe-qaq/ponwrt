@@ -1,0 +1,339 @@
+Subject: [PATCH] r64 kernel downlink performance and resume correctness
+
+Revalidate native authority; preserve stopped unchanged soft rules, not old
+FOEs. Keep single hart, exact policy, PN and DMA/WA ownership contracts.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -769,6 +769,9 @@
+ 	/* A live cookie may be replaced repeatedly while its route is refreshed. */
+ 	atomic64_t kite_replace_reuse, kite_replace_gc;
+  atomic64_t kite_ps_reauth_requested, kite_ps_reauth_ok, kite_ps_reauth_missing;
++ atomic64_t kite_l2_reindexed, kite_soft_preserved, kite_scan_stopped;
++ atomic64_t kite_learn_reason[8];
++ u32 kite_learn_last_slot, kite_learn_last_reason;
+  atomic64_t kite_reason[16];
+  unsigned long kite_absent_cookie[64];
+  u32 kite_absent_next, kite_last_reason;
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -457,11 +457,6 @@
+ 		 * downlink rule back to mac80211 while TX is blocked. */
+ 		if (!airoha_kite_endpoint(ppe, &out))
+ 			return airoha_kite_reason(ppe, 6, -EAGAIN);
+-		if (READ_ONCE(s->sta[out.airoha_npu.wcid].tx_blocked) ||
+-      READ_ONCE(s->r60.degraded[out.airoha_npu.band])) {
+-			atomic64_inc(&ppe->kite_egress_blocked);
+-			return airoha_kite_reason(ppe, 7, -EAGAIN);
+-		}
+ 		e->kite_out_wcid = out.airoha_npu.wcid;
+ 		e->kite_out_gen = out.airoha_npu.generation;
+ 		e->kite_out_key = out.airoha_npu.key_generation;
+@@ -740,15 +735,14 @@
+ 		        (const u8 *)b + sizeof(b->ib1), sizeof(*a) - sizeof(a->ib1));
+ }
+ 
+-static bool airoha_kite_flow_reusable(struct airoha_ppe *ppe,
++static bool airoha_kite_flow_same(struct airoha_ppe *ppe,
+ 	struct airoha_flow_table_entry *old, struct airoha_flow_table_entry *new)
+ {
+ 	struct kdp_shared *s = READ_ONCE(ppe->kite_dp);
+ 
+ 	/* Only optimize Kite. Ordinary Ethernet/PON retain their native path. */
+ 	if (!old || !s || (!new->kite_in_wcid && !new->kite_out_wcid) ||
+-	    old->kite_retired || !airoha_kite_flow_live(ppe, old) ||
+-     (old->kite_suspended && s->r60.ps[old->kite_out_wcid].active) ||
++	    old->kite_retired || !old->kite_published ||
+ 	    !old->kite_rule_len || old->kite_rule_len != new->kite_rule_len ||
+ 	    memcmp(old->kite_rule_bytes, new->kite_rule_bytes, old->kite_rule_len) ||
+ 	    old->egress_dev != new->egress_dev ||
+@@ -770,6 +764,31 @@
+ 	     !READ_ONCE(s->flow[old->kite_capture_policy].version)))
+ 		return false;
+ 	return true;
++}
++
++/* A fresh rule is always fully built before either reuse decision. The
++ * soft case preserves only an already stopped owner under the SAME native
++ * rule/refresh cell; it never binds hardware while PS/WAKE is asserted. */
++static bool airoha_kite_flow_reusable(struct airoha_ppe *ppe,
++ struct airoha_flow_table_entry *old, struct airoha_flow_table_entry *new)
++{
++ return airoha_kite_flow_same(ppe, old, new) &&
++        airoha_kite_flow_live(ppe, old) &&
++        (!old->kite_suspended || !ppe->kite_dp->r60.ps[old->kite_out_wcid].active);
++}
++static bool airoha_kite_soft_reusable(struct airoha_ppe *ppe,
++ struct airoha_flow_table_entry *old, struct airoha_flow_table_entry *new)
++{
++ struct kdp_shared *s = READ_ONCE(ppe->kite_dp);
++ u32 wi = old ? old->kite_out_wcid : 0, blocked;
++ if (!wi || wi >= KDP_WCIDS || !s || !s->enabled || s->gate || kdp_failed(s) ||
++     !old->kite_suspended || !airoha_kite_flow_same(ppe, old, new)) return false;
++ blocked = READ_ONCE(s->sta[wi].tx_blocked);
++ return blocked && !(blocked & ~KDP_TX_BLOCK_SOFTWARE) &&
++        !s->r60.degraded[s->sta[wi].band] && s->sta[wi].enabled &&
++        s->sta[wi].authorized && s->session == old->kite_session &&
++        s->sta[wi].generation == old->kite_out_gen &&
++        s->sta[wi].key_generation == old->kite_out_key;
+ }
+ 
+ static void airoha_kite_capture_key(struct kdp_flow *dst, const struct kdp_flow *src)
+@@ -1027,8 +1046,11 @@
+ 
+ 	mutex_lock(&flow_offload_mutex);
+ 	if (!ppe->kite_dp || kdp_failed(ppe->kite_dp) ||
+-	    READ_ONCE(ppe->kite_dp->gate) || list_empty(&ppe->kite_flows))
+-		goto out;
++	    READ_ONCE(ppe->kite_dp->gate) || list_empty(&ppe->kite_flows)) {
++  atomic_set(&ppe->kite_scan_budget, 0);
++  atomic64_inc(&ppe->kite_scan_stopped);
++  goto out;
++ }
+ 	/* Read actual physical SRAM/DRAM entries. The software tuple hash only
+ 	 * indexes candidates after a hardware slot has been observed. */
+ 	for (n = 0; n < 64 && atomic_dec_if_positive(&ppe->kite_scan_budget) >= 0; n++) {
+@@ -1104,14 +1126,13 @@
+ void airoha_kite_learn_hint(struct airoha_ppe_dev *dev)
+ {
+ 	struct airoha_ppe *ppe = dev->priv;
+-	unsigned long flags;
++	unsigned long flags, delay = msecs_to_jiffies(20);
+ 	bool arm = false;
+ 
+ 	/* A miss restarts one bounded pass; no MMIO scanning in NAPI. */
+ 	spin_lock_irqsave(&ppe->kite_scan_lock, flags);
+ 	if (READ_ONCE(ppe->kite_dp) &&
+-	    atomic_read(&ppe->kite_scan_budget) <= 0 &&
+-	    !time_before(jiffies, READ_ONCE(ppe->kite_scan_next))) {
++	    atomic_read(&ppe->kite_scan_budget) <= 0) {
+ 		u32 total;
+ 
+ 		/* The regular skb path learns a fresh flow directly.  This pass is
+@@ -1119,14 +1140,18 @@
+ 		 * coalesce the many publication hints generated by a traffic burst. */
+ 		total = airoha_ppe_get_total_num_entries(ppe);
+ 		if (total) {
+-			WRITE_ONCE(ppe->kite_scan_next, jiffies + HZ);
++   if (time_before(jiffies, READ_ONCE(ppe->kite_scan_next)))
++    delay = max(delay, READ_ONCE(ppe->kite_scan_next) - jiffies);
++   WRITE_ONCE(ppe->kite_scan_next, jiffies + delay + HZ);
+ 			atomic_set(&ppe->kite_scan_budget, min_t(u32, total, 256));
+ 			arm = true;
+ 		}
+ 	}
+-	spin_unlock_irqrestore(&ppe->kite_scan_lock, flags);
+-	if (arm)
+-		schedule_delayed_work(&ppe->kite_learn, msecs_to_jiffies(20));
++ if (READ_ONCE(ppe->kite_dp) && atomic_read(&ppe->kite_scan_budget) > 0)
++  arm = true;
++ spin_unlock_irqrestore(&ppe->kite_scan_lock, flags);
++ if (arm)
++  schedule_delayed_work(&ppe->kite_learn, delay);
+ }
+ EXPORT_SYMBOL_GPL(airoha_kite_learn_hint);
+ 
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1076,6 +1076,20 @@
+ 	}
+ }
+ 
++/* Invalidated children retain accounting ownership across a partial stop.
++ * Reuse a proved INVALID child on relearn instead of adding one on every
++ * sleep/wake. Never overwrite the hash of a still-live child. */
++static struct airoha_flow_table_entry *
++airoha_ppe_foe_find_subflow(struct airoha_flow_table_entry *e, u32 hash)
++{
++ struct airoha_flow_table_entry *f, *spare = NULL;
++ hlist_for_each_entry(f, &e->l2_flows, l2_subflow_node) {
++  if (f->hash == hash) return f;
++  if (f->hash == 0xffff && !spare) spare = f;
++ }
++ return spare;
++}
++
+ static int
+ airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
+ 				    struct airoha_flow_table_entry *e,
+@@ -1091,16 +1105,15 @@
+ 	if (!hwe_p)
+ 		return -EINVAL;
+ 
+-	hlist_for_each_entry(f, &e->l2_flows, l2_subflow_node)
+-		if (f->hash == hash)
+-			goto prepare;
+-	f = kzalloc(sizeof(*f), GFP_ATOMIC);
++ f = airoha_ppe_foe_find_subflow(e, hash);
++ if (f) goto prepare;
++ f = kzalloc(sizeof(*f), GFP_ATOMIC);
+ 	if (!f)
+ 		return -ENOMEM;
+ 
+ 	fresh = true;
+ 	f->type = FLOW_TYPE_L2_SUBFLOW;
+-	f->hash = hash;
++	f->hash = 0xffff;
+ 
+ 	prepare:
+ 	memcpy(&hwe, hwe_p, sizeof(*hwe_p));
+@@ -1141,8 +1154,9 @@
+ 			kfree(f);
+ 		return err;
+ 	}
+-	airoha_kite_note_bind(ppe,e);
+-	if (fresh)
++ f->hash = hash; /* publish only after successful BIND readback */
++ airoha_kite_note_bind(ppe,e);
++ if (fresh)
+ 		hlist_add_head(&f->l2_subflow_node, &e->l2_flows);
+ 
+ 	return 0;
+@@ -1157,17 +1171,16 @@
+ 	struct airoha_foe_entry *hwe;
+ 	bool commit_done = false;
+ 	struct hlist_node *n;
+-	u32 index, state;
++	u32 index, state, why = 0;
+ 
+ 	spin_lock_bh(&ppe_lock);
+ 
+ 	hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
+-	if (!hwe)
+-		goto unlock;
++	if (!hwe) { why = 1; goto unlock; }
+ 
+ 	state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe->ib1);
+-	if (state == AIROHA_FOE_STATE_BIND)
+-		goto unlock;
++	if (state == AIROHA_FOE_STATE_BIND) { why = 2; goto unlock; }
++ if (state != AIROHA_FOE_STATE_UNBIND) { why = 3; goto unlock; }
+ 
+ 	/* Native L2B uses its learned key, not an IPv4/L4 software hash bucket. */
+ 	if (airoha_is_7581(ppe->eth) &&
+@@ -1190,8 +1203,9 @@
+ 		    (e->kite_suspended || !airoha_kite_flow_live(ppe, e)))
+ 			continue;
+ 
+-		if (airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan))
+-			goto unlock;
++		if (airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan)) {
++   why = 7; goto unlock;
++  }
+ 		commit_done = true;
+ 		e->hash = hash;
+ 		airoha_kite_note_bind(ppe,e);
+@@ -1204,9 +1218,14 @@
+ 	airoha_ppe_foe_set_bridge_addrs(&br, eth_hdr(skb));
+ 	e = rhashtable_lookup_fast(&ppe->l2_flows, &br,
+ 				   airoha_l2_flow_table_params);
+-	if (e && !e->kite_suspended && airoha_kite_flow_live(ppe, e))
+-		airoha_ppe_foe_commit_subflow_entry(ppe, e, hash, rx_wlan);
++ if (!e) why = 4;
++ else if (e->kite_suspended) why = 5;
++ else if (!airoha_kite_flow_live(ppe, e)) why = 6;
++ else if (airoha_ppe_foe_commit_subflow_entry(ppe, e, hash, rx_wlan)) why = 7;
+ unlock:
++ atomic64_inc(&ppe->kite_learn_reason[why]);
++ WRITE_ONCE(ppe->kite_learn_last_slot, hash);
++ WRITE_ONCE(ppe->kite_learn_last_reason, why);
+ 	spin_unlock_bh(&ppe_lock);
+ }
+ 
+@@ -1219,8 +1238,8 @@
+ 	e->type = FLOW_TYPE_L2;
+ 	prev = rhashtable_lookup_get_insert_fast(&ppe->l2_flows, &e->l2_node,
+ 						 airoha_l2_flow_table_params);
+-	if (!prev)
+-		return 0;
++ if (!prev || prev == e)
++  return 0;
+ 
+ 	if (IS_ERR(prev))
+ 		return PTR_ERR(prev);
+@@ -1634,9 +1653,17 @@
+ 	if (err)
+ 		goto free_entry;
+ 
+-	airoha_kite_rule_snapshot(e, rule);
+-	*candidate = e;
+-	return 0;
++ airoha_kite_rule_snapshot(e, rule);
++ *candidate = e;
++ /* Complete rule/tuple/path validation first. PS is a temporary admission
++  * failure, not evidence that an unchanged suspended rule was revoked. */
++ if (e->kite_out_wcid && eth->ppe->kite_dp &&
++     (READ_ONCE(eth->ppe->kite_dp->sta[e->kite_out_wcid].tx_blocked) ||
++      READ_ONCE(eth->ppe->kite_dp->r60.degraded[eth->ppe->kite_dp->sta[e->kite_out_wcid].band]))) {
++  atomic64_inc(&eth->ppe->kite_egress_blocked);
++  return airoha_kite_reason(eth->ppe, 7, -EAGAIN);
++ }
++ return 0;
+ free_entry:
+ 	airoha_ppe_flow_free(e);
+ 	return err;
+@@ -1661,15 +1688,34 @@
+    dma_wmb(); WRITE_ONCE(s->r63.first_rule_request[wi],request);
+   }
+  }
+-	old = rhashtable_lookup(&eth->flow_table, &f->cookie, airoha_flow_table_params);
++ old = rhashtable_lookup(&eth->flow_table, &f->cookie, airoha_flow_table_params);
++ if (err == -EAGAIN && e && old && old->kite_refresh == f->hw_refresh &&
++     airoha_kite_soft_reusable(eth->ppe, old, e)) {
++  atomic64_inc(&eth->ppe->kite_soft_preserved);
++  airoha_ppe_flow_free(e);
++  return err; /* native owner retries; hardware remains stopped */
++ }
+ 	if (!err && old && old->kite_refresh == f->hw_refresh &&
+      airoha_kite_flow_reusable(eth->ppe, old, e)) {
+   if (old->kite_suspended) {
++   /* One MAC pair can have multiple exact owners. The indexed one may
++    * still be suspended/idle after this active cookie resumes. Replace
++    * the representative under the same lock as native skb learning. */
++   if (old->type == FLOW_TYPE_L2) {
++    spin_lock_bh(&ppe_lock);
++    err = airoha_ppe_foe_l2_flow_commit_entry(eth->ppe, old);
++    spin_unlock_bh(&ppe_lock);
++    if (err) { airoha_ppe_flow_free(e); return err; }
++    atomic64_inc(&eth->ppe->kite_l2_reindexed);
++   }
+    /* A fresh native REPLACE proved the complete unchanged rule and current
+     * endpoint. Old hardware slots stay INVALID: learn only real UNBINDs. */
+    if (old->kite_soft_slot < KDP_FLOWS)
+     WRITE_ONCE(eth->ppe->kite_dp->r60.soft[old->kite_soft_slot].version, 0);
+-   dma_wmb(); old->kite_suspended = false;
++   dma_wmb();
++   spin_lock_bh(&ppe_lock);
++   old->kite_suspended = false;
++   spin_unlock_bh(&ppe_lock);
+    atomic64_inc(&eth->ppe->kite_ps_reauth_ok);
+   }
+ 		atomic64_inc(&eth->ppe->kite_replace_reuse);
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -240,6 +240,13 @@
+ 		atomic64_read(&ppe->kite_replace_gc),
+ 		atomic64_read(&ppe->kite_ingress_published),
+ 		atomic64_read(&ppe->kite_downlink_published));
++ seq_printf(m,"r64_learn reindexed=%lld soft_preserved=%lld scan_stopped=%lld budget=%d last_slot=%u last_reason=%u\n",
++  atomic64_read(&ppe->kite_l2_reindexed),atomic64_read(&ppe->kite_soft_preserved),
++  atomic64_read(&ppe->kite_scan_stopped),atomic_read(&ppe->kite_scan_budget),
++  READ_ONCE(ppe->kite_learn_last_slot),READ_ONCE(ppe->kite_learn_last_reason));
++ { static const char *const names[]={"bound","read_fail","already_bound","not_unbind","l2_absent","l2_suspended","l2_not_live","commit_fail"};
++   for (unsigned int i=0;i<ARRAY_SIZE(names);i++)
++    seq_printf(m,"r64_learn_%s=%lld\n",names[i],atomic64_read(&ppe->kite_learn_reason[i])); }
+  seq_printf(m,"r63_reauth requested=%lld accepted=%lld no_owner=%lld last_reason=%u\n",
+   atomic64_read(&ppe->kite_ps_reauth_requested),atomic64_read(&ppe->kite_ps_reauth_ok),
+   atomic64_read(&ppe->kite_ps_reauth_missing),ppe->kite_last_reason);
+@@ -255,9 +262,9 @@
+ 		struct airoha_flow_table_entry *flow;
+ 
+ 		list_for_each_entry(flow, &ppe->kite_flows, kite_node)
+-			seq_printf(m, "kite_flow hash=%u policy=%u in_wcid=%u out_wcid=%u type=%u\n",
++			seq_printf(m, "kite_flow hash=%u policy=%u in_wcid=%u out_wcid=%u type=%u suspended=%u cookie=%lu\n",
+ 				flow->hash, flow->kite_policy, flow->kite_in_wcid,
+-				flow->kite_out_wcid, flow->type);
++				flow->kite_out_wcid, flow->type, flow->kite_suspended, flow->cookie);
+ 	}
+ 	mutex_unlock(&flow_offload_mutex);
+ 	seq_printf(m, "setup_attempts=%lld\n", atomic64_read(&ppe->setup_attempts));

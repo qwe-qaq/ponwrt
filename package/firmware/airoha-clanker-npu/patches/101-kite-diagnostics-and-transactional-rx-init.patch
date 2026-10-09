@@ -1,0 +1,744 @@
+Subject: Export read-only diagnostics; make RX initialization failure-atomic and bound BA/SRAM accesses.
+
+Local integration for fixed Clanker 735529c and ponwrt 6.18.52.
+
+--- a/kite_rxd.h
++++ b/kite_rxd.h
+@@ -80,4 +80,24 @@
+ {
+ 	return wcid > 0 && wcid <= (dbdc ? 255u : 150u);
+ }
++
++/* Legacy BA storage has two 150-WCID banks. This helper never dereferences
++ * an unallocated bank, even if the computed offset is nonzero. */
++static inline u32 kite_ba_address(u32 band, u32 wcid, u32 tid, u32 dbdc,
++				u32 bank_a, u32 bank_b)
++{
++	u32 base, index;
++
++	if (band > 1 || tid > 7 || !wcid || wcid > (dbdc ? 300u : 150u))
++		return 0;
++	if (dbdc) {
++		base = wcid > 150 ? bank_a : bank_b;
++		index = wcid > 150 ? wcid - 151 : wcid - 1;
++	} else {
++		base = band ? bank_b : bank_a;
++		index = wcid - 1;
++	}
++	return base ? base + (index * 8 + tid) * 28 : 0;
++}
++
+ #endif
+--- a/npu_hostadpt.c
++++ b/npu_hostadpt.c
+@@ -31,9 +31,10 @@
+ 
+ int hostadpt_init(void)
+ {
++	npu_dbg_loop(NDBG_TAG('W', 'H', 'O', 'S'));
+ #ifdef HAS_NPU_WIFI_TX
+ 	while (REG32(HOSTADPT_IN_BASE_PTR(1)) == 0)
+-		;
++		npu_dbg_poll();
+ 	hostadpt_in_base[1] = (REG32(HOSTADPT_IN_BASE_PTR(1)) & 0x3FFFFFFF) |
+ 			      NPU_ADDR_MASK;
+ 	hostadpt_in_base[0] = (REG32(HOSTADPT_IN_BASE_PTR(0)) & 0x3FFFFFFF) |
+@@ -43,7 +44,7 @@
+ #endif
+ 	/* wait for host to configure RX DMA pointer */
+ 	while (REG32(HOSTADPT_RX_DMA_PTR) == 0)
+-		;
++		npu_dbg_poll();
+ 
+ 	hostadpt_tx_ring_base = (REG32(HOSTADPT_TX_DMA_PTR) & 0x3FFFFFFF) | 0x40000000;
+ 	hostadpt_rx_ring_base = (REG32(HOSTADPT_RX_DMA_PTR) & 0x3FFFFFFF) | 0x40000000;
+@@ -106,7 +107,7 @@
+ 		(*(u32 *)(counter_base_tri + 0x38))++;
+ }
+ 
+-int host_ring_submit(u32 buf_addr, u16 pkt_len, u32 band,
++static int host_ring_submit_impl(u32 buf_addr, u16 pkt_len, u32 band,
+ 			    u16 wcid, u8 amsdu, u8 fwd_type,
+ 			    u16 orig_len, u8 is_last, u32 info)
+ {
+@@ -200,10 +201,21 @@
+ 	}
+ }
+ 
++int host_ring_submit(u32 buf_addr, u16 pkt_len, u32 band,
++			    u16 wcid, u8 amsdu, u8 fwd_type,
++			    u16 orig_len, u8 is_last, u32 info)
++{
++	int ret = host_ring_submit_impl(buf_addr, pkt_len, band, wcid, amsdu, fwd_type, orig_len, is_last, info);
++
++	if (band < 2)
++		NDBG_CNT((ret ? NC_KITE_HOST_FAIL0 : NC_KITE_HOST0) + band);
++	return ret;
++}
++
+ #ifdef WIFI_KITE
+ /* Core 3 is the only producer. Claim/copy the entire chain before publishing
+  * any DONE bit, then publish the head last. Congestion drops a whole frame. */
+-int host_ring_submit_kite_chain(const u32 *nodes, u32 n, u32 band)
++static int host_ring_submit_kite_chain_impl(const u32 *nodes, u32 n, u32 band)
+ {
+ 	u32 ring = band ? hostadpt_rx_ring_base : hostadpt_tx_ring_base;
+ 	u32 idx, slot, i, sum = 0, total;
+@@ -242,6 +254,15 @@
+ 	REG32(HOSTADPT_RX_DMA_IDX(band)) = slot;
+ 	return 0;
+ }
++int host_ring_submit_kite_chain(const u32 *nodes, u32 n, u32 band)
++{
++	int ret = host_ring_submit_kite_chain_impl(nodes, n, band);
++
++	if (band < 2)
++		NDBG_CNT((ret ? NC_KITE_CHAIN_FAIL0 : NC_KITE_CHAIN0) + band);
++	return ret;
++}
++
+ #endif
+ 
+ #ifdef HAS_ASYNC_COPY
+--- a/npu_internal.h
++++ b/npu_internal.h
+@@ -767,6 +767,7 @@
+ #define NDBG_BASE	0x3E906800
+ #endif
+ #define NDBG_SIZE	0x1000
++extern u32 sram_alloc_offset;
+ /* tags and text read in order in a word dump, first char in the MSB */
+ #define NDBG_TAG(a, b, c, d)	((u32)(a) << 24 | (b) << 16 | (c) << 8 | (d))
+ #define NDBG_MAGIC	NDBG_TAG('N', 'D', 'B', 'G')
+@@ -787,7 +788,16 @@
+ 	NC_PPE_MAILS = 16, NC_PPE_LAST,
+ 	NC_DBA_MAILS = 20, NC_DBA_FRAMES,
+ 	NC_TDMA_TX_FULL = 24,
+-	NC_SRAM_ALLOCS = 32, NC_SRAM_USED,
++	NC_SRAM_ALLOCS = 32, NC_SRAM_USED, NC_SRAM_FAIL, NC_KITE_INIT_FAIL,
++	/* Two-band pairs, single writer per slot. */
++	NC_KITE_RX0 = 40, NC_KITE_RX1,
++	NC_KITE_RX_BAD0, NC_KITE_RX_BAD1,
++	NC_KITE_HOST0, NC_KITE_HOST1,
++	NC_KITE_HOST_FAIL0, NC_KITE_HOST_FAIL1,
++	NC_KITE_CHAIN0, NC_KITE_CHAIN1,
++	NC_KITE_CHAIN_FAIL0, NC_KITE_CHAIN_FAIL1,
++	NC_KITE_INIT0, NC_KITE_INIT1,
++	NC_KITE_ROLLBACK0, NC_KITE_ROLLBACK1,
+ 	NC_MAX = 96,
+ };
+ 
+--- a/npu_mbox.c
++++ b/npu_mbox.c
+@@ -79,6 +79,7 @@
+ 			(base_ptr & 0xFFFF) << 8 | (ret & 0xFF);
+ 		NDBG_TRACE(NDBG_MBOX, mbox_idx << 8 | func_idx, base_ptr, ret);
+ 
++		__asm__ volatile("fence iorw,iorw" ::: "memory");
+ 		/* blocking: set done; else return result via queue 8 */
+ 		if (rptr & 1)
+ 			REG32(MBQ_CTRL3(mbox_idx)) = (rptr | 2) & 0xFFFF;
+--- a/npu_sram.c
++++ b/npu_sram.c
+@@ -53,12 +53,6 @@
+ 
+ 	hw_mutex_lock(sram_buf_mutex);
+ 
+-	if (sram_alloc_offset >= SRAM_SIZE && sram_alloc_count >= SRAM_MAX_ENTRIES) {
+-		hw_mutex_unlock(sram_buf_mutex);
+-		npu_printf("sram is over the max!!current para:AddrType=%d,idx=%d,tmp_restore_index=%d\n",
+-			   addr_type, sram_alloc_offset, sram_alloc_count);
+-		return SRAM_ERROR_ADDR;
+-	}
+ 
+ 	/* check if already allocated */
+ 	if (sram_alloc_count > 0) {
+@@ -86,10 +80,19 @@
+ 			npu_printf("alloc fail!!current para:AddrType=%d,idx=%x,tmp_restore_index=%d,npu_init_sram_addr=%x\n",
+ 				   addr_type, sram_alloc_offset, sram_alloc_count, (u32)base);
+ 			hw_mutex_unlock(sram_buf_mutex);
++			NDBG_CNT(NC_SRAM_FAIL);
+ 			return SRAM_ERROR_ADDR;
+ 		}
+ 	} else {
+ 		base = (u8 *)SRAM_BASE;
++	}
++
++	if (sram_alloc_count >= SRAM_MAX_ENTRIES || !size_class ||
++	    (u32)base < SRAM_BASE || (u32)base - SRAM_BASE >= SRAM_SIZE ||
++	    size_class > SRAM_SIZE - ((u32)base - SRAM_BASE)) {
++		NDBG_CNT(NC_SRAM_FAIL);
++		hw_mutex_unlock(sram_buf_mutex);
++		return SRAM_ERROR_ADDR;
+ 	}
+ 
+ 	/* record entry */
+--- a/npu_wifi.c
++++ b/npu_wifi.c
+@@ -55,20 +55,79 @@
+ 	return (u16)ret;
+ }
+ 
++#if defined(AN7581) && defined(MT7916)
++/* GET32 is independent of the ownership ABI. Values are observational:
++ * aligned 32-bit reads, not a globally atomic snapshot across harts. */
++static int kite_diag_snapshot(u32 *msg, u32 cnt)
++{
++	static u32 sequence;
++	u32 page = msg[0] & 15, i;
++	u32 *d = msg + 2;
++
++	if (cnt != 256 || page > 1)
++		return 0;
++	for (i = 0; i < 62; i++)
++		d[i] = 0;
++	d[0] = 0x4b440001;
++	d[1] = page;
++	d[2] = ++sequence;
++	d[3] = timer_raw_tick;
++	if (page == 0) {
++		d[4] = (rxd_2g_init_done ? 1 : 0) | (rxd_5g_init_done ? 2 : 0);
++		d[5] = hostadpt_tx_ring_ready;
++		d[6] = sram_alloc_offset;
++		d[7] = ndbg->cnt[NC_SRAM_ALLOCS];
++		d[8] = ndbg->cnt[NC_PPE_MAILS];
++		d[9] = ndbg->cnt[NC_TUN_PKTS];
++		d[10] = ndbg->cnt[NC_TUN_DROP];
++		d[11] = ndbg->cnt[NC_TDMA_TX_FULL];
++		d[12] = ndbg->cnt[NC_KITE_INIT_FAIL];
++		d[13] = ndbg->cnt[NC_SRAM_FAIL];
++		for (i = 0; i < MAX_CORE_NUM; i++) {
++			volatile struct ndbg_hart *h = &ndbg->hart[i];
++			u32 *out = d + 14 + i * 6;
++
++			out[0] = h->loop;
++			out[1] = h->beat;
++			out[2] = h->mails;
++			out[3] = h->trap_cnt;
++			out[4] = h->mcause;
++			out[5] = h->mepc;
++		}
++	} else {
++		/* Always-on, single-writer counters; wrap modulo 2^32. */
++		for (i = 0; i < 16; i++)
++			d[4 + i] = ndbg->cnt[NC_KITE_RX0 + i];
++		d[20] = rxd_2g_cpu_idx;
++		d[21] = rxd_5g_cpu_idx;
++		d[22] = wifi_driver_model;
++		d[23] = wifi_dbdc_mode;
++		d[24] = wifi_debug_flags;
++		d[25] = wifi_force_to_cpu;
++		d[26] = wifi_band_cap;
++	}
++	return 1;
++}
++#endif
++
+ /* MFUNC_WIFI: msg[0] bits 7:4 funcType, bits 3:0 interface; msg[1] funcId */
+ int wifi_mail_dispatch(u32 base, u32 cnt)
+ {
+ 	u32 *msg = (u32 *)((base & 0x3FFFFFFF) | NPU_ADDR_MASK);
+ 	u32 func_type = (msg[0] >> 4) & 0xF;
+ 
+-	(void)cnt;
++	if (cnt < 8)
++		return 0;
+ #ifdef NPU_MAIL_TRACE
+ 	if (func_type != 3 || msg[1] != 0)
+ 		npu_printf("[MAIL]t%d f%d i%d %x %x %x\n", func_type, msg[1],
+-			   msg[0] & 0xF, msg[2], msg[3], msg[4]);
+-#endif
+-	NDBG_TRACE(NDBG_WIFI, func_type << 8 | (msg[1] & 0xFF), msg[2], msg[3]);
++			   msg[0] & 0xF, cnt >= 12 ? msg[2] : 0,
++			   cnt >= 16 ? msg[3] : 0, cnt >= 20 ? msg[4] : 0);
++#endif
++	NDBG_TRACE(NDBG_WIFI, func_type << 8 | (msg[1] & 0xFF), cnt >= 12 ? msg[2] : 0, cnt >= 16 ? msg[3] : 0);
+ #if defined(AN7581) && defined(MT7916)
++	if (func_type == 3 && msg[1] == 32)
++		return kite_diag_snapshot(msg, cnt);
+ 	if (func_type == 3 && msg[1] == 31) {
+ 		if (cnt < 20)
+ 			return 0;
+--- a/npu_wifi.h
++++ b/npu_wifi.h
+@@ -253,7 +253,7 @@
+ 
+ void wifi_queue_mutex_init(void);
+ void wifi_ba_node_init(void);
+-void __attribute__((noinline)) wifi_npu_init(u32 band);
++int __attribute__((noinline)) wifi_npu_init(u32 band);
+ void __attribute__((noinline)) npu_set_pcie_base(u32 addr, u32 band);
+ void __attribute__((noinline)) wifi_reset_ba_entry(u32 dir, u32 wcid);
+ void __attribute__((noinline)) npu_set_retry_limit(u32 val);
+@@ -271,7 +271,7 @@
+ void __attribute__((noinline)) npu_set_bar_info(u32 band, u32 packed);
+ void __attribute__((noinline)) npu_set_ba_entry(u32 band, u32 packed);
+ void __attribute__((noinline)) npu_set_wait_state(u32 port, u8 state);
+-void __attribute__((noinline)) npu_set_rxd_init(u32 ring_size, u32 band);
++int __attribute__((noinline)) npu_set_rxd_init(u32 ring_size, u32 band);
+ 
+ /* ================================================================
+  * Eagle: npu_wifi_eagle.c and npu_wifi_eagle_dp.c
+--- a/npu_wifi_ba.c
++++ b/npu_wifi_ba.c
+@@ -5,6 +5,7 @@
+ 
+ #include "npu_internal.h"
+ #include "npu_wifi.h"
++#include "kite_rxd.h"
+ 
+ #ifdef WIFI_KITE
+ 
+@@ -324,20 +325,11 @@
+ /* the active entry of (wcid, tid) the band owns, or NULL */
+ static NPU_HOT u32 *ba_band_entry(u32 band, u32 wcid, u32 tid)
+ {
+-	u32 off = (wcid - 1) * 224 + tid * 28;
+-	u32 e;
+-
+-	if (wifi_dbdc_mode == 0) {
+-		e = (band != 0 ? ba_table_b : ba_table_a) + off;
+-		if (e == 0 || *(u8 *)(e + 24) != 4)
+-			return NULL;
+-		return (u32 *)e;
+-	}
+-	if (wcid > 150)
+-		e = ba_table_a + off - 150 * 224;
+-	else
+-		e = ba_table_b + off;
+-	if (*(u8 *)(e + 25) != band || *(u8 *)(e + 24) != 4)
++	u32 e = kite_ba_address(band, wcid, tid, wifi_dbdc_mode,
++				ba_table_a, ba_table_b);
++
++	if (!e || *(u8 *)(e + 24) != 4 ||
++	    (wifi_dbdc_mode && *(u8 *)(e + 25) != band))
+ 		return NULL;
+ 	return (u32 *)e;
+ }
+--- a/npu_wifi_init.c
++++ b/npu_wifi_init.c
+@@ -7,6 +7,7 @@
+ 
+ #include "npu_internal.h"
+ #include "npu_wifi.h"
++#include "kite_rxd.h"
+ 
+ 
+ /* ================================================================
+@@ -39,76 +40,48 @@
+ 	*(u16 *)(desc + 6) = (*(u16 *)(desc + 6) & 0x4000) | 0xDAC;
+ }
+ 
+-/* 5G rx ring */
+-static int wifi_init_rxd_5g(u32 ring_size, u32 band)
+-{
+-	u32 i;
++/* The host must keep WiFi DMA stopped until SET_DESC succeeds. */
++static int wifi_init_rxd(u32 ring_size, u32 band)
++{
++	u32 ring = band ? rxd_base_5g : rxd_base_2g;
++	u16 *ids = band ? rxd_5g_bufid_table : (u16 *)rxd_2g_bufid_base;
++	u32 i, allocated = 0;
+ 	s32 id;
+ 
+-	npu_printf("[NPU] Enter %s, band_idx=%d, rx_ring_size=%lu\n",
+-		   "npu_npu_init_rxd_5G", band, ring_size);
+-
+-	if (ring_size - 1 > 0x5FF)
+-		npu_printf("ERROR! rx_ring_size = %lu \n", ring_size);
+-
+-	if (rxd_5g_init_done != 0) {
+-		npu_printf("5G init second: do np_skb free\n");
+-		rxd_5g_init_done = 0;
+-		for (i = 0; i < ring_size; i++)
+-			buf_id_free(0, band, rxd_5g_bufid_table[i]);
+-	}
+-
++	if (band > 1 || ring_size != 1536 || !ring || !ids ||
++	    (band ? rxd_5g_init_done : rxd_2g_init_done))
++		return 0;
++	npu_memset((void *)ring, 0, ring_size * 16);
+ 	for (i = 0; i < ring_size; i++) {
+ 		id = buf_id_alloc_hw(0, band);
+-		if (id == -1) {
+-			npu_printf("[%s] rxd init: alloc buffid fail!\n",
+-				   (band != 0) ? "5G" : "2.4G");
+-			return 1;
+-		}
+-		rxd_5g_bufid_table[i] = (u16)id;
+-		wifi_rxd_set_buf(rxd_base_5g + i * 16, id);
+-	}
+-
+-	rxd_5g_cpu_idx = 0;
+-	rxd_5g_flush_tick = KITE_TICK;
+-	rxd_5g_init_done = 1;
+-	return 0;
+-}
+-
+-/* 2.4G rx ring */
+-static int wifi_init_rxd_2g(u32 ring_size, u32 band)
+-{
+-	u16 *tbl;
+-	u32 i;
+-	s32 id;
+-
+-	npu_printf("[NPU] Enter(2.4G) %s, band_idx=%d, rx_ring_size=%lu\n",
+-		   "npu_npu_init_rxd", band, ring_size);
+-
+-	if (ring_size - 1 > 0x5FF)
+-		npu_printf("ERROR! rx_ring_size = %lu\n", ring_size);
+-
+-	tbl = (u16 *)rxd_2g_bufid_base;
+-	if (tbl != NULL && rxd_2g_init_done != 0) {
+-		rxd_2g_init_done = 0;
+-		for (i = 0; i < ring_size; i++)
+-			buf_id_free(0, band, tbl[i]);
+-	}
+-
+-	for (i = 0; i < ring_size; i++) {
+-		id = buf_id_alloc_hw(0, band);
+-		if (id == -1) {
+-			npu_printf("!!!!!!!!!!!! [%s] rxd init: alloc buffid fail!\n",
+-				   (band != 0) ? "5G" : "2.4G");
+-			return 1;
+-		}
+-		tbl[i] = (u16)id;
+-		wifi_rxd_set_buf(rxd_base_2g + i * 16, id);
+-	}
+-
+-	rxd_2g_cpu_idx = 0;
+-	rxd_2g_flush_tick = KITE_TICK;
+-	rxd_2g_init_done = 1;
++		if (id < 0)
++			goto rollback;
++		ids[allocated++] = id;
++		wifi_rxd_set_buf(ring + i * 16, id);
++	}
++	if (band) {
++		rxd_5g_cpu_idx = 0;
++		rxd_5g_flush_tick = KITE_TICK;
++	} else {
++		rxd_2g_cpu_idx = 0;
++		rxd_2g_flush_tick = KITE_TICK;
++	}
++	__asm__ volatile("fence iorw,iorw" ::: "memory");
++	if (band)
++		rxd_5g_init_done = 1;
++	else
++		rxd_2g_init_done = 1;
++	NDBG_CNT(NC_KITE_INIT0 + band);
++	return 1;
++rollback:
++	while (allocated) {
++		--allocated;
++		buf_id_free(0, band, ids[allocated]);
++		ids[allocated] = 0xffff;
++	}
++	npu_memset((void *)ring, 0, ring_size * 16);
++	__asm__ volatile("fence iorw,iorw" ::: "memory");
++	NDBG_CNT(NC_KITE_ROLLBACK0 + band);
+ 	return 0;
+ }
+ 
+@@ -123,21 +96,10 @@
+ 	}
+ 
+ 	for (i = 0; i < 8; i++) {
+-		if (wifi_dbdc_mode != 0) {
+-			if (wcid > 150)
+-				entry_addr = ba_table_a +
+-					     224 * (wcid - 151) + i * 28;
+-			else
+-				entry_addr = ba_table_b +
+-					     224 * (wcid - 1) + i * 28;
+-		} else {
+-			if (dir != 0)
+-				entry_addr = ba_table_b +
+-					     224 * (wcid - 1) + i * 28;
+-			else
+-				entry_addr = ba_table_a +
+-					     224 * (wcid - 1) + i * 28;
+-		}
++		entry_addr = kite_ba_address(dir, wcid, i, wifi_dbdc_mode,
++					     ba_table_a, ba_table_b);
++		if (!entry_addr)
++			return;
+ 
+ 		ba_flush_entry((u32 *)entry_addr);
+ 
+@@ -292,12 +254,54 @@
+ 	return 0;
+ }
+ 
++#ifdef WIFI_KITE
++static int kite_prepare_sram(u32 band)
++{
++	static const u16 common[] = { 1, 4, 7, 8, 12, 13,
++#if MAX_CORE_NUM > 2
++		21,
++#endif
++	};
++	static const u16 per_band[2][5] = { { 3, 15, 10, 20, 6 },
++					 { 2, 14, 9, 19, 6 } };
++	u32 i, addr;
++#ifdef AN7552
++	const u32 end = 0x3e840000;
++#elif defined(AN7581)
++	const u32 end = 0x3e878000;
++#else
++	const u32 end = 0x3e880000;
++#endif
++
++	if (band > 1)
++		return 0;
++	for (i = 0; i < sizeof(common) / sizeof(common[0]); i++) {
++		addr = sram_buf_alloc(common[i]);
++		if (addr < 0x3e800000 || addr >= end)
++			return 0;
++	}
++	for (i = 0; i < 5; i++) {
++		addr = sram_buf_alloc(per_band[band][i]);
++		if (addr < 0x3e800000 || addr >= end)
++			return 0;
++	}
++	/* DBDC can address either bank regardless of which band started first. */
++	ba_table_a = sram_buf_alloc(8);
++	ba_table_b = sram_buf_alloc(7);
++	return 1;
++}
++#endif
++
+ /* npu_init for one band, from SET_WAIT_DESC */
+-void __attribute__((noinline)) wifi_npu_init(u32 band)
++int __attribute__((noinline)) wifi_npu_init(u32 band)
+ {
+ #ifdef WIFI_KITE
+ 	u32 desc_type1, desc_type2;
+ 	u32 bar_5g, bar_2g;
++	static u8 pipeline_ready __attribute__((unused));
++
++	if (!kite_prepare_sram(band))
++		return 0;
+ 
+ 	npu_printf("[NPU] %s...\n", "npu_init");
+ 
+@@ -359,7 +363,7 @@
+ 	/* no classifier core on AN7552: no pipeline */
+ #if MAX_CORE_NUM > 2
+ 	npu_printf("[NPU]  %s...\n", "pipeline_pkt_queue_init");
+-	{
++	if (!pipeline_ready) {
+ 		u32 *p;
+ 		u32 end;
+ 
+@@ -371,12 +375,14 @@
+ 			*(u16 *)(p + 1) = 0;
+ 			p = (u32 *)((u8 *)p + 8);
+ 		}
++		pipeline_ready = 1;
+ 	}
+ #endif
+ 
+ 	counter_init(band);
+ 	wcid_counter_init(band);
+ #endif
++	return 1;
+ }
+ 
+ /* WiFi mailbox setters: simple parameter setters called from host.
+@@ -485,25 +491,10 @@
+ 		return;
+ 	}
+ 
+-	if (wifi_dbdc_mode != 0) {
+-		if (wcid == 0) {
+-			npu_printf("ERROR!!!!! [GET_BA_ENTRY_DBDC_]wcid == 0\n");
+-			return;
+-		}
+-		if (wcid > 150)
+-			entry_addr = ba_table_a +
+-				     28 * (8 * (wcid - 151) + tid);
+-		else
+-			entry_addr = ba_table_b +
+-				     28 * (8 * (wcid - 1) + tid);
+-	} else {
+-		u32 off = 28 * (8 * (wcid - 1) + tid);
+-
+-		if (band != 0)
+-			entry_addr = ba_table_b + off;
+-		else
+-			entry_addr = ba_table_a + off;
+-	}
++	entry_addr = kite_ba_address(band, wcid, tid, wifi_dbdc_mode,
++				     ba_table_a, ba_table_b);
++	if (!entry_addr)
++		return;
+ 
+ 	ba_state_update(ssn & 0xFFFF, 3, entry_addr);
+ 
+@@ -571,23 +562,12 @@
+ 		return;
+ 	}
+ 
++	entry_addr = kite_ba_address(band, wcid, tid, wifi_dbdc_mode,
++				     ba_table_a, ba_table_b);
++	if (!entry_addr)
++		return;
++
+ 	if (band != 0) {
+-		if (wifi_dbdc_mode != 0) {
+-			if (wcid == 0) {
+-				npu_printf("ERROR!!!!! "
+-					   "[GET_BA_ENTRY_DBDC_]wcid == 0\n");
+-				entry_addr = 0;
+-			} else if (wcid > 150) {
+-				entry_addr = ba_table_a +
+-					     28 * (8 * (wcid - 151) + tid);
+-			} else {
+-				entry_addr = ba_table_b +
+-					     28 * (8 * (wcid - 1) + tid);
+-			}
+-		} else {
+-			entry_addr = ba_table_b +
+-				     28 * (8 * (wcid - 1) + tid);
+-		}
+ 
+ 		ba_flush_entry((u32 *)entry_addr);
+ 		hw_mutex_lock(ba_mutex_5g);
+@@ -606,22 +586,6 @@
+ 
+ 		hw_mutex_unlock(ba_mutex_5g);
+ 	} else {
+-		if (wifi_dbdc_mode != 0) {
+-			if (wcid == 0) {
+-				npu_printf("ERROR!!!!! "
+-					   "[GET_BA_ENTRY_DBDC_]wcid == 0\n");
+-				entry_addr = 0;
+-			} else if (wcid > 150) {
+-				entry_addr = ba_table_a +
+-					     28 * (8 * (wcid - 151) + tid);
+-			} else {
+-				entry_addr = ba_table_b +
+-					     28 * (8 * (wcid - 1) + tid);
+-			}
+-		} else {
+-			entry_addr = ba_table_a +
+-				     28 * (8 * (wcid - 1) + tid);
+-		}
+ 
+ 		ba_flush_entry((u32 *)entry_addr);
+ 
+@@ -671,11 +635,7 @@
+ 	npu_printf("set wait!  not Force to CPU \n");
+ }
+ 
+-void __attribute__((noinline)) npu_set_rxd_init(u32 ring_size, u32 band)
+-{
+-	if (band == 1)
+-		wifi_init_rxd_5g(ring_size, 1);
+-	else
+-		wifi_init_rxd_2g(ring_size, band);
+-}
+-
++int __attribute__((noinline)) npu_set_rxd_init(u32 ring_size, u32 band)
++{
++	return wifi_init_rxd(ring_size, band);
++}
+--- a/npu_wifi_kite.c
++++ b/npu_wifi_kite.c
+@@ -233,8 +233,10 @@
+ 	if (band > 1 || msg[2] != 1536 || !wifi_pkt_buf_addr ||
+ 	    (band ? rxd_5g_init_done : rxd_2g_init_done))
+ 		return 0;
+-	wifi_npu_init(band);
+-	npu_set_rxd_init(msg[2], band);
++	if (!wifi_npu_init(band) || !npu_set_rxd_init(msg[2], band)) {
++		NDBG_CNT(NC_KITE_INIT_FAIL);
++		return 0;
++	}
+ 	return 1;
+ }
+ 
+@@ -255,7 +257,9 @@
+ int wifi_mail_set_ba_win_size(u32 *msg)
+ {
+ 	if ((msg[0] & 0xf) > 1 ||
+-	    !kite_legacy_wcid_valid((msg[2] >> 3) & 0xff, wifi_dbdc_mode))
++	    !kite_legacy_wcid_valid((msg[2] >> 3) & 0xff, wifi_dbdc_mode) ||
++	    !kite_ba_address(msg[0] & 0xf, (msg[2] >> 3) & 0xff,
++			     msg[2] & 7, wifi_dbdc_mode, ba_table_a, ba_table_b))
+ 		return 0;
+ 	npu_set_ba_entry(msg[0] & 0xF, msg[2]);
+ 	return 1;
+@@ -270,7 +274,9 @@
+ int wifi_mail_set_del_sta(u32 *msg)
+ {
+ 	if ((msg[0] & 0xf) > 1 ||
+-	    !kite_legacy_wcid_valid(msg[2], wifi_dbdc_mode))
++	    !kite_legacy_wcid_valid(msg[2], wifi_dbdc_mode) ||
++	    !kite_ba_address(msg[0] & 0xf, msg[2], 0, wifi_dbdc_mode,
++			     ba_table_a, ba_table_b))
+ 		return 0;
+ 	wifi_reset_ba_entry(msg[0] & 0xF, msg[2]);
+ 	return 1;
+--- a/npu_wifi_rx.c
++++ b/npu_wifi_rx.c
+@@ -75,7 +75,7 @@
+ 			wifi_u64_add(apcli_count_5g, 1);
+ 		}
+ 	}
+-	if ((s8)wcid >= 0 && dir <= 1) {
++	if (wcid < 128 && dir <= 1) {
+ 		wifi_u64_add(&npu_rx_pkts_entry[dir][wcid * 2], 1);
+ 		wifi_u64_add(&npu_rx_bytes_entry[dir][wcid * 2], bytes);
+ 	}
+@@ -242,15 +242,10 @@
+ 		return -1;
+ 	}
+ 
+-	if (wifi_dbdc_mode != 0) {
+-		if (pn.wcid > 150)
+-			e = ba_table_a + 28 * (8 * (pn.wcid - 151) + pn.tid);
+-		else
+-			e = ba_table_b + 28 * (8 * (pn.wcid - 1) + pn.tid);
+-	} else {
+-		e = (band != 0 ? ba_table_b : ba_table_a) +
+-		    28 * (8 * (pn.wcid - 1) + pn.tid);
+-	}
++	e = kite_ba_address(band, pn.wcid, pn.tid, wifi_dbdc_mode,
++			    ba_table_a, ba_table_b);
++	if (!e)
++		return buf_id;
+ 	entry = (u32 *)e;
+ 
+ 	if (*(u8 *)(e + 24) == 0) {
+@@ -474,12 +469,10 @@
+ 	if (pn.wcid == 0)
+ 		return kite_classify_pn(pn, buf_id, band);
+ 
+-	if (wifi_dbdc_mode != 0 && pn.wcid > 150)
+-		e = ba_table_a + 28 * (8 * (pn.wcid - 151) + pn.tid);
+-	else if (wifi_dbdc_mode != 0 || band != 0)
+-		e = ba_table_b + 28 * (8 * (pn.wcid - 1) + pn.tid);
+-	else
+-		e = ba_table_a + 28 * (8 * (pn.wcid - 1) + pn.tid);
++	e = kite_ba_address(band, pn.wcid, pn.tid, wifi_dbdc_mode,
++			    ba_table_a, ba_table_b);
++	if (!e)
++		return buf_id;
+ 
+ 	/* ba_state_update has nothing to do after a non-A-MSDU frame */
+ 	if (*(u8 *)(e + 24) != 4 || (u8)(*(u8 *)(e + 22) - 2) <= 1 ||
+@@ -646,8 +639,11 @@
+ 		idx = (idx >= KITE_RX_RING_LAST) ? 0 : idx + 1;
+ 	}
+ 	/* A full ring without LAST is malformed, not an endless wait. */
+-	if (!(w1 & 0x40000000) || invalid)
++	if (!(w1 & 0x40000000) || invalid) {
+ 		*len = 0x4000;
++		NDBG_CNT(NC_KITE_RX_BAD0 + band);
++	}
++	NDBG_CNT(NC_KITE_RX0 + band);
+ 	*ridx = idx;
+ 	return n;
+ }

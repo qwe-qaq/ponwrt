@@ -1,0 +1,344 @@
+Subject: Expose cached Clanker health, periodic summaries, and retain mailbox DMA ownership after timeout.
+
+Local integration for fixed Clanker 735529c and ponwrt 6.18.52.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -6,6 +6,8 @@
+ 
+ #include <linux/devcoredump.h>
+ #include <linux/firmware.h>
++#include <linux/mutex.h>
++#include <linux/sysfs.h>
+ #include <linux/platform_device.h>
+ #include <linux/of_net.h>
+ #include <linux/of_platform.h>
+@@ -175,7 +177,7 @@
+ 	u32 val, offset = 0;
+ 	int ret;
+ 
+-	if (len > AIROHA_NPU_MBOX_SIZE)
++	if (len <= 0 || len > AIROHA_NPU_MBOX_SIZE)
+ 		return -EINVAL;
+ 
+ 	if (reply && reply_len > len)
+@@ -191,7 +193,22 @@
+ 	 */
+ 	spin_lock_bh(&core->lock);
+ 
++	/* A timeout does not revoke NPU DMA ownership. Keep this buffer intact
++	 * until the firmware publishes DONE; a late reply is then discarded. */
++	if (core->pending_reply) {
++		regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(3), &val);
++		if (!(val & MBOX_MSG_DONE)) {
++			core->deferred++;
++			spin_unlock_bh(&core->lock);
++			return -EBUSY;
++		}
++		dma_rmb();
++		core->pending_reply = false;
++		core->late_replies++;
++	}
++	core->requests++;
+ 	memcpy(core->buf, data, len);
++	dma_wmb();
+ 
+ 	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(0) + offset, core->addr);
+ 	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(1) + offset, len);
+@@ -204,6 +221,13 @@
+ 					      REG_CR_MBQ0_CTRL(3) + offset,
+ 					      val, (val & MBOX_MSG_DONE),
+ 					      100, AIROHA_NPU_MBOX_TIMEOUT_US);
++	if (ret == -ETIMEDOUT) {
++		core->pending_reply = true;
++		core->timeouts++;
++	} else if (!ret) {
++		dma_rmb();
++		core->completed++;
++	}
+ 	if (!ret && FIELD_GET(MBOX_MSG_STATUS, val) != NPU_MBOX_SUCCESS)
+ 		ret = -EINVAL;
+ 
+@@ -246,6 +270,7 @@
+ 	}
+ 
+ 	memcpy_toio(addr, fw->data, fw->size);
++	dev_info(dev, "loaded %s (%zu bytes)\n", fw_name, fw->size);
+ out:
+ 	release_firmware(fw);
+ 
+@@ -498,6 +523,10 @@
+ 	struct wlan_mbox_data *wlan_data;
+ 	int err, len;
+ 
++	if (data_len < 0 || data_len > AIROHA_NPU_MBOX_SIZE - sizeof(*wlan_data) ||
++	    ifindex < 0 || ifindex > 15)
++		return -EINVAL;
++
+ 	len = sizeof(*wlan_data) + data_len;
+ 	wlan_data = kzalloc(len, gfp);
+ 	if (!wlan_data)
+@@ -521,6 +550,10 @@
+ 	struct wlan_mbox_data *wlan_data;
+ 	int err, len;
+ 
++	if (data_len < 0 || data_len > AIROHA_NPU_MBOX_SIZE - sizeof(*wlan_data) ||
++	    ifindex < 0 || ifindex > 15)
++		return -EINVAL;
++
+ 	len = sizeof(*wlan_data) + data_len;
+ 	wlan_data = kzalloc(len, gfp);
+ 	if (!wlan_data)
+@@ -535,6 +568,209 @@
+ 	kfree(wlan_data);
+ 
+ 	return err;
++}
++
++/* Clanker read-only diagnostic ABI v1: GET32, pages selected by ifindex.
++ * Every request is exactly 256 bytes including the WLAN header. Fields are
++ * sampled independently by firmware; counter deltas wrap modulo 2^32. */
++#define CLANKER_DIAG_MAGIC 0x4b440001
++#define CLANKER_DIAG_WORDS 62
++#define CLANKER_DIAG_PAGES 2
++
++struct airoha_clanker_diag {
++	struct airoha_npu *npu;
++	struct delayed_work work;
++	struct mutex lock; /* cached snapshot only; never held during mailbox IO */
++	u32 data[CLANKER_DIAG_PAGES][CLANKER_DIAG_WORDS];
++	u32 samples, moving, quiet[8];
++	u32 requests, completed, timeouts, late_replies, deferred;
++	unsigned long updated;
++	int error;
++	bool pending;
++};
++
++static const char *airoha_clanker_role(u32 tag)
++{
++	switch (tag) {
++	case 0x57484f53: return "waiting-host-rings"; /* WHOS */
++	case 0x4b525831: return "wifi-rx-core1";
++	case 0x4b525832: return "wifi-rx-core2";
++	case 0x4b504950: return "wifi-classifier";
++	case 0x4b4e4f44: return "host-delivery";
++	case 0x54554e4c: return "tunnel";
++	case 0x49444c45: return "idle";
++	default: return "startup-or-other";
++	}
++}
++
++static ssize_t clanker_status_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	struct airoha_npu *npu = dev_get_drvdata(dev);
++	struct airoha_clanker_diag *d = npu->clanker;
++	u32 *p, *c;
++	ssize_t n = 0;
++	int i;
++
++	mutex_lock(&d->lock);
++	p = d->data[0];
++	c = d->data[1];
++	n += sysfs_emit_at(buf, n,
++		"diag_abi=1 ownership_caps=0 wifi_path=host samples=%u last_error=%d age_ms=%u\n",
++		d->samples, d->error,
++		d->samples ? jiffies_to_msecs(jiffies - d->updated) : 0);
++	n += sysfs_emit_at(buf, n,
++		"mailbox requests=%u completed=%u timeouts=%u late=%u deferred=%u pending=%u\n",
++		d->requests, d->completed, d->timeouts, d->late_replies,
++		d->deferred, d->pending);
++	if (!d->samples) {
++		n += sysfs_emit_at(buf, n, "snapshot=unavailable\n");
++		goto out;
++	}
++	n += sysfs_emit_at(buf, n,
++		"sequence=%u/%u tick=%u rx_bands=%#x host_ready=%u heartbeat_moving=%#x\n",
++		p[2], c[2], p[3], p[4], p[5], d->moving);
++	n += sysfs_emit_at(buf, n,
++		"sram_bytes=%u allocations=%u alloc_fail=%u init_fail=%u ppe_mail=%u tunnel_rx=%u tunnel_drop=%u tdma_full=%u\n",
++		p[6], p[7], p[13], p[12], p[8], p[9], p[10], p[11]);
++	for (i = 0; i < 8; i++) {
++		u32 *h = p + 14 + i * 6;
++
++		n += sysfs_emit_at(buf, n,
++			"core%d role=%s tag=%08x beat=%u quiet_samples=%u mail=%u traps=%u cause=%08x pc=%08x\n",
++			i, airoha_clanker_role(h[0]), h[0], h[1], d->quiet[i],
++			h[2], h[3], h[4], h[5]);
++	}
++	for (i = 0; i < 2; i++)
++		n += sysfs_emit_at(buf, n,
++			"band%d rx_frames=%u rx_bad=%u host_desc=%u host_fail=%u host_chains=%u chain_fail=%u init_ok=%u rollback=%u rx_idx=%u\n",
++			i, c[4+i], c[6+i], c[8+i], c[10+i], c[12+i],
++			c[14+i], c[16+i], c[18+i], c[20+i]);
++	n += sysfs_emit_at(buf, n,
++		"driver_model=%u dbdc=%u fast_flags=%#x force_cpu=%u band_cap=%u\n",
++		c[22], c[23], c[24], c[25], c[26]);
++out:
++	mutex_unlock(&d->lock);
++	return n;
++}
++static DEVICE_ATTR_RO(clanker_status);
++
++static struct attribute *airoha_clanker_attrs[] = {
++	&dev_attr_clanker_status.attr,
++	NULL,
++};
++static const struct attribute_group airoha_clanker_group = {
++	.attrs = airoha_clanker_attrs,
++};
++
++static void airoha_clanker_poll(struct work_struct *work)
++{
++	struct airoha_clanker_diag *d = container_of(to_delayed_work(work),
++						struct airoha_clanker_diag, work);
++	struct airoha_npu *npu = d->npu;
++	struct airoha_npu_core *core = &npu->cores[0];
++	u32 data[CLANKER_DIAG_PAGES][CLANKER_DIAG_WORDS] = {};
++	u32 moving = 0, traps = 0, quiet = 0;
++	int i, err = 0, previous_error;
++	bool report;
++
++	for (i = 0; i < CLANKER_DIAG_PAGES; i++) {
++		err = airoha_npu_wlan_msg_get(npu, i,
++			(enum airoha_npu_wlan_get_cmd)32,
++			data[i], sizeof(data[i]), GFP_KERNEL);
++		if (err)
++			break;
++		if (data[i][0] != CLANKER_DIAG_MAGIC || data[i][1] != i) {
++			err = -EPROTO;
++			break;
++		}
++	}
++	mutex_lock(&d->lock);
++	previous_error = d->error;
++	d->error = err;
++	spin_lock_bh(&core->lock);
++	d->requests = core->requests;
++	d->completed = core->completed;
++	d->timeouts = core->timeouts;
++	d->late_replies = core->late_replies;
++	d->deferred = core->deferred;
++	d->pending = core->pending_reply;
++	spin_unlock_bh(&core->lock);
++	if (err) {
++		mutex_unlock(&d->lock);
++		if (err != previous_error)
++			dev_warn(npu->dev,
++				 "Clanker diagnostics unavailable: %d (snapshot retained; mailbox timeout retains DMA buffer)\n",
++				 err);
++		goto next;
++	}
++	for (i = 0; i < 8; i++) {
++		u32 *h = data[0] + 14 + i * 6;
++		u32 *old = d->data[0] + 14 + i * 6;
++
++		if (d->samples && h[1] != old[1]) {
++			moving |= BIT(i);
++			d->quiet[i] = 0;
++		} else if (d->samples && d->quiet[i] < 255) {
++			d->quiet[i]++;
++		}
++		if (h[3] != old[3])
++			traps |= BIT(i);
++		if (d->quiet[i] >= 3)
++			quiet |= BIT(i);
++	}
++	report = d->samples < 2 || !(d->samples % 3) || traps || previous_error;
++	d->samples++;
++	d->moving = moving;
++	memcpy(d->data, data, sizeof(data));
++	d->updated = jiffies;
++	if (report) {
++		dev_info(npu->dev,
++			 "Clanker health: sample=%u wifi=host rx_bands=%#x host_ready=%u heartbeat=%#x quiet=%#x traps_changed=%#x mbox=%u/%u timeouts=%u sram=%u\n",
++			 d->samples, data[0][4], data[0][5], moving, quiet,
++			 traps, d->completed, d->requests, d->timeouts, data[0][6]);
++		dev_info(npu->dev,
++			 "Clanker traffic: rx=%u/%u host=%u/%u chains=%u/%u drops=%u/%u ppe_mail=%u tunnel=%u init_fail=%u alloc_fail=%u\n",
++			 data[1][4], data[1][5], data[1][8], data[1][9],
++			 data[1][12], data[1][13], data[1][10] + data[1][14],
++			 data[1][11] + data[1][15], data[0][8], data[0][9],
++			 data[0][12], data[0][13]);
++	}
++	for (i = 0; i < 8; i++) {
++		u32 *h = data[0] + 14 + i * 6;
++
++		if (d->samples <= 2 || (report && ((traps | quiet) & BIT(i))))
++			dev_info(npu->dev,
++				 "Clanker core%d: %s beat=%u mail=%u traps=%u cause=%#x pc=%#x\n",
++				 i, airoha_clanker_role(h[0]), h[1], h[2],
++				 h[3], h[4], h[5]);
++	}
++	mutex_unlock(&d->lock);
++next:
++	schedule_delayed_work(&d->work, 10 * HZ);
++}
++
++static void airoha_clanker_diag_start(struct airoha_npu *npu)
++{
++	struct airoha_clanker_diag *d;
++	int err;
++
++	d = devm_kzalloc(npu->dev, sizeof(*d), GFP_KERNEL);
++	if (!d) {
++		dev_warn(npu->dev, "Clanker diagnostics allocation failed\n");
++		return;
++	}
++	d->npu = npu;
++	mutex_init(&d->lock);
++	INIT_DELAYED_WORK(&d->work, airoha_clanker_poll);
++	npu->clanker = d;
++	err = devm_device_add_group(npu->dev, &airoha_clanker_group);
++	if (err)
++		dev_warn(npu->dev, "Clanker status sysfs unavailable: %d\n", err);
++	dev_info(npu->dev,
++		 "Clanker monitor: sample 10s, summary 30s, /sys/bus/platform/devices/%s/clanker_status; WiFi RX ownership disabled\n",
++		 dev_name(npu->dev));
++	schedule_delayed_work(&d->work, HZ);
+ }
+ 
+ static int
+@@ -865,6 +1101,8 @@
+ 	}
+ 
+ 	platform_set_drvdata(pdev, npu);
++	if (of_property_read_bool(dev->of_node, "airoha,clanker-kite-abi"))
++		airoha_clanker_diag_start(npu);
+ 
+ 	return 0;
+ }
+@@ -874,6 +1112,8 @@
+ 	struct airoha_npu *npu = platform_get_drvdata(pdev);
+ 	int i;
+ 
++	if (npu->clanker)
++		cancel_delayed_work_sync(&npu->clanker->work);
+ 	for (i = 0; i < ARRAY_SIZE(npu->cores); i++)
+ 		cancel_work_sync(&npu->cores[i].wdt_work);
+ }
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -163,10 +163,13 @@
+ 	WLAN_FUNC_GET_WAIT_NPU_VERSION,
+ };
+ 
++struct airoha_clanker_diag;
++
+ struct airoha_npu {
+ #if (IS_BUILTIN(CONFIG_NET_AIROHA_NPU) || IS_MODULE(CONFIG_NET_AIROHA_NPU))
+ 	struct device *dev;
+ 	struct regmap *regmap;
++	struct airoha_clanker_diag *clanker;
+ 
+ 	struct airoha_npu_core {
+ 		struct airoha_npu *npu;
+@@ -176,6 +179,8 @@
+ 		/* Coherent bounce buffer for mailbox cmd/rsp */
+ 		void *buf;
+ 		dma_addr_t addr;
++		bool pending_reply;
++		u32 requests, completed, timeouts, late_replies, deferred;
+ 	} cores[NPU_NUM_CORES];
+ 
+ 	int irqs[NPU_NUM_IRQ];

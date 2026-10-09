@@ -1,0 +1,15 @@
+Subject: airoha: expose NPU RX policy and TDMA admission counters
+
+A zero RX-PPE counter is ambiguous without separating policy misses from a
+full TDMA ring. Extend the shared ABI with read-only per-band counters. The
+firmware increments them only after secure MPDU validation, and the host
+reports them beside the existing owned-token counters.
+
+--- a/include/linux/soc/airoha/kite-datapath.h
++++ b/include/linux/soc/airoha/kite-datapath.h
+@@ -156,4 +156,5 @@
+ 	unsigned int tx_sent[2], tx_freed[2], tx_drop[2], tx_bad_done;
+ 	unsigned int rx_ppe[2], rx_host[2], rx_replay[2], rx_stale[2];
+ 	unsigned int rx_miss[2], rx_free[2], rx_unsupported[2], tx_aborted[2], reserved[1];
++	unsigned int rx_policy_hit[2], rx_policy_miss[2], rx_tdma_full[2];
+ 	struct kdp_sta sta[KDP_WCIDS];

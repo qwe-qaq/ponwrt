@@ -1,0 +1,423 @@
+From: ponwrt maintainers
+Subject: [PATCH] r76: Reduce duplicate credit bookkeeping and TX context work; expose actual feed batches.
+
+Native incremental patch on release75. Datapath ABI12 and DMA ownership unchanged.
+
+--- a/kite-credit.inc
++++ b/kite-credit.inc
+@@ -11,7 +11,9 @@
+ };
+ static struct {
+  struct dp_credit_band band[2];
+- u16 owner[KDP_TOKENS], sta[2][KDP_WCIDS];
++ /* Diagnostic STA counts are reconstructed only during pressure proof. */
++ u16 sta[2][KDP_WCIDS];
++ u32 band1[KDP_TOKENS/32]; /* compact immutable band proof for live tokens */
+  u32 extra_reaps, pressure_tick;
+ } dp_credit __attribute__((section(".kite_observe"), aligned(64)));
+ static volatile u32 dp_credit_seq;
+@@ -62,24 +64,24 @@
+  }
+  return 0;
+ }
+-static int dp_credit_commit(u32 id, u32 band, u32 wi)
++/* Callers have already validated token index, WIFI state, band and the
++ * unique pending bit. That existing ownership ledger is authoritative.
++ * Retain only the control counter needed for cross-band reservation. */
++static int dp_credit_commit(u32 id, u32 band)
+ {
+- if (id>=KDP_TOKENS || band>1 || !wi || wi>=KDP_WCIDS ||
+-     dp_credit.owner[id] || dp_credit.band[band].pending>=KDP_TOKENS ||
+-     dp_credit.sta[band][wi]>=KDP_TOKENS) return 0;
+- dp_credit.owner[id]=wi | (band<<10);
+- u32 n=++dp_credit.band[band].pending, count=++dp_credit.sta[band][wi];
+- if (n>dp_credit.band[band].peak) dp_credit.band[band].peak=n;
+- if (count>dp_credit.band[band].sta_peak) dp_credit.band[band].sta_peak=count;
++ struct dp_credit_band *v=&dp_credit.band[band];
++ if (v->pending>=KDP_TOKENS) return 0;
++ if (band) dp_credit.band1[id>>5] |= 1u<<(id&31);
++ if (++v->pending>v->peak) v->peak=v->pending;
+  return 1;
+ }
+ static int dp_credit_release(u32 id, u32 band)
+ {
+- u32 owner=dp_credit.owner[id], wi=owner&1023u;
+- if (!wi || wi>=KDP_WCIDS || (owner>>10)!=band || !dp_credit.sta[band][wi] ||
+-     !dp_credit.band[band].pending) return 0;
+- dp_credit.sta[band][wi]--; dp_credit.owner[id]=0;
+- dp_credit.band[band].pending--; dp_credit.band[band].released++;
++ struct dp_credit_band *v=&dp_credit.band[band];
++ u32 bit=1u<<(id&31);
++ if (!v->pending || !!(dp_credit.band1[id>>5]&bit)!=band) return 0;
++ if (band) dp_credit.band1[id>>5] &= ~bit;
++ v->pending--; v->released++;
+  return 1;
+ }
+ /* Pure diagnostics. Published on the existing ~84ms snapshot, no token
+@@ -97,15 +99,9 @@
+    u32 now=csr_read(mcycle);
+    dp_credit_elapsed(s,now);
+   }
+-  s->owner_wcid=s->owner_pending=0;
+  }
+- for (u32 b=0;b<2;b++) for (u32 wi=1;wi<KDP_WCIDS;wi++)
+-  if (dp_credit.sta[b][wi]>dp_credit.band[b].owner_pending) {
+-   dp_credit.band[b].owner_pending=dp_credit.sta[b][wi];
+-   dp_credit.band[b].owner_wcid=wi;
+-  }
+  v[0]=1;v[1]=seq;v[2]=dp_session;v[3]=dp_epoch;
+- v[4]=75;v[5]=cpu_clock_get();v[6]=(u32)csr_read(mcycle)>>8;
++ v[4]=76;v[5]=cpu_clock_get();v[6]=(u32)csr_read(mcycle)>>8;
+  v[7]=dp_free_count;v[8]=dp_wait_count;
+  v[9]=dp->done.producer;v[10]=dp->done.consumer;v[11]=DP_CREDIT_RESERVE;
+  for (u32 b=0;b<2;b++) {
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -71,6 +71,7 @@
+ 	struct kdp_packet packet;
+ };
+ #include "kite-credit.inc"
++#include "kite-feed.inc"
+ #include "kite-observe.inc"
+ #include "kite-fast.inc"
+ static u32 dp_len[2];
+@@ -154,6 +155,7 @@
+  dp_private.context_valid = dp_batch_valid;
+  dp_private.route_tag[0] = dp_private.route_tag[1] = 0;
+  dp_private.sta_checked[0] = dp_private.sta_checked[1] = 0;
++ dp_private.hint_checked[0] = dp_private.hint_checked[1] = 0;
+  dp_private.context_session = dp_session; dp_private.context_epoch = dp_epoch;
+  dp_freed_defer = 1;
+ }
+@@ -163,6 +165,7 @@
+  dp_publish_freed(); dp_freed_defer = 0;
+  dp_private.context_valid = 0; dp_batch_valid = 0;
+  dp_private.sta_checked[0] = dp_private.sta_checked[1] = 0;
++ dp_private.hint_checked[0] = dp_private.hint_checked[1] = 0;
+ }
+ static volatile struct kdp_shared *dp_tx_shared(void)
+ {
+@@ -285,7 +288,7 @@
+ 	dp_session = session;
+ 	dp_epoch = epoch;
+ 	dp_path_seq = 0;
+- dp_cost_seq[0]=dp_cost_seq[1]=0; dp_credit_seq=0;
++ dp_cost_seq[0]=dp_cost_seq[1]=0; dp_credit_seq=0; dp_feed_seq=0;
+ 	dp_ring = ring;
+ 	dp_observe_needs_init = 1; /* sample DRAM belongs exclusively to hart4 */
+ 	dp_alloc = dp_reap = 0;
+@@ -837,6 +840,7 @@
+  struct dp_publish_batch *q = &dp_batch[band];
+  u32 n, j;
+  if (!dp) return;
++ dp_feed_batch(band,dp_observe_sample[band]);
+  dp_service.band[band].wifi_publishes++;
+  dp_observe_gap(band,1);
+  for (n = 0; n < q->packets; n++) {
+@@ -919,6 +923,7 @@
+ 	desc = dp_ring + band * DP_TDMA_BYTES + dp_idx[band] * 32;
+ 	len = REG32(desc + 4);
+  if (!(len & 0x80000000u)) {
++  dp_feed.reason[band]=1;dp_feed.empty[band]=1;
+ 		dp_obs.band[band].tdma_empty++;
+   dp_observe_empty(band,1);
+ 		dp_performance[band].reserved[KDP_PERF_TDMA_EMPTY]++;
+@@ -973,6 +978,7 @@
+    dp->stats[band].reserved[KDP_STAT_TX_ADMISSION_DROP]++; goto drop;
+   }
+   if (gate) {
++   dp_feed.reason[band]=5;
+    if (dp_gate_hold(band)) return 0;
+    dp->quality[band].gate_drop++;
+    dp->stats[band].reserved[KDP_STAT_TX_ADMISSION_DROP]++; goto drop;
+@@ -1002,6 +1008,7 @@
+   dp->quality[band].blocked_drop++; goto drop;
+  }
+  if (blocked) {
++  dp_feed.reason[band]=4;
+   if (dp_ps_fallback(band,token,addr,len,wcid,&sc->value)) return 0;
+   goto drop; /* PS exception rejection has distinct r60 reason counters. */
+  }
+@@ -1013,6 +1020,7 @@
+  cache=&dp_parse[band];
+  if (!dp_free_count && (dp_perf_flags & KDP_PERF_FAST) && cache->valid &&
+      cache->token==token && cache->len==len && cache->tag==tag) {
++  dp_feed.reason[band]=2;
+   dp_credit_wait(band, 1);
+   dp_r63.band[band].full_skip++;
+   dp_performance[band].retry++; dp->stats[band].tx_full++;
+@@ -1127,9 +1135,10 @@
+ 		return 0;
+ 	}
+ 	if (dp_batch[band].packets >= 16) { dp->fault = 6; return 0; }
+- if (dp_credit_hold(band)) return 0;
++ if (dp_credit_hold(band)) { dp_feed.reason[band]=3; return 0; }
+ 	replacement = dp_alloc_token();
+ 	if (replacement < 0) {
++  dp_feed.reason[band]=2;
+   dp_credit_wait(band, 1);
+ 		/* Cache only a held packet-> The common successful submission
+ 		 * pays no packet-key copy or cache-line writes. */
+@@ -1205,7 +1214,7 @@
+  if (dp_wait_count >= KDP_TOKENS || (dp_pending[token >> 5] & (1u << (token & 31)))) {
+   dp_tune.bitmap_fault++; dp->fault = 4; return;
+  }
+- if (!dp_credit_commit(token, band, dp_batch[band].wcid[dp_batch[band].packets])) {
++ if (!dp_credit_commit(token, band)) {
+   dp_tune.bitmap_fault++; dp->fault=4; return;
+  }
+  dp_wait_count++;
+@@ -1216,7 +1225,6 @@
+   if (!(dp_wait_count & 127)) dp_pressure(1);
+  }
+  if (dp_free_count >= 64) dp_pressure_armed = 1;
+- if (dp_batch[band].packets >= 16) { dp->fault = 6; return; }
+  dp_batch[band].token[dp_batch[band].packets] = token;
+  dp_batch[band].tid[dp_batch[band].packets++] = dp_tid[band];
+ 	dp_observe_submit(band, token);
+--- a/npu_kite_tx.c
++++ b/npu_kite_tx.c
+@@ -155,8 +155,8 @@
+  volatile struct kite_tx_shared *s = t->s;
+  u32 stamp, service_stamp = kite_dp_service_stamp();
+  u32 cost = kite_dp_cost_stamp(b);
++ if (s->hw_producer == t->hw_producer) return;
+  kite_dp_tx_flush(b);
+- if (s->hw_producer == t->hw_producer) return;
+  /* All ledger/payload/descriptor writes precede the doorbell. */
+  tx_fence();
+  stamp = kite_dp_observe_mmio(b);
+@@ -290,6 +290,7 @@
+    if (s->fault) break;
+ 		}
+ 	}
++ kite_dp_feed_end(b,obs_full,ppe_submitted==KITE_TX_BUDGET);
+  if (ppe_submitted) s->ppe_submitted += ppe_submitted;
+  kite_tx_publish(t, b); /* full, held, fallback and partial tail */
+  if (!obs_packets) kite_dp_observe_batch(b, obs_full, 0, 0);
+@@ -300,10 +301,8 @@
+ }
+ static void kite_tx_step(u32 b)
+ {
+- kite_dp_tx_begin();
+  kite_tx_step_inner(b);
+  kite_dp_tx_flush(b);
+- kite_dp_tx_end();
+ }
+ 
+ void kite_tx_loop(void)
+@@ -333,9 +332,13 @@
+   u32 service_stamp = kite_dp_service_stamp();
+ 		kite_dp_tx_reap();
+   kite_dp_service_time(KDP_SERVICE_REAP, service_stamp, 1);
++  /* Both bounded bands share immutable mapping proof until the next PARK.
++   * Admission, policy versions and DMA/WA proof remain live. */
++  kite_dp_tx_begin();
+ 		kite_tx_step(0);
+   kite_dp_tx_pressure_reap();
+ 		kite_tx_step(1);
++  kite_dp_tx_end();
+ 		kite_dp_observe_loop_end();
+ 	}
+ }
+--- a/kite-observe.inc
++++ b/kite-observe.inc
+@@ -111,6 +111,7 @@
+  for (u32 b=0;b<2;b++) {
+   dp_credit.band[b].dma_wait=dp_credit.band[b].wa_wait=dp_credit.band[b].ready_wait=0;
+  }
++ npu_memset(dp_credit.sta,0,sizeof(dp_credit.sta));
+  dp_credit.pressure_tick=dp_r63.pressure_tick;
+  now = dp_observe_mask ? (u32)csr_read(mcycle) >> 8 : 0;
+  for (i = 0; i < KDP_TOKENS; i++) {
+@@ -122,14 +123,23 @@
+   volatile struct kdp_token *t = &dp->token[i];
+   u32 seq = t->submitted, dma = t->dma_done, wa = t->wa_done;
+   u32 age = dp_observe_mask ? (now - dp_born[i]) & 0xffffffu : 0;
+-  u32 band=t->band;
+-  if (band>1) { dp_tune.bitmap_fault++; dp->fault=4; break; }
++  u32 band=t->band, wi=t->wcid;
++  if (band>1 || !wi || wi>=KDP_WCIDS) { dp_tune.bitmap_fault++; dp->fault=4; break; }
++  dp_credit.sta[band][wi]++;
+   dp_credit.band[band].dma_wait += dma != seq;
+   dp_credit.band[band].wa_wait += wa != seq;
+   dp_credit.band[band].ready_wait += dma == seq && wa == seq;
+   dp_tune.dma_wait += dma != seq; dp_tune.wa_wait += wa != seq;
+   dp_tune.ready_wait += dma == seq && wa == seq;
+   if (age > dp_tune.oldest_ticks) dp_tune.oldest_ticks = age;
++ }
++ for (u32 b=0;b<2;b++) {
++  struct dp_credit_band *v=&dp_credit.band[b];
++  v->owner_wcid=v->owner_pending=0;
++  for (u32 wi=1;wi<KDP_WCIDS;wi++) if (dp_credit.sta[b][wi]>v->owner_pending) {
++   v->owner_wcid=wi; v->owner_pending=dp_credit.sta[b][wi];
++  }
++  if (v->owner_pending>v->sta_peak) v->sta_peak=v->owner_pending;
+  }
+  elapsed=(u32)csr_read(mcycle)-start; dp_diag[2]+=elapsed;
+  if (elapsed>dp_diag[3]) dp_diag[3]=elapsed;
+@@ -208,6 +218,7 @@
+  /* Only hart4 initializes its cached accumulators. Publish reset identity
+   * before normal sampling; readers never see previous-session statistics. */
+  dp_credit_init();
++ npu_memset(&dp_feed,0,sizeof(dp_feed));
+  npu_memset(dp_cost,0,sizeof(dp_cost));
+  for (u32 b=0;b<2;b++) {
+   dp_cost[b].session=dp_session; dp_cost[b].epoch=dp_epoch;
+@@ -376,7 +387,7 @@
+  start = csr_read(mcycle);
+  dp_observe_published = start;
+  dp_obs.publishes++;
+- dp_cost_publish(0); dp_cost_publish(1); dp_credit_publish();
++ dp_cost_publish(0); dp_cost_publish(1); dp_credit_publish(); dp_feed_publish();
+  seq=dp->r63.seq+1; dp->r63.seq=seq; KDP_BARRIER();
+  dp->r63.tick=dp_observe_tick(); dp->r63.pressure_tick=dp_r63.pressure_tick;
+  dp_snapshot_words((void *)dp->r63.band,dp_r63.band,sizeof(dp_r63.band));
+--- a/kite-datapath-fw.h
++++ b/kite-datapath-fw.h
+@@ -86,3 +86,6 @@
+ { return band < 2 && dp_observe_sample[band] ? kite_dp_observe_mmio_sampled(band) : 0; }
+ 
+ #endif
++
++void kite_dp_feed_end(u32 band, u32 full, u32 exhausted);
++void kite_dp_feed_snapshot(u32 *out);
+--- a/kite-fast.inc
++++ b/kite-fast.inc
+@@ -67,6 +67,7 @@
+  u32 context_valid, context_session, context_epoch;
+  u32 sta_checked[2], bridge_first[2];
+  u32 route_tag[2], route_wcid[2];
++ u32 hint_checked[2]; /* immutable identity proof; cleared at begin/end and fill */
+  u32 last_hint[2]; /* tail keeps all r64 cache offsets; index + 1, not authority */
+ } dp_private __attribute__((section(".kite_private"), aligned(64)));
+ _Static_assert(sizeof(dp_private) <= 8192, "private cache budget");
+@@ -257,6 +258,7 @@
+  h = &dp_hint[band][set][way];
+  if (h->cap_version && (h->capture != capture || h->exact != exact))
+   dp_obs.band[band].hint_replace++;
++ dp_private.hint_checked[band] &= ~(1u << (set*DP_HINT_WAYS+way));
+  h->cap_version = 0;
+  h->capture = capture; h->exact = exact; h->key = key;
+  h->session = match.session; h->generation = match.generation;
+@@ -461,9 +463,15 @@
+      h->protocol!=p->protocol || h->mac[0]!=p->mac[0] ||
+      h->mac[1]!=p->mac[1] || h->mac[2]!=p->mac[2] ||
+      h->vlan!=KDP_SLOT_NONE || (h->cap_ds & h->cap_mask) ||
+-     (h->exact_ds & h->exact_mask) || h->wcid!=wcid || h->band!=band ||
+-     h->generation!=sta->generation || h->key_generation!=sta->key_generation ||
+-     h->tag!=sta->tx_tag || h->bss!=sta->bss || h->session!=dp_policy_session(s)) goto next;
++     (h->exact_ds & h->exact_mask) || h->wcid!=wcid || h->band!=band) goto next;
++ /* The hint's immutable identity was already matched to this STA snapshot
++  * in this bounded begin/end. Fill invalidates its bit; PARK invalidates
++  * the whole cache. This never caches wire matching or policy versions. */
++ if (!dp_private.context_valid || !(dp_private.hint_checked[band] & (1u<<index))) {
++  if (h->generation!=sta->generation || h->key_generation!=sta->key_generation ||
++      h->tag!=sta->tx_tag || h->bss!=sta->bss || h->session!=dp_policy_session(s)) goto next;
++  if (dp_private.context_valid) dp_private.hint_checked[band] |= 1u<<index;
++ }
+  /* Private exact data is valid only while both live publications agree.
+   * Lifecycle changes PARK hart4; host policy versions never ABA. */
+  KDP_BARRIER();
+--- a/npu_wifi.c
++++ b/npu_wifi.c
+@@ -69,7 +69,7 @@
+ 	u32 page = msg[0] & 15, i;
+ 	u32 *d = msg + 2;
+ 
+-	if (cnt != 256 || page > 7)
++	if (cnt != 256 || page > 8)
+ 		return 0;
+ 	for (i = 0; i < 62; i++)
+ 		d[i] = 0;
+@@ -125,6 +125,9 @@
+ 	} else if (page == 4) {
+ 		kite_dp_path_snapshot(d + 4);
+ 		d[61] = 0x4b500001; /* KP1 last exact-policy miss, observational */
++	} else if (page == 8) {
++  kite_dp_feed_snapshot(d + 4);
++  d[61] = 0x4b450001; /* FE1 */
+ 	} else if (page == 7) {
+   kite_dp_queue_snapshot(d + 4);
+   d[61] = 0x4b460001; /* KF1 */
+--- a/npu_wifi.h
++++ b/npu_wifi.h
+@@ -370,3 +370,5 @@
+ #endif
+ 
+ #endif /* NPU_WIFI_H */
++
++void kite_dp_feed_snapshot(u32 *out);
+--- a/kite-feed.inc
++++ b/kite-feed.inc
+@@ -0,0 +1,70 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Hart4-only, per-batch diagnostics. No ownership or admission authority.
++ * FE1 stays out of shared datapath ABI12 and is published uncached. */
++struct dp_feed_band {
++ u32 batches, packets, hist[5], end[8];
++ u32 mixed, wcid, tid, run_max, gap_samples, gap_cycles, gap_max;
++ u32 ready_gap_samples, ready_gap_cycles;
++};
++static struct {
++ struct dp_feed_band band[2];
++ u32 reason[2], stamp[2], armed[2], empty[2];
++} dp_feed __attribute__((section(".kite_observe")));
++static u32 dp_feed_storage[64] __attribute__((section(".kite_observe"),aligned(64)));
++static volatile u32 dp_feed_seq;
++static void dp_feed_batch(u32 band, u32 sampled)
++{
++ struct dp_publish_batch *q=&dp_batch[band];
++ struct dp_feed_band *v=&dp_feed.band[band];
++ u32 n=q->packets, bin;
++ if (!n) return;
++ bin=n==1?0:n<=4?1:n<=8?2:n<16?3:4;
++ v->batches++;v->packets+=n;v->hist[bin]++;
++ if (sampled) {
++  u32 now=csr_read(mcycle),run=0,wi=KDP_SLOT_NONE,tid=KDP_SLOT_NONE,mixed=0;
++  for (u32 i=0;i<n;i++) {
++   if (q->wcid[i]!=wi || q->tid[i]!=tid) {
++    mixed+=!!run;run=0;wi=q->wcid[i];tid=q->tid[i];
++   }
++   run++;if (run>v->run_max) v->run_max=run;
++  }
++  v->mixed+=!!mixed;v->wcid=wi;v->tid=tid;
++  if (dp_feed.armed[band]) {
++   u32 gap=now-dp_feed.stamp[band];
++   v->gap_samples++;v->gap_cycles+=gap;if(gap>v->gap_max)v->gap_max=gap;
++   if (!dp_feed.empty[band]) {v->ready_gap_samples++;v->ready_gap_cycles+=gap;}
++  }
++  dp_feed.stamp[band]=now;dp_feed.empty[band]=0;
++ }
++ /* Only adjacent sampled batches form an interval; unsampled work resets. */
++ dp_feed.armed[band]=!!sampled;
++}
++void kite_dp_feed_end(u32 band, u32 full, u32 exhausted)
++{
++ if (band>1) return;
++ u32 why=full?6:exhausted?7:dp_feed.reason[band];
++ if (why>7) why=0;
++ dp_feed.band[band].end[why]++;
++ dp_feed.reason[band]=0;
++}
++static void dp_feed_publish(void)
++{
++ volatile u32 *v=KDP_DIAG_UNCACHED(dp_feed_storage);
++ u32 seq=(dp_feed_seq&~1u)+2;if(!seq)seq=2;
++ dp_feed_seq=seq-1;KDP_BARRIER();
++ v[0]=1;v[1]=seq;v[2]=dp_session;v[3]=dp_epoch;v[4]=76;
++ v[5]=cpu_clock_get();v[6]=(u32)csr_read(mcycle)>>8;
++ v[7]=0;v[8]=0;
++ for(u32 b=0;b<2;b++)for(u32 i=0;i<24;i++)v[9+b*24+i]=((u32*)&dp_feed.band[b])[i];
++ KDP_BARRIER();dp_feed_seq=seq;
++}
++void kite_dp_feed_snapshot(u32 *out)
++{
++ const volatile u32 *v=KDP_DIAG_UNCACHED(dp_feed_storage);
++ for(u32 retry=0;retry<3;retry++){
++  u32 seq=dp_feed_seq;if(!seq||(seq&1))continue;
++  KDP_BARRIER();for(u32 i=0;i<57;i++)out[i]=v[i];KDP_BARRIER();
++  if(seq==dp_feed_seq&&out[1]==seq)return;
++ }
++ for(u32 i=0;i<57;i++)out[i]=0;
++}

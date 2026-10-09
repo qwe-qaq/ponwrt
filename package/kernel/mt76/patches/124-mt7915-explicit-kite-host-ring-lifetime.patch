@@ -1,0 +1,184 @@
+--- a/mt7915/kite-control.h
++++ b/mt7915/kite-control.h
+@@ -23,6 +23,7 @@
+ #define KITE_CTL_CAP_CONTROL_ONLY 16u
+ #define KITE_CTL_CAP_ARM_PA 32u
+ #define KITE_CTL_CAPS 63u
++#define KITE_CTL_CAP_HOST_RING 64u /* optional explicit bind/unbind, not DMA ownership */
+ #define KITE_CTL_MODE_DATA 0u
+ #define KITE_CTL_MODE_CONTROL_ONLY 1u
+ 
+@@ -55,6 +56,8 @@
+ 	KITE_CTL_KEY, /* wcid, generation, key generation, cipher, keyid */
+ 	KITE_CTL_BA, /* wcid, generation, tid, window (0=DELBA), SSN */
+ 	KITE_CTL_CLOSE,
++	KITE_CTL_HOST_BIND, /* ring0 ARM PA, ring1 ARM PA or 0, bands (1 or 3), count512 */
++	KITE_CTL_HOST_UNBIND, /* expected bind serial; host writer only, not full DMA stop */
+ };
+ enum kite_ctl_result {
+ 	KITE_CTL_OK,
+@@ -69,6 +72,7 @@
+ 	KITE_CTL_RUNNING,
+ 	KITE_CTL_PARKING,
+ 	KITE_CTL_PARKED,
++	KITE_CTL_FAULTED, /* DMA completion unknown; no reclaim or automatic resume */
+ };
+ /* Reply: magic, words, capabilities, session, last serial, result, state,
+  * ack mask, WCID count, required DRAM bytes, accepted commands, rejected
+--- /dev/null
++++ b/mt7915/kite-host.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PONWRT_KITE_HOST_H
++#define PONWRT_KITE_HOST_H
++
++/* Firmware source ownership is retained on HOLD, including a partial
++ * chain. Neither DONE nor the producer index may be published. */
++#define KITE_HOST_HOLD (-2)
++#define KITE_HOST_DIAG_MAGIC 0x4b480001u
++#define KITE_HOST_RING_COUNT 512u
++#define KITE_HOST_RING_BYTES (KITE_HOST_RING_COUNT * 24u)
++
++static inline int kite_host_ring_valid(unsigned long long addr)
++{
++	return addr >= 0x80000000ull && addr < 0xc0000000ull &&
++	       !(addr & 63) && KITE_HOST_RING_BYTES <= 0xc0000000ull - addr;
++}
++
++#if defined(AN7581) && defined(MT7916)
++int kite_host_copy(u32 src, u32 dst, u32 len);
++int kite_host_dma_idle(void);
++int kite_host_faulted(void);
++void kite_host_dma_snapshot(u32 *out);
++int kite_host_bind(u32 session, u32 epoch, u32 bandmask, u32 pa0, u32 pa1);
++int kite_host_unbind(u32 session, u32 epoch);
++u32 kite_host_bound(void);
++void kite_host_snapshot(u32 *out);
++#else
++static inline int kite_host_faulted(void) { return 0; }
++#endif
++#endif
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -265,10 +265,10 @@
+ 	struct {
+ 		struct mutex lock;
+ 		struct airoha_npu *control_npu;
+-		u32 session, serial;
++		u32 session, serial, host_epoch;
+ 		u32 generation[MT7916_WTBL_SIZE];
+ 		u32 key_generation[MT7916_WTBL_SIZE];
+-		bool active, failed, control_only;
++		bool active, failed, control_only, host_bound;
+ 		bool live[MT7916_WTBL_SIZE];
+ 	} kite;
+ #endif
+@@ -486,6 +486,8 @@
+ void mt7915_npu_control_detach(struct mt7915_dev *dev);
+ int mt7915_npu_control_open(struct mt7915_dev *dev);
+ int mt7915_npu_control_resume(struct mt7915_dev *dev);
++int mt7915_npu_host_bind(struct mt7915_dev *dev, u64 pa0, u64 pa1, u32 bands);
++int mt7915_npu_host_unbind(struct mt7915_dev *dev);
+ int mt7915_npu_sta_add(struct mt7915_dev *dev, struct mt7915_sta *msta);
+ int mt7915_npu_port(struct mt7915_dev *dev, struct mt7915_sta *msta, bool authorized);
+ void mt7915_npu_key_commit(struct mt7915_dev *dev, struct mt76_wcid *wcid,
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -5,6 +5,7 @@
+ #include <linux/of_reserved_mem.h>
+ #include "mt7915.h"
+ #include "kite-control.h"
++#include "kite-host.h"
+ 
+ /* Protected by kite.lock or probe/remove serialization. control_npu owns
+  * one supplier reference and never implies packet/DMA ownership. */
+@@ -217,6 +218,73 @@
+ 	return ret;
+ }
+ 
++/* Explicit firmware-writer lifetime. UNBIND is only one phase of stop:
++ * WFDMA, TDMA/PPE, NAPI and devm allocations still need their own drain
++ * and quarantine before a caller may reclaim pages or restart DMA. */
++int mt7915_npu_host_bind(struct mt7915_dev *dev, u64 pa0, u64 pa1, u32 bands)
++{
++	u32 s[KITE_CTL_WORDS], args[4];
++	int ret;
++
++	if (!dev->kite.active || dev->kite.control_only ||
++	    (bands != 1 && bands != 3) || !kite_host_ring_valid(pa0) ||
++	    (bands == 3 ? !kite_host_ring_valid(pa1) : pa1 != 0))
++		return -EINVAL;
++	args[0] = pa0;
++	args[1] = pa1;
++	args[2] = bands;
++	args[3] = KITE_HOST_RING_COUNT;
++	mutex_lock(&dev->kite.lock);
++	if (dev->kite.failed || dev->kite.host_bound) {
++		ret = -EBUSY;
++		goto out;
++	}
++	ret = mt7915_kite_status(dev, s);
++	if (!ret && !(s[2] & KITE_CTL_CAP_HOST_RING))
++		ret = -EOPNOTSUPP;
++	if (!ret)
++		ret = mt7915_kite_wait_parked(dev);
++	if (!ret) {
++		/* From submission onwards the result may be unknown. Keep the
++		 * host's ownership marker even on a mailbox/result failure. */
++		dev->kite.host_bound = true;
++		ret = mt7915_kite_command(dev, KITE_CTL_HOST_BIND, args, 4);
++		dev->kite.host_epoch = dev->kite.serial;
++	}
++	if (ret)
++		mt7915_kite_fault(dev, ret);
++out:
++	mutex_unlock(&dev->kite.lock);
++	return ret;
++}
++
++int mt7915_npu_host_unbind(struct mt7915_dev *dev)
++{
++	int ret = 0;
++
++	mutex_lock(&dev->kite.lock);
++	if (!dev->kite.host_bound)
++		goto out;
++	if (dev->kite.failed) {
++		ret = -EIO;
++		goto out;
++	}
++	ret = mt7915_kite_command(dev, KITE_CTL_PARK, NULL, 0);
++	if (!ret)
++		ret = mt7915_kite_wait_parked(dev);
++	if (!ret)
++		ret = mt7915_kite_command(dev, KITE_CTL_HOST_UNBIND,
++					 &dev->kite.host_epoch, 1);
++	if (!ret)
++		dev->kite.host_bound = false;
++	else
++		mt7915_kite_fault(dev, ret);
++	/* Deliberately leave workers parked, with all packet state intact. */
++out:
++	mutex_unlock(&dev->kite.lock);
++	return ret;
++}
++
+ /* Every update is one serialized PARK -> all workers ACK -> mutation ->
+  * RESUME transaction. A failed/timed-out request never permits speculative
+  * resume or reclaim; a timeout can leave the park status unconfirmed. */
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -131,6 +131,13 @@
+ 			return ret;
+ 	}
+ 
++	/* No register auto-latch: a fresh control session explicitly binds
++	 * the prepared host rings before Wi-Fi RX descriptors are enabled. */
++	ret = mt7915_npu_host_bind(dev, mdev->q_rx[MT_RXQ_NPU0].desc_dma,
++		dev->dbdc_support ? mdev->q_rx[MT_RXQ_NPU1].desc_dma : 0,
++		dev->dbdc_support ? 3 : 1);
++	if (ret)
++		return ret;
+ 
+ 	ret = mt7915_npu_program_band(dev, 0, &mdev->q_rx[MT_RXQ_MAIN],
+ 				      MT_RXQ_RING_BASE(MT_RXQ_MAIN) +

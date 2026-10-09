@@ -1,0 +1,77 @@
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -4074,6 +4074,14 @@
+  * handle or, in some cases, must handle, for example to configure
+  * the hardware to a new channel or to transmit a frame.
+  *
++ * @sta_tx_activity: Optional atomic query of newly published offloaded traffic
++ *	for one station/TID, called by the TX BA inactivity timer. Must not sleep.
++ *	Return true once per new activity observation, with current station/key
++ *	identity validation. Does not replace peer ACK or BA negotiation.
++ * @sta_tx_agg_event: Optional atomic BA diagnostic notification. Events are
++ *	1: ADDBA response (value=status, timeout=TU), 2: peer DELBA
++ *	(value=reason, timeout=initiator), 3: local inactivity (timeout=TU).
++ *	Must not sleep or change BA state from this callback.
+  * @tx: Handler that 802.11 module calls for each transmitted frame.
+  *	skb contains the buffer starting from the IEEE 802.11 header.
+  *	The low-level driver should send the frame out based on
+@@ -4737,6 +4745,14 @@
+  *	notification frame.
+  */
+ struct ieee80211_ops {
++ /* Optional non-sleeping offload hooks. STA remains alive; timer context
++  * is possible. activity consumes evidence of actual per-TID TX since the
++  * previous observation, not pending completions or mere authorization.
++  * agg_event: 1 ADDBA response (status, timeout), 2 peer DELBA (reason,
++  * initiator), 3 local inactivity (0, timeout). No callback grants BA. */
++ bool (*sta_tx_activity)(struct ieee80211_hw *hw, struct ieee80211_sta *sta, u8 tid);
++ void (*sta_tx_agg_event)(struct ieee80211_hw *hw, struct ieee80211_sta *sta,
++                         u8 tid, u8 event, u16 value, u16 timeout);
+ 	void (*tx)(struct ieee80211_hw *hw,
+ 		   struct ieee80211_tx_control *control,
+ 		   struct sk_buff *skb);
+--- a/net/mac80211/agg-tx.c
++++ b/net/mac80211/agg-tx.c
+@@ -588,12 +588,20 @@
+ 		return;
+ 	}
+ 
++ /* A short peer inactivity timeout must not race a coarse driver worker.
++  * Query actual offloaded TX at expiry as well. The driver may not sleep. */
++ if (!test_bit(HT_AGG_STATE_WANT_STOP, &tid_tx->state) &&
++     sta->local->ops->sta_tx_activity &&
++     sta->local->ops->sta_tx_activity(&sta->local->hw, &sta->sta, tid))
++  WRITE_ONCE(tid_tx->last_tx, jiffies);
+ 	timeout = tid_tx->last_tx + TU_TO_JIFFIES(tid_tx->timeout);
+ 	if (time_is_after_jiffies(timeout)) {
+ 		mod_timer(&tid_tx->session_timer, timeout);
+ 		return;
+ 	}
+ 
++ if (sta->local->ops->sta_tx_agg_event)
++  sta->local->ops->sta_tx_agg_event(&sta->local->hw, &sta->sta, tid, 3, 0, tid_tx->timeout);
+ 	ht_dbg(sta->sdata, "tx session timer expired on %pM tid %d\n",
+ 	       sta->sta.addr, tid);
+ 
+@@ -1031,6 +1039,9 @@
+ 		return;
+ 	}
+ 
++ if (local->ops->sta_tx_agg_event)
++  local->ops->sta_tx_agg_event(&local->hw, &sta->sta, tid, 1,
++   le16_to_cpu(mgmt->u.action.addba_resp.status), le16_to_cpu(mgmt->u.action.addba_resp.timeout));
+ 	/*
+ 	 * IEEE 802.11-2007 7.3.1.14:
+ 	 * In an ADDBA Response frame, when the Status Code field
+--- a/net/mac80211/ht.c
++++ b/net/mac80211/ht.c
+@@ -472,6 +472,9 @@
+ 			   tid,
+ 			   le16_to_cpu(mgmt->u.action.delba.reason_code));
+ 
++ if (sdata->local->ops->sta_tx_agg_event)
++  sdata->local->ops->sta_tx_agg_event(&sdata->local->hw, &sta->sta, tid, 2,
++   le16_to_cpu(mgmt->u.action.delba.reason_code), initiator);
+ 	if (initiator == WLAN_BACK_INITIATOR)
+ 		__ieee80211_stop_rx_ba_session(sta, tid, WLAN_BACK_INITIATOR, 0,
+ 					       true);

@@ -1,0 +1,256 @@
+Subject: [PATCH] admit strict bridge L4 capture policies to Kite
+
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -261,6 +261,113 @@
+ 	return true;
+ }
+ 
++/* Broad PPE L2 capture plus a strict NPU L4 policy. The FOE itself only
++ * receives exact MAC/VLAN forwarding fields; all supported L3/L4 keys are
++ * retained in kdp_flow and checked after capture. Isolation-domain matches
++ * are rejected because the NPU packet metadata has no ingress-port field. */
++static bool airoha_kite_bridge_l4_rule(const struct flow_rule *rule)
++{
++	const struct flow_action_entry *act;
++	struct flow_match_control control;
++	struct flow_match_eth_addrs eth;
++	struct flow_match_basic basic;
++	struct flow_match_ports ports;
++	int i;
++	bool bridge = false, redirect = false;
++
++	if (!(rule->match.dissector->used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_META)) ||
++	    !(rule->match.dissector->used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL)) ||
++	    !(rule->match.dissector->used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_BASIC)) ||
++	    !(rule->match.dissector->used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_ETH_ADDRS)) ||
++	    !(rule->match.dissector->used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_PORTS)) ||
++	    (!(rule->match.dissector->used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_IPV4_ADDRS)) &&
++	     !(rule->match.dissector->used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_IPV6_ADDRS))))
++		return false;
++
++	flow_action_for_each(i, act, &rule->action) {
++		switch (act->id) {
++		case FLOW_ACTION_BRIDGE:
++			bridge = true;
++			break;
++		case FLOW_ACTION_REDIRECT:
++			redirect = true;
++			break;
++		default:
++			return false;
++		}
++	}
++	if (!bridge || !redirect)
++		return false;
++
++	flow_rule_match_control(rule, &control);
++	if (control.key->addr_type || control.mask->addr_type != U16_MAX ||
++	    control.mask->flags)
++		return false;
++	flow_rule_match_eth_addrs(rule, &eth);
++	if (!airoha_kite_mask_full(eth.mask->src, ETH_ALEN) ||
++	    !airoha_kite_mask_full(eth.mask->dst, ETH_ALEN) ||
++	    !is_valid_ether_addr(eth.key->src) ||
++	    !is_valid_ether_addr(eth.key->dst))
++		return false;
++	flow_rule_match_basic(rule, &basic);
++	if (basic.mask->ip_proto != 0xff ||
++	    (basic.key->ip_proto != IPPROTO_TCP && basic.key->ip_proto != IPPROTO_UDP) ||
++	    (basic.mask->n_proto && basic.mask->n_proto != htons(U16_MAX)))
++		return false;
++	flow_rule_match_ports(rule, &ports);
++	if (ports.mask->src != htons(U16_MAX) || ports.mask->dst != htons(U16_MAX))
++		return false;
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META)) {
++		struct flow_match_meta meta;
++		flow_rule_match_meta(rule, &meta);
++		/* No ingress-port/isolation field exists in the NPU packet key. */
++		if (meta.mask->ingress_ifindex)
++			return false;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IP)) {
++		struct flow_match_ip ip;
++		flow_rule_match_ip(rule, &ip);
++		if (ip.mask->ttl)
++			return false;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS) &&
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV6_ADDRS))
++		return false;
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS)) {
++		struct flow_match_ipv4_addrs a;
++		flow_rule_match_ipv4_addrs(rule, &a);
++		if (a.mask->src != cpu_to_be32(U32_MAX) ||
++		    a.mask->dst != cpu_to_be32(U32_MAX))
++			return false;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV6_ADDRS)) {
++		struct flow_match_ipv6_addrs a;
++		flow_rule_match_ipv6_addrs(rule, &a);
++		for (i = 0; i < 4; i++)
++			if (a.mask->src.s6_addr32[i] != cpu_to_be32(U32_MAX) ||
++			    a.mask->dst.s6_addr32[i] != cpu_to_be32(U32_MAX))
++				return false;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN)) {
++		struct flow_match_vlan vlan;
++		flow_rule_match_vlan(rule, &vlan);
++		if (vlan.key->vlan_tpid != htons(ETH_P_8021Q) ||
++		    vlan.mask->vlan_id != VLAN_VID_MASK)
++			return false;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_TCP)) {
++		struct flow_match_tcp tcp;
++		flow_rule_match_tcp(rule, &tcp);
++		/* kdp_flow has no TCP flag field; never widen a flag rule. */
++		if (tcp.mask->flags)
++			return false;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN) ||
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_CONTROL))
++		return false;
++	return true;
++}
++
+ static int airoha_kite_flow_prepare(struct airoha_ppe *ppe,
+ 	struct airoha_flow_table_entry *e, struct flow_rule *rule,
+ 	struct net_device *odev, const struct ethhdr *eth)
+@@ -272,6 +379,7 @@
+ 	struct net_device *idev;
+ 	struct kdp_flow *k = &e->kite_key;
+ 	u32 i, bucket;
++	bool bridge_l4 = airoha_kite_bridge_l4_rule(rule);
+ 	int ret = 0;
+ 
+ 	lockdep_assert_held(&flow_offload_mutex);
+@@ -295,6 +403,43 @@
+ 		e->kite_out_key = out.airoha_npu.key_generation;
+ 		e->kite_session = out.airoha_npu.session;
+ 	}
++	/* A bridge L4 rule is a downlink capture policy. The PPE entry keeps
++	 * exact MAC forwarding, while the NPU receives the complete tuple below. */
++	if (bridge_l4) {
++		if (out.type != DEV_PATH_AIROHA_NPU)
++			return -EOPNOTSUPP;
++		flow_rule_match_meta(rule, &meta);
++		idev = dev_get_by_index(dev_net(odev), meta.key->ingress_ifindex);
++		if (!idev)
++			return -ENODEV;
++		if (idev->ieee80211_ptr) {
++			ret = -EOPNOTSUPP;
++			goto put;
++		}
++		flow_rule_match_eth_addrs(rule, &mac);
++		if (!ether_addr_equal(mac.key->dst, s->sta[out.airoha_npu.wcid].addr)) {
++			ret = -EOPNOTSUPP;
++			goto put;
++		}
++		k->session = out.airoha_npu.session;
++		k->generation = out.airoha_npu.generation;
++		k->key_generation = out.airoha_npu.key_generation;
++		k->wcid = out.airoha_npu.wcid;
++		k->band = out.airoha_npu.band;
++		k->bss = out.airoha_npu.bss;
++		ether_addr_copy(k->smac, mac.key->src);
++		ether_addr_copy(k->dmac, mac.key->dst);
++		k->vlan = KDP_SLOT_NONE;
++		k->hw_slot = KDP_SLOT_NONE;
++		k->cookie_lo = lower_32_bits(e->cookie);
++		k->cookie_hi = upper_32_bits(e->cookie);
++		/* Use the destination STA as the policy owner so its lifecycle and
++		 * generation revoke the capture before a stale packet can transmit. */
++		e->kite_in_wcid = k->wcid;
++		e->kite_in_gen = k->generation;
++		e->kite_in_key = k->key_generation;
++		goto policy_ready;
++	}
+ 	/* L2B already carries the exact MAC pair and the verified output route
+ 	 * in the PPE descriptor. It has no NPU ingress policy to publish. */
+ 	if (airoha_kite_bridge_l2_rule(rule))
+@@ -346,7 +491,9 @@
+ 			goto put;
+ 		}
+ 	}
+-	k->session = in.airoha_npu.session;
++policy_ready:
++	if (!bridge_l4) {
++		k->session = in.airoha_npu.session;
+ 	k->generation = in.airoha_npu.generation;
+ 	k->key_generation = in.airoha_npu.key_generation;
+ 	k->wcid = in.airoha_npu.wcid;
+@@ -356,7 +503,8 @@
+ 	k->vlan = KDP_SLOT_NONE;
+ 	k->hw_slot = KDP_SLOT_NONE;
+ 	k->cookie_lo = lower_32_bits(e->cookie);
+-	k->cookie_hi = upper_32_bits(e->cookie);
++		k->cookie_hi = upper_32_bits(e->cookie);
++	}
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN) ||
+ 	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_CONTROL)) {
+ 		ret = -EOPNOTSUPP;
+@@ -396,7 +544,7 @@
+ 		}
+ 		k->src[0] = be32_to_cpu(a.key->src);
+ 		k->dst[0] = be32_to_cpu(a.key->dst);
+-		k->type = KDP_FLOW_IPV4;
++		k->type = bridge_l4 ? KDP_FLOW_BRIDGE_IPV4 : KDP_FLOW_IPV4;
+ 	} else if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV6_ADDRS)) {
+ 		struct flow_match_ipv6_addrs a;
+ 
+@@ -410,14 +558,14 @@
+ 			k->src[i] = be32_to_cpu(a.key->src.s6_addr32[i]);
+ 			k->dst[i] = be32_to_cpu(a.key->dst.s6_addr32[i]);
+ 		}
+-		k->type = KDP_FLOW_IPV6;
++		k->type = bridge_l4 ? KDP_FLOW_BRIDGE_IPV6 : KDP_FLOW_IPV6;
+ 	} else {
+ 		k->type = KDP_FLOW_BRIDGE;
+ 	}
+ 	/* The rule contains pre-route MACs. PPE egress MACs are supplied by
+ 	 * native Ethernet MANGLE actions; never substitute BSSID here. */
+ 	ether_addr_copy(k->dmac, mac.key->dst);
+-	if (k->type != KDP_FLOW_BRIDGE) {
++	if (k->type == KDP_FLOW_IPV4 || k->type == KDP_FLOW_IPV6) {
+ 		atomic64_inc(&ppe->kite_routed_ingress);
+ 		if (!ether_addr_equal(k->dmac, eth->h_dest))
+ 			atomic64_inc(&ppe->kite_routed_mac_rewrite);
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1324,7 +1324,8 @@
+ 	flow_action_for_each(i, act, &rule->action) {
+ 		if (act->id != FLOW_ACTION_BRIDGE)
+ 			continue;
+-		if (airoha_kite_bridge_l2_rule(rule))
++		if (airoha_kite_bridge_l2_rule(rule) ||
++		    airoha_kite_bridge_l4_rule(rule))
+ 			continue;
+ 		NL_SET_ERR_MSG_MOD(extack,
+ 			"PPE cannot represent exact bridge L4/domain policy; software forwarding retained");
+@@ -1507,10 +1508,13 @@
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS)) {
+ 		struct flow_match_ports ports;
+ 
+-		if (offload_type == PPE_PKT_TYPE_BRIDGE)
++		if (offload_type == PPE_PKT_TYPE_BRIDGE &&
++		    !airoha_kite_bridge_l4_rule(rule))
+ 			return -EOPNOTSUPP;
+ 
+-		flow_rule_match_ports(rule, &ports);
++		/* Native L2B ignores the tuple; the NPU policy retains it. */
++		if (offload_type != PPE_PKT_TYPE_BRIDGE)
++			flow_rule_match_ports(rule, &ports);
+ 		data.src_port = ports.key->src;
+ 		data.dst_port = ports.key->dst;
+ 	} else if (offload_type != PPE_PKT_TYPE_BRIDGE) {
+--- a/include/linux/soc/airoha/kite-datapath.h
++++ b/include/linux/soc/airoha/kite-datapath.h
+@@ -106,6 +106,8 @@
+ #define KDP_FLOW_IPV4 1u
+ #define KDP_FLOW_IPV6 2u
+ #define KDP_FLOW_BRIDGE 3u
++#define KDP_FLOW_BRIDGE_IPV4 4u
++#define KDP_FLOW_BRIDGE_IPV6 5u
+ #define KDP_SLOT_NONE 0xffffffffu
+ 
+ struct kdp_sta {

@@ -1,0 +1,136 @@
+Subject: mt7915: harden Kite recovery and TX ring backpressure
+
+Separate transient TX ring pressure from the lifecycle gate, clear it after
+DMA cleanup, and make it visible in debugfs. A STOPPED Kite session uses the
+proven recovery transaction for TX_UNBIND. Restart errors retain both radio
+run intents and quarantine only when DMA ownership cannot be proven stopped.
+
+--- a/mt76.h	2026-10-03 09:20:14.198153090 +0800
++++ b/mt76.h	2026-10-03 09:46:36.763577511 +0800
+@@ -251,7 +251,7 @@
+ 	/* Kite uses a separate 16-byte staging ring, never Eagle MT_QFLAG_NPU. */
+ 	struct kite_tx_shared *kite_tx;
+ 	dma_addr_t kite_tx_dma;
+-	bool kite_tx_active, kite_tx_blocked;
++	bool kite_tx_active, kite_tx_blocked, kite_tx_pressure;
+ 	u32 kite_kicks, kite_full, kite_gated, kite_wa_freed;
+ 	u32 kite_last_progress, kite_pending, kite_aborted;
+ 	u32 kite_rx_polls, kite_rx_frames, kite_rx_batches, kite_rx_invalid;
+--- a/dma.c	2026-10-03 09:20:14.168941746 +0800
++++ b/dma.c	2026-10-03 09:46:36.763833462 +0800
+@@ -478,6 +478,23 @@
+ 		spin_unlock_bh(&q->lock);
+ 	}
+ 
++	/* A ring-full return is ordinary backpressure, not a Kite fault.
++	 * Keep the lifecycle gate separate from this pressure bit: recovery may
++	 * hold q->kite_tx_blocked while cleanup makes the ring reusable. */
++	if (q->kite_tx) {
++		bool wake = false;
++
++		spin_lock_bh(&q->lock);
++		if (q->kite_tx_pressure &&
++		    q->queued + MT_TXQ_FREE_THR < q->ndesc) {
++			q->kite_tx_pressure = false;
++			wake = !q->kite_tx_blocked;
++		}
++		spin_unlock_bh(&q->lock);
++		if (wake)
++			mt76_worker_schedule(&dev->tx_worker);
++	}
++
+ 	if (!q->queued)
+ 		wake_up(&dev->tx_wait);
+ }
+@@ -754,8 +771,10 @@
+ 	tx_info.nbuf = n;
+ 
+ 	if (q->queued + (tx_info.nbuf + 1) / 2 >= q->ndesc - 1) {
+-		if (q->kite_tx)
++		if (q->kite_tx) {
+ 			q->kite_full++;
++			q->kite_tx_pressure = true;
++		}
+ 		ret = -ENOMEM;
+ 		goto unmap;
+ 	}
+--- a/tx.c	2026-10-03 09:20:14.172936996 +0800
++++ b/tx.c	2026-10-03 09:48:43.853750897 +0800
+@@ -486,6 +486,7 @@
+ mt76_txq_stopped(struct mt76_queue *q)
+ {
+ 	return q->stopped || q->blocked || READ_ONCE(q->kite_tx_blocked) ||
++	       READ_ONCE(q->kite_tx_pressure) ||
+ 	       q->queued + MT_TXQ_FREE_THR >= q->ndesc;
+ }
+ 
+--- a/mt7915/npu-control.c	2026-10-03 09:20:14.242023774 +0800
++++ b/mt7915/npu-control.c	2026-10-03 09:49:07.017489113 +0800
+@@ -948,6 +948,7 @@
+ 			break;
+ 		q->kite_tx_active = true;
+ 		q->kite_tx_blocked = false;
++		q->kite_tx_pressure = false;
+ 		q->kite_progress_at = jiffies;
+ 		q->kite_last_progress = READ_ONCE(q->kite_wa_freed);
+ 		q->kite_aborted += q->kite_pending;
+@@ -1003,7 +1004,11 @@
+ 		}
+ 	}
+ 	if (!ret) {
+-		if (dev->kite.failed)
++		/* STOPPED is a valid proven boundary after a partial firmware
++		 * drain. Use the recovery transaction there even when the original
++		 * failure latch was not set; the ordinary command path assumes the
++		 * workers are still PARKED and can reject TX_UNBIND. */
++		if (dev->kite.failed || stopped)
+ 			ret = mt7915_kite_recovery_command(dev, KITE_CTL_TX_UNBIND,
+ 							   NULL, 0, NULL);
+ 		else
+@@ -1245,8 +1250,8 @@
+ 		dma_rmb();
+ 		seq_printf(
+ 			seq,
+-			"band%d active=%u gate=%u epoch=%u input=%pad ring=%pad head=%u tail=%u queued=%d staged=%u published=%u dma=%u submitted=%u reaped=%u WA_freed=%u kicks=%u wraps=%u full=%u gated=%u cancelled=%u invalid=%u fault=%u polls=%u pending=%u aborted=%u\n",
+-			b, q->kite_tx_active, q->kite_tx_blocked,
++			"band%d active=%u gate=%u pressure=%u epoch=%u input=%pad ring=%pad head=%u tail=%u queued=%d staged=%u published=%u dma=%u submitted=%u reaped=%u WA_freed=%u kicks=%u wraps=%u full=%u gated=%u cancelled=%u invalid=%u fault=%u polls=%u pending=%u aborted=%u\n",
++			b, q->kite_tx_active, q->kite_tx_blocked, q->kite_tx_pressure,
+ 			kite_tx_read(&s->epoch), &q->kite_tx_dma, &q->desc_dma,
+ 			q->head, q->tail, q->queued, kite_tx_read(&s->producer),
+ 			kite_tx_read(&s->published),
+--- a/mt7915/mac.c	2026-10-03 09:20:14.246912443 +0800
++++ b/mt7915/mac.c	2026-10-03 09:48:07.870481962 +0800
+@@ -1453,7 +1453,7 @@
+ 	struct mt7915_phy *phy2;
+ 	struct mt76_phy *ext_phy;
+ 	struct mt76_dev *mdev = &dev->mt76;
+-	bool run_main, run_ext;
++	bool run_main = false, run_ext = false;
+ 	int ret;
+ 
+ 	ext_phy = dev->mt76.phys[MT_BAND1];
+@@ -1562,9 +1562,22 @@
+ 
+ out:
+ 	if (ret && mt76_npu_device_active(mdev)) {
+-		dev->recovery.failed = true;
++		int stop_ret;
++
+ 		mt7915_dma_napi_disable(dev);
+-		mt7915_dma_quiesce(dev);
++		stop_ret = mt7915_dma_quiesce(dev);
++		/* A firmware init/run error may be transient. Keep both radio
++		 * intents for the full-reset retry; only a failed DMA ownership
++		 * proof is allowed to quarantine the device permanently. */
++		if (run_main)
++			set_bit(MT76_STATE_RUNNING, &dev->mphy.state);
++		if (run_ext && ext_phy)
++			set_bit(MT76_STATE_RUNNING, &ext_phy->state);
++		dev->recovery.failed = stop_ret || dev->mt76.npu_quarantine;
++		if (!dev->recovery.failed)
++			dev_info(dev->mt76.dev,
++				 "Kite stop proof retained after restart error %d; retrying both radios\n",
++				 ret);
+ 		return ret;
+ 	}
+ 	/* reset done */

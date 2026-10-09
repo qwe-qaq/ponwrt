@@ -1,0 +1,24 @@
+Subject: [PATCH] allow open-key fallback and enforce current DP authorization
+
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1251,12 +1251,18 @@
+ 	};
+ 	struct mt76_wcid *wcid;
+ 	struct mt7915_sta *msta;
++	struct kdp_shared *dp = READ_ONCE(dev->mt76.kite_dp);
+ 	u32 generation = KDP_HOST_FALLBACK_GENERATION(generation_key);
+ 	u32 key_generation = KDP_HOST_FALLBACK_KEY_GENERATION(generation_key);
+ 
+ 	if (!KDP_HOST_FALLBACK_VALID(meta) || skb->len < ETH_HLEN ||
+ 		ctx.band > 1 || ctx.wcid >= MT7916_WTBL_SIZE || !session ||
+-		!generation || !key_generation || !READ_ONCE(dev->kite.active) ||
++		!generation || !READ_ONCE(dev->kite.active) ||
++		!READ_ONCE(dev->kite.dp_bound) || !dp ||
++		READ_ONCE(dp->session) != session || !READ_ONCE(dp->enabled) ||
++		READ_ONCE(dp->gate) || !READ_ONCE(dp->sta[ctx.wcid].enabled) ||
++		!READ_ONCE(dp->sta[ctx.wcid].authorized) ||
++		(READ_ONCE(dp->sta[ctx.wcid].cipher) && !key_generation) ||
+ 		READ_ONCE(dev->kite.session) != session ||
+ 		!READ_ONCE(dev->kite.live[ctx.wcid]) ||
+ 		READ_ONCE(dev->kite.generation[ctx.wcid]) > 0xffffu ||

@@ -1,0 +1,725 @@
+Subject: [PATCH] r63 kernel PS lifecycle and single-hart downlink performance
+
+Native rule reauthorization retains Linux ownership. No direct stale-FOE
+restore, cross-hart pipeline, relaxed keys, PN or completion proof.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -577,6 +577,7 @@
+ 	u32 kite_session, kite_in_gen, kite_in_key, kite_out_gen, kite_out_key;
+ 	bool kite_retired, kite_published, kite_suspended;
+  u32 kite_soft_slot;
++ struct flow_hw_refresh *kite_refresh;
+  struct kdp_flow kite_tx_key;
+ 	struct kdp_flow kite_key;
+ 	u16 kite_rule_len;
+@@ -767,6 +768,10 @@
+ 	atomic64_t kite_path_out_npu, kite_path_in_npu, kite_egress_blocked;
+ 	/* A live cookie may be replaced repeatedly while its route is refreshed. */
+ 	atomic64_t kite_replace_reuse, kite_replace_gc;
++ atomic64_t kite_ps_reauth_requested, kite_ps_reauth_ok, kite_ps_reauth_missing;
++ atomic64_t kite_reason[16];
++ unsigned long kite_absent_cookie[64];
++ u32 kite_absent_next, kite_last_reason;
+ 	atomic64_t kite_ingress_published, kite_downlink_published;
+ 	atomic64_t kite_routed_ingress, kite_routed_mac_rewrite;
+ 	u32 kite_capture_refs[KDP_FLOWS];
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -456,11 +456,11 @@
+ 		 * ingress Wi-Fi policy can still be admitted, but force this
+ 		 * downlink rule back to mac80211 while TX is blocked. */
+ 		if (!airoha_kite_endpoint(ppe, &out))
+-			return -EAGAIN;
++			return airoha_kite_reason(ppe, 6, -EAGAIN);
+ 		if (READ_ONCE(s->sta[out.airoha_npu.wcid].tx_blocked) ||
+       READ_ONCE(s->r60.degraded[out.airoha_npu.band])) {
+ 			atomic64_inc(&ppe->kite_egress_blocked);
+-			return -EAGAIN;
++			return airoha_kite_reason(ppe, 7, -EAGAIN);
+ 		}
+ 		e->kite_out_wcid = out.airoha_npu.wcid;
+ 		e->kite_out_gen = out.airoha_npu.generation;
+@@ -472,18 +472,18 @@
+ 	 * exact MAC forwarding, while the NPU receives the complete tuple below. */
+ 	if (bridge_l4) {
+ 		if (out.type != DEV_PATH_AIROHA_NPU)
+-			return -EOPNOTSUPP;
++			return airoha_kite_reason(ppe, 8, -EOPNOTSUPP);
+ 		flow_rule_match_meta(rule, &meta);
+ 		idev = dev_get_by_index(dev_net(odev), meta.key->ingress_ifindex);
+ 		if (!idev)
+ 			return -ENODEV;
+ 		if (idev->ieee80211_ptr) {
+-			ret = -EOPNOTSUPP;
++			ret = airoha_kite_reason(ppe, 9, -EOPNOTSUPP);
+ 			goto put;
+ 		}
+ 		flow_rule_match_eth_addrs(rule, &mac);
+ 		if (!ether_addr_equal(mac.key->dst, s->sta[out.airoha_npu.wcid].addr)) {
+-			ret = -EOPNOTSUPP;
++			ret = airoha_kite_reason(ppe, 10, -EOPNOTSUPP);
+ 			goto put;
+ 		}
+ 		k->session = out.airoha_npu.session;
+@@ -663,6 +663,7 @@
+ 	if (ret) {
+ 		atomic64_inc(&ppe->kite_policy_reject);
+ 		atomic64_inc(&ppe->kite_prepare_reject);
++  if (!ppe->kite_last_reason) airoha_kite_reason(ppe, 12, ret);
+ 		WRITE_ONCE(ppe->kite_prepare_errno, ret);
+ 	} else {
+ 		atomic64_inc(&ppe->kite_policy_accept);
+@@ -747,6 +748,7 @@
+ 	/* Only optimize Kite. Ordinary Ethernet/PON retain their native path. */
+ 	if (!old || !s || (!new->kite_in_wcid && !new->kite_out_wcid) ||
+ 	    old->kite_retired || !airoha_kite_flow_live(ppe, old) ||
++     (old->kite_suspended && s->r60.ps[old->kite_out_wcid].active) ||
+ 	    !old->kite_rule_len || old->kite_rule_len != new->kite_rule_len ||
+ 	    memcmp(old->kite_rule_bytes, new->kite_rule_bytes, old->kite_rule_len) ||
+ 	    old->egress_dev != new->egress_dev ||
+@@ -1052,7 +1054,7 @@
+ 			br.src_mac_lo = hwe->l2b.src_mac_hi << 16 | hwe->l2b.src_mac_lo;
+ 			e = rhashtable_lookup_fast(&ppe->l2_flows, &br,
+ 						   airoha_l2_flow_table_params);
+-			if (e && e->kite_in_wcid && airoha_kite_flow_live(ppe, e) &&
++			if (e && e->kite_in_wcid && !e->kite_suspended && airoha_kite_flow_live(ppe, e) &&
+ 			    ((e->kite_key.vlan == KDP_SLOT_NONE ? 0 : e->kite_key.vlan) ==
+ 			     hwe->l2b.ingress_vlan) &&
+ 			    !airoha_ppe_foe_commit_subflow_entry(ppe, e, slot, true)) {
+@@ -1065,7 +1067,7 @@
+ 			goto unlock;
+ 		index = airoha_ppe_foe_get_entry_hash(ppe, hwe);
+ 		hlist_for_each_entry(e, &ppe->foe_flow[index], list) {
+-			if (!e->kite_in_wcid || !airoha_kite_flow_live(ppe, e) ||
++			if (!e->kite_in_wcid || (e->kite_suspended || !airoha_kite_flow_live(ppe, e)) ||
+ 			    e->type != FLOW_TYPE_L4 || !airoha_ppe_foe_compare_entry(e, hwe))
+ 				continue;
+ 			if (e->hash != 0xffff && e->hash != slot) {
+@@ -1196,7 +1198,8 @@
+ 		list_del_init(&e->kite_node);
+ 		rhashtable_remove_fast(&ppe->eth->flow_table, &e->node,
+ 				       airoha_flow_table_params);
+-		kfree(e);
++		airoha_kite_removed(ppe,e->cookie);
++		airoha_ppe_flow_free(e);
+ 		atomic64_inc(&ppe->kite_revoked);
+ 	}
+ 	airoha_kite_capture_clear(ppe, wcid);
+@@ -1234,7 +1237,8 @@
+ 		list_del_init(&e->kite_node);
+ 		rhashtable_remove_fast(&ppe->eth->flow_table, &e->node,
+ 				       airoha_flow_table_params);
+-		kfree(e);
++		airoha_kite_removed(ppe,e->cookie);
++		airoha_ppe_flow_free(e);
+ 		atomic64_inc(&ppe->kite_revoked);
+ 	}
+ 	if (map) {
+@@ -1267,6 +1271,9 @@
+   u32 base,i;
+   if (e->kite_out_wcid!=wi) continue;
+   if (e->kite_suspended) {
++   if (e->kite_soft_slot < KDP_FLOWS) {
++    WRITE_ONCE(s->r60.soft_request[e->kite_soft_slot], request); dma_wmb();
++   }
+    ret=airoha_kite_invalidate(ppe,e); if (ret) goto out;
+    continue; /* a partial revoke retry must still prove every slot stopped */
+   }
+@@ -1297,6 +1304,23 @@
+  mutex_unlock(&flow_offload_mutex); return ret;
+ }
+ EXPORT_SYMBOL_GPL(airoha_kite_suspend_tx);
++
++int airoha_kite_reauthorize_tx(struct airoha_ppe_dev *dev, unsigned int wi)
++{
++ struct airoha_ppe *ppe = dev->priv;
++ struct airoha_flow_table_entry *e;
++ mutex_lock(&flow_offload_mutex);
++ list_for_each_entry(e, &ppe->kite_flows, kite_node) {
++  if (e->kite_out_wcid != wi || !e->kite_suspended) continue;
++  if (!e->kite_refresh) { atomic64_inc(&ppe->kite_ps_reauth_missing); continue; }
++  WRITE_ONCE(e->kite_refresh->retry_at, jiffies);
++  flow_hw_refresh_request(e->kite_refresh);
++  atomic64_inc(&ppe->kite_ps_reauth_requested);
++ }
++ mutex_unlock(&flow_offload_mutex);
++ return 0;
++}
++EXPORT_SYMBOL_GPL(airoha_kite_reauthorize_tx);
+ 
+ int airoha_kite_revoke_tx(struct airoha_ppe_dev *dev, unsigned int wcid)
+ {
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -25,6 +25,18 @@
+ DEFINE_MUTEX(flow_offload_mutex);
+ static DEFINE_SPINLOCK(ppe_lock);
+ static void airoha_kite_note_bind(struct airoha_ppe *ppe, struct airoha_flow_table_entry *e);
++/* r63 cause counters: zero is success/unspecified, 1..15 below are
++ * rejection/lifecycle causes, never hardware-hit or delivery counters. */
++static int airoha_kite_reason(struct airoha_ppe *ppe,u32 reason,int err)
++{
++ /* Record the first failure site; count once at the completed command. */
++ WRITE_ONCE(ppe->kite_last_reason,reason); return err;
++}
++static void airoha_kite_removed(struct airoha_ppe *ppe,unsigned long cookie)
++{
++ ppe->kite_absent_cookie[ppe->kite_absent_next++ % 64]=cookie;
++}
++
+ static bool airoha_kite_flow_live(struct airoha_ppe *ppe,
+ 				   struct airoha_flow_table_entry *e);
+ static int airoha_kite_flow_remove(struct airoha_ppe *ppe,
+@@ -969,6 +981,13 @@
+ 	return err;
+ }
+ 
++static void airoha_ppe_flow_free(struct airoha_flow_table_entry *e)
++{
++ if (!e) return;
++ flow_hw_refresh_put(e->kite_refresh);
++ kfree(e);
++}
++
+ static void airoha_ppe_foe_remove_flow(struct airoha_ppe *ppe,
+ 				       struct airoha_flow_table_entry *e)
+ {
+@@ -984,7 +1003,7 @@
+ 	}
+ 	if (e->type == FLOW_TYPE_L2_SUBFLOW) {
+ 		hlist_del_init(&e->l2_subflow_node);
+-		kfree(e);
++		airoha_ppe_flow_free(e);
+ 	}
+ }
+ 
+@@ -1053,7 +1072,7 @@
+ 		airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
+ 		rhashtable_remove_fast(&eth->flow_table, &e->node,
+ 				       airoha_flow_table_params);
+-		kfree(e);
++		airoha_ppe_flow_free(e);
+ 	}
+ }
+ 
+@@ -1168,7 +1187,7 @@
+ 		}
+ 
+ 		if (!airoha_ppe_foe_compare_entry(e, hwe) ||
+-		    !airoha_kite_flow_live(ppe, e))
++		    (e->kite_suspended || !airoha_kite_flow_live(ppe, e)))
+ 			continue;
+ 
+ 		if (airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan))
+@@ -1185,7 +1204,7 @@
+ 	airoha_ppe_foe_set_bridge_addrs(&br, eth_hdr(skb));
+ 	e = rhashtable_lookup_fast(&ppe->l2_flows, &br,
+ 				   airoha_l2_flow_table_params);
+-	if (e && airoha_kite_flow_live(ppe, e))
++	if (e && !e->kite_suspended && airoha_kite_flow_live(ppe, e))
+ 		airoha_ppe_foe_commit_subflow_entry(ppe, e, hash, rx_wlan);
+ unlock:
+ 	spin_unlock_bh(&ppe_lock);
+@@ -1378,7 +1397,8 @@
+ 	if (err)
+ 		return err;
+ 	atomic64_inc(&eth->ppe->kite_replace_gc);
+-	kfree(e);
++ airoha_kite_removed(eth->ppe,e->cookie);
++	airoha_ppe_flow_free(e);
+ 	return 0;
+ }
+ 
+@@ -1401,12 +1421,13 @@
+ 	err = airoha_ppe_flow_check_bridge(rule, f->common.extack);
+ 	if (err) {
+ 		atomic64_inc(&eth->ppe->bridge_policy_fallback);
++  airoha_kite_reason(eth->ppe, 2, err);
+ 		return err;
+ 	}
+ 
+ 
+ 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META))
+-		return -EOPNOTSUPP;
++		return airoha_kite_reason(eth->ppe, 3, -EOPNOTSUPP);
+ 
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL)) {
+ 		struct flow_match_control match;
+@@ -1415,9 +1436,9 @@
+ 		addr_type = match.key->addr_type;
+ 		if (flow_rule_has_control_flags(match.mask->flags,
+ 						f->common.extack))
+-			return -EOPNOTSUPP;
++			return airoha_kite_reason(eth->ppe, 3, -EOPNOTSUPP);
+ 	} else {
+-		return -EOPNOTSUPP;
++		return airoha_kite_reason(eth->ppe, 3, -EOPNOTSUPP);
+ 	}
+ 
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC)) {
+@@ -1426,7 +1447,7 @@
+ 		flow_rule_match_basic(rule, &match);
+ 		l4proto = match.key->ip_proto;
+ 	} else {
+-		return -EOPNOTSUPP;
++		return airoha_kite_reason(eth->ppe, 3, -EOPNOTSUPP);
+ 	}
+ 
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IP)) {
+@@ -1445,7 +1466,7 @@
+ 			memcpy(data.eth.h_dest, match.key->dst, ETH_ALEN);
+ 			memcpy(data.eth.h_source, match.key->src, ETH_ALEN);
+ 		} else {
+-			return -EOPNOTSUPP;
++			return airoha_kite_reason(eth->ppe, 3, -EOPNOTSUPP);
+ 		}
+ 	} else {
+ 		switch (addr_type) {
+@@ -1456,7 +1477,7 @@
+ 			offload_type = PPE_PKT_TYPE_IPV6_ROUTE_5T;
+ 			break;
+ 		default:
+-			return -EOPNOTSUPP;
++			return airoha_kite_reason(eth->ppe, 3, -EOPNOTSUPP);
+ 		}
+ 	}
+ 
+@@ -1476,7 +1497,7 @@
+ 		case FLOW_ACTION_MANGLE:
+ 			if (offload_type == PPE_PKT_TYPE_BRIDGE) {
+ 				if (act->mangle.htype != FLOW_ACT_MANGLE_HDR_TYPE_ETH)
+-					return -EOPNOTSUPP;
++					return airoha_kite_reason(eth->ppe, 3, -EOPNOTSUPP);
+ 				airoha_ppe_flow_mangle_eth(act, &data.eth);
+ 				break;
+ 			}
+@@ -1495,7 +1516,7 @@
+ 		case FLOW_ACTION_VLAN_PUSH:
+ 			if (data.vlan.num == 2 ||
+ 			    act->vlan.proto != htons(ETH_P_8021Q))
+-				return -EOPNOTSUPP;
++				return airoha_kite_reason(eth->ppe, 3, -EOPNOTSUPP);
+ 
+ 			data.vlan.hdr[data.vlan.num].id = act->vlan.vid;
+ 			data.vlan.hdr[data.vlan.num].proto = act->vlan.proto;
+@@ -1505,24 +1526,25 @@
+ 			break;
+ 		case FLOW_ACTION_PPPOE_PUSH:
+ 			if (data.pppoe.num == 1 || data.vlan.num == 2)
+-				return -EOPNOTSUPP;
++				return airoha_kite_reason(eth->ppe, 3, -EOPNOTSUPP);
+ 
+ 			data.pppoe.sid = act->pppoe.sid;
+ 			data.pppoe.num++;
+ 			break;
+ 		default:
+-			return -EOPNOTSUPP;
++			return airoha_kite_reason(eth->ppe, 3, -EOPNOTSUPP);
+ 		}
+ 	}
+ 
+ 	if (!is_valid_ether_addr(data.eth.h_source) ||
+ 	    !is_valid_ether_addr(data.eth.h_dest))
+-		return -EINVAL;
++		return airoha_kite_reason(eth->ppe, 4, -EINVAL);
+ 
+ 	err = airoha_ppe_foe_entry_prepare(eth, &hwe, odev, offload_type,
+ 					   &data, l4proto, dsfield,
+ 					   &egress_dev);
+ 	if (err) {
++		airoha_kite_reason(eth->ppe, 5, err);
+ 		if (err == -EOPNOTSUPP && egress_dev &&
+ 		    egress_dev->flags & AIROHA_PRIV_F_PON)
+ 			NL_SET_ERR_MSG_MOD(f->common.extack,
+@@ -1535,13 +1557,13 @@
+ 
+ 		if (offload_type == PPE_PKT_TYPE_BRIDGE &&
+ 		    !airoha_kite_bridge_l4_rule(rule))
+-			return -EOPNOTSUPP;
++			return airoha_kite_reason(eth->ppe, 3, -EOPNOTSUPP);
+ 
+ 		flow_rule_match_ports(rule, &ports);
+ 		data.src_port = ports.key->src;
+ 		data.dst_port = ports.key->dst;
+ 	} else if (offload_type != PPE_PKT_TYPE_BRIDGE) {
+-		return -EOPNOTSUPP;
++		return airoha_kite_reason(eth->ppe, 3, -EOPNOTSUPP);
+ 	}
+ 
+ 	if (!bridge_l4 && addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS) {
+@@ -1569,7 +1591,7 @@
+ 
+ 		if (offload_type == PPE_PKT_TYPE_BRIDGE) {
+ 			if (act->mangle.htype != FLOW_ACT_MANGLE_HDR_TYPE_ETH)
+-				return -EOPNOTSUPP;
++				return airoha_kite_reason(eth->ppe, 3, -EOPNOTSUPP);
+ 			continue;
+ 		}
+ 
+@@ -1585,7 +1607,7 @@
+ 			/* handled earlier */
+ 			break;
+ 		default:
+-			return -EOPNOTSUPP;
++			return airoha_kite_reason(eth->ppe, 3, -EOPNOTSUPP);
+ 		}
+ 
+ 		if (err)
+@@ -1600,7 +1622,7 @@
+ 
+ 	e = kzalloc(sizeof(*e), GFP_KERNEL);
+ 	if (!e)
+-		return -ENOMEM;
++		return airoha_kite_reason(eth->ppe, 11, -ENOMEM);
+ 
+ 	INIT_LIST_HEAD(&e->gc_node);
+ 	INIT_LIST_HEAD(&e->kite_node);
+@@ -1616,7 +1638,7 @@
+ 	*candidate = e;
+ 	return 0;
+ free_entry:
+-	kfree(e);
++	airoha_ppe_flow_free(e);
+ 	return err;
+ }
+ 
+@@ -1628,17 +1650,36 @@
+ 	struct airoha_flow_table_entry *e = NULL, *old;
+ 	int err, revoke;
+ 
++ WRITE_ONCE(eth->ppe->kite_last_reason,0);
+ 	err = airoha_ppe_flow_build(eth, f, &e);
++ if (!err && e->kite_out_wcid && eth->ppe->kite_dp) {
++  struct kdp_shared *s=eth->ppe->kite_dp;
++  u32 wi=e->kite_out_wcid,request=READ_ONCE(s->r60.ps[wi].request);
++  if (request && !READ_ONCE(s->r60.ps[wi].active) &&
++      READ_ONCE(s->r63.first_rule_request[wi])!=request) {
++   WRITE_ONCE(s->r63.first_rule_ms[wi],(u32)jiffies_to_msecs(jiffies));
++   dma_wmb(); WRITE_ONCE(s->r63.first_rule_request[wi],request);
++  }
++ }
+ 	old = rhashtable_lookup(&eth->flow_table, &f->cookie, airoha_flow_table_params);
+-	if (!err && airoha_kite_flow_reusable(eth->ppe, old, e)) {
++	if (!err && old && old->kite_refresh == f->hw_refresh &&
++     airoha_kite_flow_reusable(eth->ppe, old, e)) {
++  if (old->kite_suspended) {
++   /* A fresh native REPLACE proved the complete unchanged rule and current
++    * endpoint. Old hardware slots stay INVALID: learn only real UNBINDs. */
++   if (old->kite_soft_slot < KDP_FLOWS)
++    WRITE_ONCE(eth->ppe->kite_dp->r60.soft[old->kite_soft_slot].version, 0);
++   dma_wmb(); old->kite_suspended = false;
++   atomic64_inc(&eth->ppe->kite_ps_reauth_ok);
++  }
+ 		atomic64_inc(&eth->ppe->kite_replace_reuse);
+ 		airoha_kite_learn_hint(&eth->ppe->dev);
+-		kfree(e);
++		airoha_ppe_flow_free(e);
+ 		return 0;
+ 	}
+ 	revoke = airoha_ppe_flow_replace_remove(eth, f->cookie);
+ 	if (revoke || err) {
+-		kfree(e);
++		airoha_ppe_flow_free(e);
+ 		return revoke ? revoke : err;
+ 	}
+ 	err = airoha_kite_flow_reserve(eth->ppe, e);
+@@ -1652,12 +1693,14 @@
+ 	err = rhashtable_insert_fast(&eth->flow_table, &e->node, airoha_flow_table_params);
+ 	if (err < 0)
+ 		goto remove_foe_entry;
++ e->kite_refresh = f->hw_refresh;
++ flow_hw_refresh_get(e->kite_refresh);
+ 	airoha_kite_flow_publish(eth->ppe, e);
+ 	return 0;
+ remove_foe_entry:
+ 	airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
+ free_entry:
+-	kfree(e);
++	airoha_ppe_flow_free(e);
+ 	return err;
+ }
+ 
+@@ -1668,15 +1711,18 @@
+ 
+ 	e = rhashtable_lookup(&eth->flow_table, &f->cookie,
+ 			      airoha_flow_table_params);
+-	if (!e)
+-		return -ENOENT;
++	if (!e) {
++  unsigned int i;
++  for (i=0;i<64;i++) if (eth->ppe->kite_absent_cookie[i] == f->cookie) break;
++  return airoha_kite_reason(eth->ppe,i<64 ? 13 : 14,-ENOENT);
++ }
+ 
+ 	if (airoha_kite_flow_remove(eth->ppe, e))
+ 		return -EIO;
+ 	airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
+ 	rhashtable_remove_fast(&eth->flow_table, &e->node,
+ 			       airoha_flow_table_params);
+-	kfree(e);
++	airoha_ppe_flow_free(e);
+ 
+ 	return 0;
+ }
+@@ -1755,20 +1801,30 @@
+ }
+ 
+ static int airoha_ppe_flow_offload_cmd(struct airoha_eth *eth,
+-				       struct flow_cls_offload *f)
+-{
+-	switch (f->command) {
+-	case FLOW_CLS_REPLACE:
+-		return airoha_ppe_flow_offload_replace(eth, f);
+-	case FLOW_CLS_DESTROY:
+-		return airoha_ppe_flow_offload_destroy(eth, f);
+-	case FLOW_CLS_STATS:
+-		return airoha_ppe_flow_offload_stats(eth, f);
+-	default:
+-		break;
+-	}
+-
+-	return -EOPNOTSUPP;
++                                         struct flow_cls_offload *f)
++{
++ int ret;
++ u32 reason;
++ WRITE_ONCE(eth->ppe->kite_last_reason,0);
++ switch (f->command) {
++ case FLOW_CLS_REPLACE:
++  ret=airoha_ppe_flow_offload_replace(eth,f); break;
++ case FLOW_CLS_DESTROY:
++  ret=airoha_ppe_flow_offload_destroy(eth,f); break;
++ case FLOW_CLS_STATS:
++  return airoha_ppe_flow_offload_stats(eth,f);
++ default:
++  return -EOPNOTSUPP;
++ }
++ if (ret < 0) {
++  reason=READ_ONCE(eth->ppe->kite_last_reason);
++  if (!reason || reason>=ARRAY_SIZE(eth->ppe->kite_reason)) reason=15;
++  WRITE_ONCE(eth->ppe->kite_last_reason,reason);
++  atomic64_inc(&eth->ppe->kite_reason[reason]);
++ } else {
++  WRITE_ONCE(eth->ppe->kite_last_reason,0);
++ }
++ return ret;
+ }
+ 
+ static int airoha_ppe_flush_sram_entries(struct airoha_ppe *ppe)
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -240,6 +240,14 @@
+ 		atomic64_read(&ppe->kite_replace_gc),
+ 		atomic64_read(&ppe->kite_ingress_published),
+ 		atomic64_read(&ppe->kite_downlink_published));
++ seq_printf(m,"r63_reauth requested=%lld accepted=%lld no_owner=%lld last_reason=%u\n",
++  atomic64_read(&ppe->kite_ps_reauth_requested),atomic64_read(&ppe->kite_ps_reauth_ok),
++  atomic64_read(&ppe->kite_ps_reauth_missing),ppe->kite_last_reason);
++ {
++  static const char *const names[]={"none","input","bridge_shape","action_or_match","mac","output_mapping","endpoint","ps_or_degraded","bridge_reverse","wifi_ingress","peer_mac","memory","policy","absent_retired","absent_unknown","other"};
++  unsigned int i;
++  for(i=1;i<ARRAY_SIZE(names);i++) seq_printf(m,"r63_reason_%s=%lld\n",names[i],atomic64_read(&ppe->kite_reason[i]));
++ }
+ 	seq_printf(m, "kite_routed_ingress=%lld kite_routed_mac_rewrite=%lld\n",
+ 		atomic64_read(&ppe->kite_routed_ingress),
+ 		atomic64_read(&ppe->kite_routed_mac_rewrite));
+--- a/include/linux/soc/airoha/airoha_kite.h
++++ b/include/linux/soc/airoha/airoha_kite.h
+@@ -14,6 +14,7 @@
+ 	const struct airoha_kite_ops *ops, void *priv);
+ int airoha_kite_revoke(struct airoha_ppe_dev *dev, unsigned int wcid);
+ int airoha_kite_suspend_tx(struct airoha_ppe_dev *dev, unsigned int wcid, u32 request);
++int airoha_kite_reauthorize_tx(struct airoha_ppe_dev *dev, unsigned int wcid);
+ int airoha_kite_revoke_tx(struct airoha_ppe_dev *dev, unsigned int wcid);
+ int airoha_kite_update_qos(struct airoha_ppe_dev *dev, unsigned int wcid,
+ 			 const u8 *map, bool custom);
+--- a/include/linux/soc/airoha/kite-datapath.h
++++ b/include/linux/soc/airoha/kite-datapath.h
+@@ -9,8 +9,8 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_ABI_VERSION 11u
+-#define KDP_MAGIC 0x4b44000bu
++#define KDP_ABI_VERSION 12u
++#define KDP_MAGIC 0x4b44000cu
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -370,6 +370,20 @@
+  struct kdp_suspend ps[KDP_WCIDS];
+  struct kdp_flow soft[KDP_FLOWS];
+  unsigned int soft_request[KDP_FLOWS];
++};
++/* ABI12 appends observations only; no DMA-region offset changes.
++ * hart4 owns snapshot/band counters. ARM owns first_rule_{ms,request}.
++ * tick fields use 256-cycle units; modulo differences only within a session. */
++struct kdp_r63_band {
++ unsigned int gate_hold, gate_timeout, full_skip;
++ unsigned int soft_reason[8];
++ unsigned int soft_wcid, soft_request, soft_type, soft_protocol, soft_ports;
++ unsigned int empty_runs, empty_bins[8], empty_since, empty_active;
++};
++struct kdp_r63 {
++ unsigned int seq, tick, pressure_tick;
++ struct kdp_r63_band band[2];
++ unsigned int first_rule_ms[KDP_WCIDS], first_rule_request[KDP_WCIDS];
+ };
+ struct kdp_shared {
+ 	unsigned int magic, bytes, session, epoch;
+@@ -398,6 +412,7 @@
+ 	struct kdp_tuning tuning;
+  struct kdp_r59 r59;
+  struct kdp_r60 r60;
++ struct kdp_r63 r63;
+ };
+ 
+ /* ABI9 extends the tail, never the header or DMA regions. Magic and bytes
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@ -3,6 +3,9 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/list.h>
++#include <linux/refcount.h>
++#include <linux/slab.h>
++#include <linux/rcupdate.h>
+ #include <linux/netlink.h>
+ #include <net/flow_dissector.h>
+ 
+@@ -692,6 +695,28 @@
+ 	struct netlink_ext_ack *extack;
+ };
+ 
++/* A request for a fresh native rule, never an authorization or flow pointer.
++ * The flowtable and each installed driver rule own independent references.
++ * RCU protects packet readers after native teardown; late driver requests
++ * cannot revive or dereference a freed connection. */
++struct flow_hw_refresh {
++ refcount_t refs;
++ unsigned long pending;
++ unsigned long retry_at;
++ struct rcu_head rcu;
++};
++static inline void flow_hw_refresh_get(struct flow_hw_refresh *r)
++{
++ if (r) refcount_inc(&r->refs);
++}
++static inline void flow_hw_refresh_put(struct flow_hw_refresh *r)
++{
++ if (r && refcount_dec_and_test(&r->refs)) kfree_rcu(r, rcu);
++}
++static inline void flow_hw_refresh_request(struct flow_hw_refresh *r)
++{
++ if (r) set_bit(0, &r->pending);
++}
+ struct flow_cls_offload {
+ 	struct flow_cls_common_offload common;
+ 	enum flow_cls_command command;
+@@ -700,6 +725,7 @@
+ 	struct flow_rule *rule;
+ 	struct flow_stats stats;
+ 	u32 classid;
++	struct flow_hw_refresh *hw_refresh;
+ };
+ 
+ enum offload_act_command  {
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -186,6 +186,7 @@
+ };
+ 
+ struct flow_offload {
++	struct flow_hw_refresh *hw_refresh;
+ 	struct flow_offload_tuple_rhash		tuplehash[FLOW_OFFLOAD_DIR_MAX];
+ 	struct nf_conn				*ct;
+ 	unsigned long				flags;
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -261,6 +261,7 @@
+ 		break;
+ 	}
+ 	nf_ct_put(flow->ct);
++	flow_hw_refresh_put(flow->hw_refresh);
+ 	kfree_rcu(flow, rcu_head);
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_free);
+@@ -360,11 +361,19 @@
+ 			  struct flow_offload *flow, bool force)
+ {
+ 	u32 timeout;
+-
++ struct flow_hw_refresh *r = smp_load_acquire(&flow->hw_refresh);
++ bool refresh = r && READ_ONCE(r->pending) &&
++                time_after_eq(jiffies, READ_ONCE(r->retry_at));
++
++ if (r && READ_ONCE(r->pending) && (test_bit(NF_FLOW_TEARDOWN, &flow->flags) ||
++     test_bit(NF_FLOW_HW_DYING, &flow->flags) ||
++     test_bit(NF_FLOW_HW_DEAD, &flow->flags) || nf_ct_is_dying(flow->ct) ||
++     nf_flow_timeout_delta(READ_ONCE(flow->timeout)) <= 0))
++  return;
+ 	timeout = nf_flowtable_time_stamp + flow_offload_get_timeout(flow);
+ 	if (force || timeout - READ_ONCE(flow->timeout) > HZ)
+ 		WRITE_ONCE(flow->timeout, timeout);
+-	else
++	else if (!refresh)
+ 		return;
+ 
+ 	if (likely(!nf_flowtable_hw_offload(flow_table)) ||
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -1023,6 +1023,7 @@
+ 
+ 	nf_flow_offload_init(&cls_flow, proto, priority, cmd,
+ 			     &flow->tuplehash[dir].tuple, &extack);
++	cls_flow.hw_refresh = READ_ONCE(flow->hw_refresh);
+ 	if (cmd == FLOW_CLS_REPLACE)
+ 		cls_flow.rule = flow_rule->rule;
+ 
+@@ -1030,6 +1031,8 @@
+ 	list_for_each_entry(block_cb, block_cb_list, list) {
+ 		err = block_cb->cb(TC_SETUP_CLSFLOWER, &cls_flow,
+ 				   block_cb->cb_priv);
++  if (cmd == FLOW_CLS_REPLACE && (err == -EAGAIN || err == -EBUSY))
++   flow_hw_refresh_request(cls_flow.hw_refresh);
+ 		if (err < 0)
+ 			continue;
+ 
+@@ -1082,11 +1085,35 @@
+ static void flow_offload_work_add(struct flow_offload_work *offload)
+ {
+ 	struct nf_flow_rule *flow_rule[FLOW_OFFLOAD_DIR_MAX];
++ struct flow_hw_refresh *r = READ_ONCE(offload->flow->hw_refresh);
++ unsigned long requested = 0;
+ 	int err;
+ 
++ /* HW_PENDING serializes native add/del/stats. Validate the live owner,
++  * then build both directions from native tuples and current neighbours. */
++ if (test_bit(NF_FLOW_TEARDOWN, &offload->flow->flags) ||
++     test_bit(NF_FLOW_HW_DYING, &offload->flow->flags) ||
++     test_bit(NF_FLOW_HW_DEAD, &offload->flow->flags) ||
++     test_bit(NF_FLOW_CLOSING, &offload->flow->flags) ||
++     test_bit(NF_FLOW_HW_DISABLED, &offload->flow->flags) ||
++     nf_ct_is_dying(offload->flow->ct) ||
++     nf_flow_timeout_delta(READ_ONCE(offload->flow->timeout)) <= 0)
++  return;
++ if (!r) {
++  r = kzalloc(sizeof(*r), GFP_KERNEL);
++  if (r) { refcount_set(&r->refs, 1); smp_store_release(&offload->flow->hw_refresh, r); }
++ }
++ if (r) {
++  requested = xchg(&r->pending, 0);
++  /* Busy coalesces for 100ms; a PS wake sets retry_at=now for prompt retry.
++   * A concurrent request survives this transaction's completion. */
++  WRITE_ONCE(r->retry_at, jiffies + max_t(unsigned long, 1, HZ / 10));
++ }
+ 	err = nf_flow_offload_alloc(offload, flow_rule);
+-	if (err < 0)
++	if (err < 0) {
++  if (requested) flow_hw_refresh_request(r);
+ 		return;
++ }
+ 
+ 	err = flow_offload_rule_add(offload, flow_rule);
+ 	if (err < 0)

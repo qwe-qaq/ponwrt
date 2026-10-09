@@ -167,10 +167,10 @@ if (!phy_name || !command | !commands[command])
 
 let phy_split = split(phy_name, ":");
 phydev = phy_open(phy_split[0], phy_split[1]);
-phy = phydev.phy;
 if (!phydev) {
 	warn(`PHY ${phy_name} does not exist\n`);
 	exit(1);
 }
+phy = phydev.phy;
 
 commands[command](ARGV);

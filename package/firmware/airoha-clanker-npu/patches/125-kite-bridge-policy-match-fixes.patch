@@ -1,0 +1,68 @@
+Subject: [PATCH] fix bridge policy VLAN and L3/L4 matching
+
+--- a/kite-packet.h
++++ b/kite-packet.h
+@@ -34,7 +34,10 @@
+ 	if (type == 0x8100) {
+ 		if (len < 18)
+ 			return 0;
+-		out->vlan = kdp_be16(p + 14); /* PCP/DEI are policy too */
++		/* Bridge policy currently keys VLAN ID.  PCP/DEI remain available to
++		 * the QoS classifier, but are deliberately not part of the L2
++		 * capture hash because nft bridge rules normally match VID only. */
++		out->vlan = kdp_be16(p + 14);
+ 		type = kdp_be16(p + 16);
+ 		off = 18;
+ 	}
+@@ -120,6 +123,8 @@
+ 	const unsigned char *dmac, unsigned int vlan, unsigned int wcid)
+ {
+ 	unsigned int i, h = wcid ^ vlan;
++	if (vlan != KDP_SLOT_NONE)
++		h = wcid ^ (vlan & 0x0fffu);
+ 	for (i = 0; i < 6; i++)
+ 		h = (h * 33u) ^ smac[i] ^ ((unsigned int)dmac[i] << 8);
+ 	h ^= h >> 16;
+@@ -155,13 +160,26 @@
+ 	KDP_BARRIER();
+ 	if (f->session != session || f->generation != generation ||
+ 	    f->key_generation != key_generation || f->wcid != wcid ||
+-	    f->band != band || f->bss != bss || f->vlan != p->vlan ||
++	    f->band != band || f->bss != bss ||
++	    ((f->vlan == KDP_SLOT_NONE) != (p->vlan == KDP_SLOT_NONE)) ||
++	    (f->vlan != KDP_SLOT_NONE &&
++	     (f->vlan & 0x0fffu) != (p->vlan & 0x0fffu)) ||
+ 	    ((p->dsfield ^ f->dsfield) & f->dsmask))
+ 		return 0;
+ 	for (i = 0; i < 6; i++)
+ 		if (f->smac[i] != p->smac[i] || f->dmac[i] != p->dmac[i])
+ 			return 0;
+-	if (f->type != KDP_FLOW_BRIDGE) {
++	if (f->type == KDP_FLOW_BRIDGE_IPV4 ||
++	    f->type == KDP_FLOW_BRIDGE_IPV6) {
++		if ((f->type == KDP_FLOW_BRIDGE_IPV4 && p->type != KDP_FLOW_IPV4) ||
++		    (f->type == KDP_FLOW_BRIDGE_IPV6 && p->type != KDP_FLOW_IPV6))
++			return 0;
++		if (f->ports != p->ports || f->protocol != p->protocol)
++			return 0;
++		for (i = 0; i < 4; i++)
++			if (f->src[i] != p->src[i] || f->dst[i] != p->dst[i])
++				return 0;
++	} else if (f->type != KDP_FLOW_BRIDGE) {
+ 		if (f->type != p->type || f->ports != p->ports ||
+ 		    f->protocol != p->protocol)
+ 			return 0;
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -144,7 +144,10 @@
+ 				f->type != KDP_FLOW_BRIDGE_IPV6) ||
+ 			f->session != s->session || f->generation != sta->generation ||
+ 			f->key_generation != sta->key_generation || f->wcid != wcid ||
+-			f->band != band || f->bss != sta->bss || f->vlan != packet->vlan)
++			f->band != band || f->bss != sta->bss ||
++			((f->vlan == KDP_SLOT_NONE) != (packet->vlan == KDP_SLOT_NONE)) ||
++			(f->vlan != KDP_SLOT_NONE &&
++			 (f->vlan & 0x0fffu) != (packet->vlan & 0x0fffu)))
+ 			continue;
+ 		for (j = 0; j < 6; j++)
+ 			if (f->smac[j] != packet->smac[j] || f->dmac[j] != packet->dmac[j])

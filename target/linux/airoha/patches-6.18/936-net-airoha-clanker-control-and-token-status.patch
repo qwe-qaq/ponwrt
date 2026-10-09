@@ -1,0 +1,141 @@
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -576,12 +576,18 @@
+ #define CLANKER_DIAG_MAGIC 0x4b440001
+ #define CLANKER_DIAG_WORDS 62
+ #define CLANKER_DIAG_PAGES 2
++#define CLANKER_CTL_MAGIC 0x4b430002
++#define CLANKER_CTL_WORDS 16
+ 
+ struct airoha_clanker_diag {
+ 	struct airoha_npu *npu;
+ 	struct delayed_work work;
+ 	struct mutex lock; /* cached snapshot only; never held during mailbox IO */
+ 	u32 data[CLANKER_DIAG_PAGES][CLANKER_DIAG_WORDS];
++	u32 control[CLANKER_CTL_WORDS];
++	unsigned long control_updated;
++	int control_error;
++	bool control_valid;
+ 	u32 samples, moving, quiet[8];
+ 	u32 requests, completed, timeouts, late_replies, deferred;
+ 	unsigned long updated;
+@@ -603,6 +609,17 @@
+ 	}
+ }
+ 
++static const char *airoha_clanker_control_state(u32 state)
++{
++	switch (state) {
++	case 0: return "closed";
++	case 1: return "running";
++	case 2: return "parking";
++	case 3: return "parked";
++	default: return "unknown";
++	}
++}
++
+ static ssize_t clanker_status_show(struct device *dev,
+ 				   struct device_attribute *attr, char *buf)
+ {
+@@ -615,6 +632,18 @@
+ 	mutex_lock(&d->lock);
+ 	p = d->data[0];
+ 	c = d->data[1];
++	n += sysfs_emit_at(buf, n, "control_abi=2 available=%u last_error=%d age_ms=%u\n",
++		d->control_valid, d->control_error, d->control_valid ?
++		jiffies_to_msecs(jiffies - d->control_updated) : 0);
++	if (d->control_valid) {
++		u32 *k = d->control;
++
++		n += sysfs_emit_at(buf, n,
++			"control mode=%s state=%s session=%u serial=%u result=%u ack=%#x accepted=%u rejected=%u stations=%u ba=%u key_fences=%u\n",
++			k[15] ? "control-only" : "data-development",
++			airoha_clanker_control_state(k[6]), k[3], k[4], k[5],
++			k[7], k[10], k[11], k[12], k[13], k[14]);
++	}
+ 	n += sysfs_emit_at(buf, n,
+ 		"diag_abi=1 ownership_caps=0 wifi_path=host samples=%u last_error=%d age_ms=%u\n",
+ 		d->samples, d->error,
+@@ -649,6 +678,9 @@
+ 	n += sysfs_emit_at(buf, n,
+ 		"driver_model=%u dbdc=%u fast_flags=%#x force_cpu=%u band_cap=%u\n",
+ 		c[22], c[23], c[24], c[25], c[26]);
++	n += sysfs_emit_at(buf, n,
++		"tdma outstanding=%u/%u invalid_returns=%u duplicate_submits=%u\n",
++		c[27], c[28], c[29], c[30]);
+ out:
+ 	mutex_unlock(&d->lock);
+ 	return n;
+@@ -671,8 +703,9 @@
+ 	struct airoha_npu_core *core = &npu->cores[0];
+ 	u32 data[CLANKER_DIAG_PAGES][CLANKER_DIAG_WORDS] = {};
+ 	u32 moving = 0, traps = 0, quiet = 0;
+-	int i, err = 0, previous_error;
+-	bool report;
++	u32 control[CLANKER_CTL_WORDS] = {};
++	int i, err = 0, previous_error, control_error;
++	bool report, control_changed;
+ 
+ 	for (i = 0; i < CLANKER_DIAG_PAGES; i++) {
+ 		err = airoha_npu_wlan_msg_get(npu, i,
+@@ -685,7 +718,30 @@
+ 			break;
+ 		}
+ 	}
++	/* Read-only and independent of GET32 health. Never infer RX ownership
++	 * or replay validation from a successful control transaction. */
++	control_error = err;
++	if (!err) {
++		control_error = airoha_npu_wlan_msg_get(npu, 0,
++			(enum airoha_npu_wlan_get_cmd)33,
++			control, sizeof(control), GFP_KERNEL);
++		if (!control_error && (control[0] != CLANKER_CTL_MAGIC ||
++		    control[1] != CLANKER_CTL_WORDS || control[6] > 3 ||
++		    control[8] != 544 || control[15] > 1))
++			control_error = -EPROTO;
++	}
+ 	mutex_lock(&d->lock);
++	control_changed = d->control_error != control_error ||
++		(!control_error && (!d->control_valid ||
++		control[3] != d->control[3] || control[6] != d->control[6] ||
++		control[12] != d->control[12] || control[13] != d->control[13] ||
++		control[14] != d->control[14]));
++	d->control_error = control_error;
++	if (!control_error) {
++		memcpy(d->control, control, sizeof(control));
++		d->control_updated = jiffies;
++		d->control_valid = true;
++	}
+ 	previous_error = d->error;
+ 	d->error = err;
+ 	spin_lock_bh(&core->lock);
+@@ -736,6 +792,21 @@
+ 			 data[1][11] + data[1][15], data[0][8], data[0][9],
+ 			 data[0][12], data[0][13]);
+ 	}
++	if (report || control_changed) {
++		if (control_error)
++			dev_warn(npu->dev, "Clanker control snapshot unavailable: %d\n",
++				 control_error);
++		else
++			dev_info(npu->dev,
++				 "Clanker control: mode=%s state=%s session=%u serial=%u result=%u ack=%#x accepted=%u rejected=%u sta=%u ba=%u keys=%u; data=host PN=host\n",
++				 control[15] ? "control-only" : "data-development",
++				 airoha_clanker_control_state(control[6]), control[3],
++				 control[4], control[5], control[7], control[10],
++				 control[11], control[12], control[13], control[14]);
++		dev_info(npu->dev,
++			 "Clanker TDMA: outstanding=%u/%u invalid_returns=%u duplicate_submits=%u\n",
++			 data[1][27], data[1][28], data[1][29], data[1][30]);
++	}
+ 	for (i = 0; i < 8; i++) {
+ 		u32 *h = data[0] + 14 + i * 6;
+ 
+@@ -761,6 +832,7 @@
+ 		return;
+ 	}
+ 	d->npu = npu;
++	d->control_error = -EAGAIN;
+ 	mutex_init(&d->lock);
+ 	INIT_DELAYED_WORK(&d->work, airoha_clanker_poll);
+ 	npu->clanker = d;

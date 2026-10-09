@@ -1,0 +1,267 @@
+From: ponwrt maintainers
+Subject: [PATCH] r76: Preserve exact authorization across pre-suspend refresh; publish bounded lifecycle and FE1 evidence.
+
+Native incremental patch on release75. Datapath ABI12 and DMA ownership unchanged.
+
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -5,6 +5,29 @@
+  */
+ /* Protected by flow_offload_mutex. Retained across Wi-Fi restart/rebind.
+  * Exhaustion keeps that peer on the host path until the next SoC boot. */
++/* Event IDs: 1 publish, 2 pending-PS refresh preserved, 3 suspend,
++ * 4 resume, 5 retire, 6 changed/rejected REPLACE. Exact keys, no payloads.
++ * The caller holds flow_offload_mutex, including debugfs readers. */
++static void airoha_kite_flow_event(struct airoha_ppe *ppe,
++                                 const struct airoha_flow_table_entry *e, u32 kind)
++{
++ struct kdp_shared *s=ppe->kite_dp;
++ struct airoha_kite_flow_event *v;
++ u32 wi=e->kite_out_wcid;
++ u64 serial;
++ if (!s || !wi || wi>=KDP_WCIDS) return;
++ serial=++ppe->kite_event_serial;
++ v=&ppe->kite_events[(serial-1)%AIROHA_KITE_FLOW_EVENTS];
++ memset(v,0,sizeof(*v));
++ v->serial=serial; v->ns=ktime_get_ns(); v->cookie=e->cookie;
++ v->key=e->kite_capture_policy!=KDP_SLOT_NONE ? e->kite_key : e->kite_tx_key;
++ v->event=kind; v->request=READ_ONCE(s->r60.ps[wi].request);
++ v->active=READ_ONCE(s->r60.ps[wi].active); v->blocked=READ_ONCE(s->sta[wi].tx_blocked);
++ v->suspended=e->kite_suspended; v->soft_slot=e->kite_soft_slot;
++ if (e->kite_soft_slot<KDP_FLOWS)
++  v->soft_version=READ_ONCE(s->r60.soft[e->kite_soft_slot].version);
++}
++
+ static u32 airoha_kite_route_serial;
+ 
+ static void airoha_kite_route_retire(struct kdp_shared *s, u32 wi)
+@@ -766,9 +789,13 @@
+ 	return true;
+ }
+ 
+-/* A fresh rule is always fully built before either reuse decision. The
+- * soft case preserves only an already stopped owner under the SAME native
+- * rule/refresh cell; it never binds hardware while PS/WAKE is asserted. */
++/* A fresh rule is always fully built before either reuse decision.
++ * PS notification sets tx_blocked before suspend obtains flow_offload_mutex.
++ * An identical REPLACE in that interval must retain the exact owner too:
++ * otherwise suspend cannot publish its soft rule while sibling captures
++ * still deliver its tail. No hardware binding is performed here. Suspend
++ * will invalidate the retained slot under PARK; changed/DESTROY rules still
++ * retire through the normal fenced path. */
+ static bool airoha_kite_flow_reusable(struct airoha_ppe *ppe,
+  struct airoha_flow_table_entry *old, struct airoha_flow_table_entry *new)
+ {
+@@ -782,7 +809,7 @@
+  struct kdp_shared *s = READ_ONCE(ppe->kite_dp);
+  u32 wi = old ? old->kite_out_wcid : 0, blocked;
+  if (!wi || wi >= KDP_WCIDS || !s || !s->enabled || s->gate || kdp_failed(s) ||
+-     !old->kite_suspended || !airoha_kite_flow_same(ppe, old, new)) return false;
++     !airoha_kite_flow_same(ppe, old, new)) return false;
+  blocked = READ_ONCE(s->sta[wi].tx_blocked);
+  return blocked && !(blocked & ~KDP_TX_BLOCK_SOFTWARE) &&
+         !s->r60.degraded[s->sta[wi].band] && s->sta[wi].enabled &&
+@@ -933,6 +960,7 @@
+ static void airoha_kite_policy_retire(struct airoha_ppe *ppe,
+ 				      struct airoha_flow_table_entry *e)
+ {
++ airoha_kite_flow_event(ppe,e,5);
+  if (e->kite_suspended) {
+   if (e->kite_soft_slot < KDP_FLOWS)
+    WRITE_ONCE(ppe->kite_dp->r60.soft[e->kite_soft_slot].version,0);
+@@ -1004,6 +1032,7 @@
+ 	}
+ 	dma_wmb();
+ 	WRITE_ONCE(e->kite_published, true);
++ airoha_kite_flow_event(ppe,e,1);
+ 	airoha_kite_learn_hint(&ppe->dev);
+ }
+ 
+@@ -1379,6 +1408,7 @@
+    if (e->kite_soft_slot < KDP_FLOWS) {
+     WRITE_ONCE(s->r60.soft_request[e->kite_soft_slot], request); dma_wmb();
+    }
++   airoha_kite_flow_event(ppe,e,3);
+    ret=airoha_kite_invalidate(ppe,e); if (ret) goto out;
+    continue; /* a partial revoke retry must still prove every slot stopped */
+   }
+@@ -1401,6 +1431,7 @@
+   if (!key.type) s->r60.soft_unsupported++;
+   else if (e->kite_soft_slot==KDP_SLOT_NONE) s->r60.soft_full++;
+   e->kite_suspended=true;
++  airoha_kite_flow_event(ppe,e,3);
+   ret=airoha_kite_invalidate(ppe,e); if (ret) goto out;
+  }
+  dma_wmb(); WRITE_ONCE(s->r60.ps[wi].active,request); dma_wmb();
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1691,9 +1691,10 @@
+  old = rhashtable_lookup(&eth->flow_table, &f->cookie, airoha_flow_table_params);
+  if (err == -EAGAIN && e && old && old->kite_refresh == f->hw_refresh &&
+      airoha_kite_soft_reusable(eth->ppe, old, e)) {
++  airoha_kite_flow_event(eth->ppe,old,2);
+   atomic64_inc(&eth->ppe->kite_soft_preserved);
+   airoha_ppe_flow_free(e);
+-  return err; /* native owner retries; hardware remains stopped */
++  return err; /* native owner retries; TX blocked until fenced suspend */
+  }
+ 	if (!err && old && old->kite_refresh == f->hw_refresh &&
+      airoha_kite_flow_reusable(eth->ppe, old, e)) {
+@@ -1716,6 +1717,7 @@
+    spin_lock_bh(&ppe_lock);
+    old->kite_suspended = false;
+    spin_unlock_bh(&ppe_lock);
++   airoha_kite_flow_event(eth->ppe,old,4);
+    atomic64_inc(&eth->ppe->kite_ps_reauth_ok);
+   }
+ 		atomic64_inc(&eth->ppe->kite_replace_reuse);
+@@ -1723,6 +1725,7 @@
+ 		airoha_ppe_flow_free(e);
+ 		return 0;
+ 	}
++ if (old) airoha_kite_flow_event(eth->ppe,old,6);
+ 	revoke = airoha_ppe_flow_replace_remove(eth, f->cookie);
+ 	if (revoke || err) {
+ 		airoha_ppe_flow_free(e);
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -719,7 +719,17 @@
+ #define AIROHA_RXD4_PPE_CPU_REASON	GENMASK(20, 16)
+ #define AIROHA_RXD4_FOE_ENTRY		GENMASK(15, 0)
+ 
++/* flow_offload_mutex serializes this control-only ring. No packet logs. */
++#define AIROHA_KITE_FLOW_EVENTS 256
++struct airoha_kite_flow_event {
++ u64 serial, ns;
++ unsigned long cookie;
++ struct kdp_flow key;
++ u32 event, request, active, blocked, suspended, soft_slot, soft_version;
++};
+ struct airoha_ppe {
++ u64 kite_event_serial;
++ struct airoha_kite_flow_event kite_events[AIROHA_KITE_FLOW_EVENTS];
+ 	struct airoha_ppe_dev dev;
+ 	struct airoha_eth *eth;
+ 
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -190,6 +190,29 @@
+ 	return airoha_ppe_debugfs_foe_show(m, private, true);
+ }
+ DEFINE_SHOW_ATTRIBUTE(airoha_ppe_debugfs_foe_bind);
++
++static int airoha_ppe_debugfs_kite_history_show(struct seq_file *m, void *private)
++{
++ struct airoha_ppe *ppe=m->private;
++ u64 last, first, n;
++ mutex_lock(&flow_offload_mutex);
++ last=ppe->kite_event_serial;
++ first=last>AIROHA_KITE_FLOW_EVENTS ? last-AIROHA_KITE_FLOW_EVENTS+1 : 1;
++ seq_printf(m,"r76_flow_ring first=%llu last=%llu overwritten=%llu capacity=%u\n",
++  last?first:0,last,last>AIROHA_KITE_FLOW_EVENTS?last-AIROHA_KITE_FLOW_EVENTS:0,
++  AIROHA_KITE_FLOW_EVENTS);
++ for (n=first;n<=last;n++) {
++  const struct airoha_kite_flow_event *e=&ppe->kite_events[(n-1)%AIROHA_KITE_FLOW_EVENTS];
++  const struct kdp_flow *f=&e->key;
++  seq_printf(m,"r76_flow seq=%llu ns=%llu event=%u cookie=%lu request=%u active=%u blocked=%u suspended=%u soft_slot=%u soft_version=%u session=%u generation=%u key_generation=%u wcid=%u band=%u type=%u protocol=%u vlan=%u dsfield=%u dsmask=%u ports=%08x src=%08x:%08x:%08x:%08x dst=%08x:%08x:%08x:%08x smac=%pM dmac=%pM\n",
++   e->serial,e->ns,e->event,e->cookie,e->request,e->active,e->blocked,e->suspended,e->soft_slot,e->soft_version,
++   f->session,f->generation,f->key_generation,f->wcid,f->band,f->type,f->protocol,f->vlan,f->dsfield,f->dsmask,f->ports,
++   f->src[0],f->src[1],f->src[2],f->src[3],f->dst[0],f->dst[1],f->dst[2],f->dst[3],f->smac,f->dmac);
++ }
++ mutex_unlock(&flow_offload_mutex);
++ return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(airoha_ppe_debugfs_kite_history);
+ 
+ static int airoha_ppe_debugfs_status_show(struct seq_file *m, void *private)
+ {
+@@ -443,6 +466,7 @@
+ 			    &airoha_ppe_debugfs_queues_fops);
+  debugfs_create_file("frame_status", 0444, ppe->debugfs_dir, ppe,
+                      &airoha_ppe_debugfs_frame_fops);
++ debugfs_create_file("kite_history",0400,ppe->debugfs_dir,ppe,&airoha_ppe_debugfs_kite_history_fops);
+ 	debugfs_create_file("status", 0444, ppe->debugfs_dir, ppe,
+ 			    &airoha_ppe_debugfs_status_fops);
+ 	debugfs_create_file("config", 0444, ppe->debugfs_dir, ppe,
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -600,6 +600,10 @@
+ 	int path_error;
+ 	unsigned long path_updated;
+ 	bool path_valid;
++	u32 feed[CLANKER_DIAG_WORDS];
++	int feed_error;
++	unsigned long feed_updated,feed_advanced;
++	bool feed_valid;
+ 	u32 queue[CLANKER_DIAG_WORDS];
+ 	int queue_error;
+ 	unsigned long queue_updated, queue_advanced;
+@@ -908,12 +912,32 @@
+   n+=sysfs_emit_at(buf,n,"queue_band%u pending=%u peak=%u demand=%u credit_hold=%u no_buffer=%u wait_kind=%u wait_at=%u no_buffer_cycles=%u credit_cycles=%u released=%u dma_wait=%u wa_wait=%u ready_wait=%u owner_wcid=%u owner_pending=%u sta_peak=%u no_buffer_cycles_hi=%u credit_cycles_hi=%u\n",
+    b,p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15],p[16],p[17]);
+  }
+- n+=sysfs_emit_at(buf,n,"scope=KF1_u32_counters waits_not_drops pressure_fields_only_at_pressure_tick per_STA_FIFO_not_bypassed\n");
++ n+=sysfs_emit_at(buf,n,"scope=KF1_u32_counters waits_not_drops pressure_fields_only_at_pressure_tick owner_and_sta_peak_sampled_at_pressure_tick per_STA_FIFO_not_bypassed\n");
+  mutex_unlock(&d->lock);return n;
+ }
+ static DEVICE_ATTR_RO(clanker_queue_status);
+ 
++static ssize_t clanker_feed_status_show(struct device *dev,
++                                       struct device_attribute *attr, char *buf)
++{
++ struct airoha_clanker_diag *d=((struct airoha_npu *)dev_get_drvdata(dev))->clanker;
++ const u32 *v;ssize_t n=0;
++ mutex_lock(&d->lock);v=d->feed+4;
++ n+=sysfs_emit_at(buf,n,"feed available=%u last_error=%d age_ms=%u producer_age_ms=%u valid=%u seq=%u session=%u epoch=%u revision=%u mhz=%u tick=%u\n",
++  d->feed_valid,d->feed_error,d->feed_valid?jiffies_to_msecs(jiffies-d->feed_updated):0,
++  d->feed_valid?jiffies_to_msecs(jiffies-d->feed_advanced):0,v[0],v[1],v[2],v[3],v[4],v[5],v[6]);
++ if(d->feed_valid&&v[0])for(u32 b=0;b<2;b++){
++  const u32 *p=v+9+b*24;
++  n+=sysfs_emit_at(buf,n,"feed_band%u batches=%u packets=%u batch1=%u batch2_4=%u batch5_8=%u batch9_15=%u batch16=%u end_other=%u end_empty=%u end_token=%u end_credit=%u end_ps=%u end_gate=%u end_ring=%u end_budget=%u sampled_mixed=%u last_wcid=%u last_tid=%u sampled_run_max=%u gap_samples=%u gap_cycles=%u gap_max=%u ready_gap_samples=%u ready_gap_cycles=%u\n",
++   b,p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15],p[16],p[17],p[18],p[19],p[20],p[21],p[22],p[23]);
++ }
++ n+=sysfs_emit_at(buf,n,"scope=FE1_doorbell_batches_not_air_AMPDU end_other_includes_fault_drop_host gap_only_adjacent_sampled_batches ready_gap=no_TDMA_empty_observed_between\n");
++ mutex_unlock(&d->lock);return n;
++}
++static DEVICE_ATTR_RO(clanker_feed_status);
++
+ static struct attribute *airoha_clanker_attrs[] = {
++ &dev_attr_clanker_feed_status.attr,
+ 	&dev_attr_clanker_queue_status.attr,
+ 	&dev_attr_clanker_cost_status.attr,
+ 	&dev_attr_clanker_status.attr,
+@@ -1056,7 +1080,7 @@
+    queue_error=airoha_npu_wlan_msg_get(npu,7,
+     (enum airoha_npu_wlan_get_cmd)32,path,sizeof(path),GFP_KERNEL);
+    if (!queue_error && (path[0]!=CLANKER_DIAG_MAGIC || path[1]!=7 ||
+-       path[61]!=0x4b460001 || (path[4] && path[8]!=75))) queue_error=-EPROTO;
++       path[61]!=0x4b460001 || (path[4] && path[8]!=76))) queue_error=-EPROTO;
+   }
+   mutex_lock(&d->lock);
+   d->queue_error=queue_error;
+@@ -1065,6 +1089,25 @@
+        (path[5]!=d->queue[5] || path[6]!=d->queue[6] || path[7]!=d->queue[7])))
+     d->queue_advanced=jiffies;
+    memcpy(d->queue,path,sizeof(path));d->queue_updated=jiffies;d->queue_valid=true;
++  }
++  mutex_unlock(&d->lock);
++ } /* FE1 is optional diagnostics, independent of ownership and KC1. */
++ {
++  int feed_error=err;
++  if (!err) {
++   memset(path,0,sizeof(path));
++   feed_error=airoha_npu_wlan_msg_get(npu,8,
++    (enum airoha_npu_wlan_get_cmd)32,path,sizeof(path),GFP_KERNEL);
++   if (!feed_error && (path[0]!=CLANKER_DIAG_MAGIC || path[1]!=8 ||
++       path[61]!=0x4b450001 || (path[4] && path[8]!=76))) feed_error=-EPROTO;
++  }
++  mutex_lock(&d->lock);
++  d->feed_error=feed_error;
++  if (!feed_error) {
++   if (!d->feed_valid || (path[4] &&
++       (path[5]!=d->feed[5] || path[6]!=d->feed[6] || path[7]!=d->feed[7])))
++    d->feed_advanced=jiffies;
++   memcpy(d->feed,path,sizeof(path));d->feed_updated=jiffies;d->feed_valid=true;
+   }
+   mutex_unlock(&d->lock);
+  }

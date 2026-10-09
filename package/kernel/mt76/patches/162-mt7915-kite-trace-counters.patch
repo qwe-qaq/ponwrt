@@ -1,0 +1,217 @@
+Subject: mt7915: expose low-overhead Kite recovery trace counters
+
+Keep recovery and offload diagnostics available after printk rotation. Counters are
+updated at control, gate, stall, radio and reset transitions and are exposed through
+debugfs without touching packet ownership or issuing mailbox commands.
+
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -295,6 +295,13 @@
+ 		u32 tx_unknown;
+ 		unsigned long tx_log_at;
+ 		unsigned long trace_log_at;
++		unsigned long trace_last_at;
++		u32 trace_gate_changes, trace_timeout_resolved, trace_timeout_unresolved;
++		u32 trace_faults, trace_stalls, trace_radio_starts, trace_radio_stops;
++		u32 trace_recovery_workers, trace_recovery_failures, trace_reset_requests;
++		u32 trace_full_attempts;
++		u32 trace_last_event, trace_last_op, trace_last_state;
++		int trace_last_error;
+ 		struct mt76_queue *txq[2];
+ 		bool live[MT7916_WTBL_SIZE];
+ 	} kite;
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -101,6 +101,12 @@
+ 			status_valid = !ret;
+ 			if (!ret && s[3] == dev->kite.session &&
+ 			    s[4] == dev->kite.serial) {
++				dev->kite.trace_timeout_resolved++;
++				dev->kite.trace_last_event = 1;
++				dev->kite.trace_last_op = op;
++				dev->kite.trace_last_error = send_ret;
++				dev->kite.trace_last_state = s[6];
++				dev->kite.trace_last_at = jiffies;
+ 				dev_info(dev->mt76.dev,
+ 					 "Kite control timeout resolved: op=%u serial=%u attempt=%u\n",
+ 					 op, dev->kite.serial, attempt + 1);
+@@ -109,6 +115,12 @@
+ 		}
+ 		if (ret || s[3] != dev->kite.session ||
+ 		    s[4] != dev->kite.serial) {
++			dev->kite.trace_timeout_unresolved++;
++			dev->kite.trace_last_event = 2;
++			dev->kite.trace_last_op = op;
++			dev->kite.trace_last_error = send_ret;
++			dev->kite.trace_last_state = s[6];
++			dev->kite.trace_last_at = jiffies;
+ 			dev_warn(dev->mt76.dev,
+ 				 "Kite control timeout unresolved: op=%u serial=%u send_ret=%d status_ret=%d status_valid=%u status_session=%u status_serial=%u state=%u result=%u\n",
+ 				 op, dev->kite.serial, send_ret, ret, status_valid,
+@@ -236,6 +248,11 @@
+ 	if (dev->kite.failed)
+ 		return ret;
+ 	dev->kite.failed = true;
++	dev->kite.trace_faults++;
++	dev->kite.trace_last_event = 3;
++	dev->kite.trace_last_error = ret;
++	dev->kite.trace_last_state = dev->recovery.state;
++	dev->kite.trace_last_at = jiffies;
+ 	dev_err(dev->mt76.dev,
+ 		"Kite control failed (%d), session %u serial %u dp_bound=%u dp_gate=%u dp_fault=%u tx_reset=%u recovery=%08x tokens=%u; %s\n",
+ 		ret, dev->kite.session, dev->kite.serial,
+@@ -932,13 +949,18 @@
+ 		q->kite_tx_blocked = stop;
+ 		spin_unlock_bh(&q->lock);
+ 	}
+-	if (changed)
++	if (changed) {
++		dev->kite.trace_gate_changes++;
++		dev->kite.trace_last_event = 4;
++		dev->kite.trace_last_state = stop;
++		dev->kite.trace_last_at = jiffies;
+ 		dev_info(dev->mt76.dev,
+ 			 "Kite TX gate transition: gate=%u session=%u tx_bound=%u dp_bound=%u dp_gate=%u tx_reset=%u recovery=%08x\n",
+ 			 stop, dev->kite.session, dev->kite.tx_bound,
+ 			 dev->kite.dp_bound,
+ 			 dev->mt76.kite_dp ? READ_ONCE(dev->mt76.kite_dp->gate) : 0,
+ 			 dev->kite.tx_reset_requested, dev->recovery.state);
++	}
+ 	if (!stop)
+ 		mt76_worker_schedule(&dev->mt76.tx_worker);
+ }
+@@ -1292,6 +1314,11 @@
+ 		    (dp_pending && time_after(jiffies, dev->kite.dp_progress_at[b] + 15 * HZ))) {
+ 			struct mt7915_dp_pending pending = mt7915_dp_pending(dev, b);
+ 
++			dev->kite.trace_stalls++;
++			dev->kite.trace_last_event = 5;
++			dev->kite.trace_last_error = -ETIMEDOUT;
++			dev->kite.trace_last_state = b;
++			dev->kite.trace_last_at = jiffies;
+ 			dev_err(dev->mt76.dev,
+ 				"Kite DP band%d stalled: pending=%u dma_wait=%u wa_wait=%u ready=%u quarantine=%u hw_submitted=%u hw_reaped=%u\n",
+ 				b, pending.wifi, pending.dma_wait, pending.wa_wait,
+@@ -1460,11 +1487,46 @@
+ }
+ DEFINE_SHOW_ATTRIBUTE(mt7915_kite_datapath);
+ 
++static int mt7915_kite_trace_show(struct seq_file *m, void *unused)
++{
++	struct mt7915_dev *dev = m->private;
++	unsigned long age = READ_ONCE(dev->kite.trace_last_at);
++
++	mutex_lock(&dev->mt76.mutex);
++	seq_printf(m,
++		"trace_abi=1 session=%u tx_bound=%u dp_bound=%u dp_attached=%u tx_gate0=%u tx_gate1=%u dp_gate=%u dp_fault=%u tx_reset=%u failed=%u recovery=%08x quarantine=%u tokens=%u\n",
++		dev->kite.session, dev->kite.tx_bound, dev->kite.dp_bound,
++		dev->kite.dp_attached,
++		dev->kite.txq[0] ? dev->kite.txq[0]->kite_tx_blocked : 0,
++		dev->kite.txq[1] ? dev->kite.txq[1]->kite_tx_blocked : 0,
++		dev->mt76.kite_dp ? READ_ONCE(dev->mt76.kite_dp->gate) : 0,
++		dev->mt76.kite_dp ? READ_ONCE(dev->mt76.kite_dp->fault) : 0,
++		dev->kite.tx_reset_requested, dev->kite.failed,
++		dev->recovery.state, dev->mt76.npu_quarantine,
++		READ_ONCE(dev->mt76.token_count));
++	seq_printf(m,
++		"events gate_changes=%u timeout_resolved=%u timeout_unresolved=%u faults=%u stalls=%u radio_start=%u radio_stop=%u recovery_worker=%u recovery_failures=%u reset_requests=%u full_attempts=%u\n",
++		dev->kite.trace_gate_changes, dev->kite.trace_timeout_resolved,
++		dev->kite.trace_timeout_unresolved, dev->kite.trace_faults,
++		dev->kite.trace_stalls, dev->kite.trace_radio_starts,
++		dev->kite.trace_radio_stops, dev->kite.trace_recovery_workers,
++		dev->kite.trace_recovery_failures, dev->kite.trace_reset_requests,
++		dev->kite.trace_full_attempts);
++	seq_printf(m, "last_event=%u last_op=%u last_error=%d last_state=%u age_ms=%lu\n",
++		dev->kite.trace_last_event, dev->kite.trace_last_op,
++		dev->kite.trace_last_error, dev->kite.trace_last_state,
++		age ? jiffies_to_msecs(jiffies - age) : 0UL);
++	mutex_unlock(&dev->mt76.mutex);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mt7915_kite_trace);
++
+ void mt7915_npu_tx_debugfs(struct mt7915_dev *dev, struct dentry *dir)
+ {
+ 	debugfs_create_file("kite_datapath", 0400, dir, dev, &mt7915_kite_datapath_fops);
+ 	debugfs_create_file("kite_tx", 0400, dir, dev, &mt7915_kite_tx_fops);
+ 	debugfs_create_file("kite_rx", 0400, dir, dev, &mt7915_kite_rx_fops);
++	debugfs_create_file("kite_trace", 0400, dir, dev, &mt7915_kite_trace_fops);
+ }
+ 
+ /* Shared lifetime uses the NPU allocator's existing DMA quarantine. Never
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -99,6 +99,9 @@
+ 	struct mt7915_dev *dev = mt7915_hw_dev(hw);
+ 	int ret;
+ 
++	dev->kite.trace_radio_starts++;
++	dev->kite.trace_last_event = 6;
++	dev->kite.trace_last_at = jiffies;
+ 	dev_info(dev->mt76.dev,
+ 		 "Kite radio start begin: band=%u session=%u tx_bound=%u dp_bound=%u failed=%u recovery=%08x quarantine=%u\n",
+ 		 mt7915_hw_phy(hw)->mt76->band_idx, dev->kite.session,
+@@ -128,6 +131,9 @@
+ 	struct mt7915_dev *dev = mt7915_hw_dev(hw);
+ 	struct mt7915_phy *phy = mt7915_hw_phy(hw);
+ 
++	dev->kite.trace_radio_stops++;
++	dev->kite.trace_last_event = 7;
++	dev->kite.trace_last_at = jiffies;
+ 	dev_warn(dev->mt76.dev,
+ 		 "Kite radio stop begin: band=%u suspend=%u session=%u tx_bound=%u dp_bound=%u failed=%u recovery=%08x quarantine=%u\n",
+ 		 phy->mt76->band_idx, suspend, dev->kite.session,
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1755,6 +1755,7 @@
+ 
+ 	mutex_lock(&dev->mt76.mutex);
+ 	for (i = 0; i < 10; i++) {
++		dev->kite.trace_full_attempts++;
+ 		dev_info(dev->mt76.dev,
+ 			"Kite full reset attempt=%d/10 quarantine=%u failed=%u tx_bound=%u dp_bound=%u\n",
+ 			i + 1, dev->mt76.npu_quarantine, dev->recovery.failed,
+@@ -1787,6 +1788,10 @@
+ 			return ret;
+ 		}
+ 		dev->recovery.failed = true;
++		dev->kite.trace_recovery_failures++;
++		dev->kite.trace_last_event = 9;
++		dev->kite.trace_last_error = ret;
++		dev->kite.trace_last_at = jiffies;
+ 		dev_err(dev->mt76.dev,
+ 			"chip full reset quarantined after %d attempts: %d; queues held, reboot required; quarantine=%u tx_bound=%u dp_bound=%u retry=%u\n",
+ 			i + 1, ret, dev->mt76.npu_quarantine, dev->kite.tx_bound,
+@@ -1835,6 +1840,10 @@
+ 	dev = container_of(work, struct mt7915_dev, reset_work);
+ 	ext_phy = dev->mt76.phys[MT_BAND1];
+ 	phy2 = ext_phy ? ext_phy->priv : NULL;
++	dev->kite.trace_recovery_workers++;
++	dev->kite.trace_last_event = 8;
++	dev->kite.trace_last_state = dev->recovery.state;
++	dev->kite.trace_last_at = jiffies;
+ 	dev_warn(dev->mt76.dev,
+ 		 "Kite recovery worker: state=%08x restart=%u failed=%u full=%u retry=%u tx_reset=%u tx_bound=%u dp_bound=%u quarantine=%u\n",
+ 		 dev->recovery.state, dev->recovery.restart, dev->recovery.failed,
+@@ -1979,6 +1988,10 @@
+ 		return;
+ 	}
+ 	dev->recovery.failed = true;
++	dev->kite.trace_recovery_failures++;
++	dev->kite.trace_last_event = 9;
++	dev->kite.trace_last_error = ret;
++	dev->kite.trace_last_at = jiffies;
+ 	dev_err(dev->mt76.dev,
+ 		"chip partial reset quarantined: %d; queues held, reboot required; retry=%u\n",
+ 		ret, dev->recovery.retry_count);
+@@ -2058,6 +2071,10 @@
+ 
+ void mt7915_reset(struct mt7915_dev *dev)
+ {
++	dev->kite.trace_reset_requests++;
++	dev->kite.trace_last_event = 10;
++	dev->kite.trace_last_state = dev->recovery.state;
++	dev->kite.trace_last_at = jiffies;
+ 	dev_warn(dev->mt76.dev,
+ 		 "Kite reset requested: state=%08x restart=%u failed=%u full=%u tx_reset=%u tx_bound=%u dp_bound=%u quarantine=%u\n",
+ 		 dev->recovery.state, dev->recovery.restart, dev->recovery.failed,

@@ -1,0 +1,109 @@
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -213,6 +213,18 @@
+ 	unsigned int hint_miss, tx_amsdu, tx_single, retry;
+ 	unsigned int reserved[8];
+ };
++/* ABI8 performance tail. These words were reserved in r55 and therefore do
++ * not move any shared/DMA field. Hart4 is the only writer; ARM reads them as
++ * a cumulative snapshot. The counters mirror the useful H3C stages without
++ * importing its descriptor or host ABI. */
++#define KDP_PERF_TDMA_READY   0u
++#define KDP_PERF_TDMA_EMPTY   1u
++#define KDP_PERF_TDMA_REARM   2u
++#define KDP_PERF_TX_RING_FULL 3u
++#define KDP_PERF_TX_PUBLISH   4u
++#define KDP_PERF_DMA_DONE     5u
++#define KDP_PERF_TX_READY     6u
++#define KDP_PERF_FALLBACK_HOLD 7u
+ /* A-MSDU publication is one aligned word: peer max length and BA TID mask.
+  * No key/PN or authorization is granted by this optional TX capability. */
+ static inline unsigned int kdp_amsdu_contract(unsigned int enabled,
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -329,6 +329,8 @@
+ 		u32 dp_rx_meta_stale[2], dp_rx_meta_invalid[2];
+ 		spinlock_t dp_done_lock;
+   u32 dp_done_producer;
++  u32 dp_done_published, dp_done_publish_calls, dp_done_publish_writes;
++  u32 dp_done_publish_skips, dp_done_events;
+   u32 ba_refresh, ba_timer_refresh, ba_starts, ba_start_failed;
+ 		struct work_struct dp_ps_work;
+ 		DECLARE_BITMAP(dp_ps_pending, KDP_WCIDS);
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1698,9 +1698,13 @@
+ 		s->perf.reap_ready, s->perf.cache_flush, npu_amsdu);
+ 	for (b = 0; b < 2; b++) {
+ 		struct kdp_perf_band *p = &s->performance[b];
+-		seq_printf(m, "perf_band%u parse_fast=%u parse_slow=%u parse_reuse=%u hint_hit=%u hint_miss=%u tx_amsdu=%u tx_single=%u retry=%u\n",
++		seq_printf(m, "perf_band%u parse_fast=%u parse_slow=%u parse_reuse=%u hint_hit=%u hint_miss=%u tx_amsdu=%u tx_single=%u retry=%u tdma_ready=%u tdma_empty=%u tdma_rearm=%u tx_ring_full=%u tx_publish=%u dma_done=%u tx_ready=%u fallback_hold=%u\n",
+ 			b, p->parse_fast, p->parse_slow, p->parse_reuse,
+-			p->hint_hit, p->hint_miss, p->tx_amsdu, p->tx_single, p->retry);
++			p->hint_hit, p->hint_miss, p->tx_amsdu, p->tx_single, p->retry,
++			p->reserved[KDP_PERF_TDMA_READY], p->reserved[KDP_PERF_TDMA_EMPTY],
++			p->reserved[KDP_PERF_TDMA_REARM], p->reserved[KDP_PERF_TX_RING_FULL],
++			p->reserved[KDP_PERF_TX_PUBLISH], p->reserved[KDP_PERF_DMA_DONE],
++			p->reserved[KDP_PERF_TX_READY], p->reserved[KDP_PERF_FALLBACK_HOLD]);
+ 	}
+ 	seq_printf(m, "dp_pause=%u dp_resume=%u dp_pause_failed=%u dp_resume_failed=%u\n",
+ 		dev->kite.trace_dp_pauses, dev->kite.trace_dp_resumes,
+@@ -1720,7 +1724,11 @@
+ 	}
+  seq_printf(m, "notify producer=%u consumer=%u overflow=%u consumed=%u stale=%u scans=%u scan_ready=%u\n",
+   READ_ONCE(s->done.producer), READ_ONCE(s->done.consumer), READ_ONCE(s->done.overflow),
+-  READ_ONCE(s->done.consumed), READ_ONCE(s->done.stale), READ_ONCE(s->done.scans), READ_ONCE(s->done.scan_ready));
++ READ_ONCE(s->done.consumed), READ_ONCE(s->done.stale), READ_ONCE(s->done.scans), READ_ONCE(s->done.scan_ready));
++ seq_printf(m, "notify_host events=%u publish_calls=%u publish_writes=%u publish_skips=%u published=%u\n",
++  READ_ONCE(dev->kite.dp_done_events), READ_ONCE(dev->kite.dp_done_publish_calls),
++  READ_ONCE(dev->kite.dp_done_publish_writes), READ_ONCE(dev->kite.dp_done_publish_skips),
++  READ_ONCE(dev->kite.dp_done_published));
+  seq_printf(m, "ba_activity refresh=%u timer_refresh=%u starts=%u start_failed=%u\n",
+   READ_ONCE(dev->kite.ba_refresh), READ_ONCE(dev->kite.ba_timer_refresh),
+   READ_ONCE(dev->kite.ba_starts), READ_ONCE(dev->kite.ba_start_failed));
+@@ -1890,7 +1898,12 @@
+  memset(s->activity, 0, sizeof(s->activity));
+  memset(&s->service, 0, sizeof(s->service));
+  dev->kite.dp_done_producer = 0;
+-	memset(&s->perf, 0, sizeof(s->perf));
++ dev->kite.dp_done_published = 0;
++ dev->kite.dp_done_publish_calls = 0;
++ dev->kite.dp_done_publish_writes = 0;
++ dev->kite.dp_done_publish_skips = 0;
++ dev->kite.dp_done_events = 0;
++ memset(&s->perf, 0, sizeof(s->perf));
+ 	memset(s->performance, 0, sizeof(s->performance));
+ 	s->perf.flags = npu_perf ? KDP_PERF_FAST | KDP_PERF_TOKENQ : 0;
+ 	/* Invalid profiling input disables optional sampling, never the link. */
+@@ -1985,6 +1998,7 @@
+   WRITE_ONCE(e->token, token - KDP_TOKEN_BASE);
+   WRITE_ONCE(e->submitted, seq);
+   dev->kite.dp_done_producer = producer + 1;
++  dev->kite.dp_done_events++;
+  }
+ 	spin_unlock_irqrestore(&dev->kite.dp_done_lock, flags);
+ 	return true;
+@@ -1993,13 +2007,21 @@
+ void mt7915_npu_dp_tx_done_publish(struct mt7915_dev *dev)
+ {
+  struct kdp_shared *s;
++ u32 producer;
+  unsigned long flags;
+  if (!READ_ONCE(dev->kite.dp_bound)) return;
+  spin_lock_irqsave(&dev->kite.dp_done_lock, flags);
++ dev->kite.dp_done_publish_calls++;
+  s = READ_ONCE(dev->mt76.kite_dp);
+- if (s && dev->kite.dp_bound && s->session == dev->kite.session && s->epoch == dev->kite.dp_epoch) {
++ producer = dev->kite.dp_done_producer;
++ if (s && dev->kite.dp_bound && s->session == dev->kite.session && s->epoch == dev->kite.dp_epoch &&
++     producer != dev->kite.dp_done_published) {
+   dma_wmb(); /* one producer publication per WA report, both MCU queues */
+-  WRITE_ONCE(s->done.producer, dev->kite.dp_done_producer);
++  WRITE_ONCE(s->done.producer, producer);
++  dev->kite.dp_done_published = producer;
++  dev->kite.dp_done_publish_writes++;
++ } else if (s && producer == dev->kite.dp_done_published) {
++  dev->kite.dp_done_publish_skips++;
+  }
+  spin_unlock_irqrestore(&dev->kite.dp_done_lock, flags);
+ }

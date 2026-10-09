@@ -1,0 +1,50 @@
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -7933,6 +7933,13 @@
+  * driver to capture a finite DMA prefix, not to free any payload.
+  */
+ u32 ieee80211_sta_tx_pending(struct ieee80211_sta *sta);
++/* Diagnostic/negative probe only. Zero is never a software drain proof.
++ * dequeued counts FQ dequeues, not WFDMA/WA completion or peer ACK. */
++struct ieee80211_sta_txq_observation {
++ u32 packets, bytes, fragments, dequeued, flags, aql;
++};
++void ieee80211_sta_txq_observe(struct ieee80211_sta *sta,
++ struct ieee80211_sta_txq_observation out[IEEE80211_NUM_TIDS + 1]);
+ 
+ /**
+  * ieee80211_txq_get_depth - get pending frame/byte count of given txq
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -6703,3 +6703,31 @@
+  return pending;
+ }
+ EXPORT_SYMBOL(ieee80211_sta_tx_pending);
++
++/* Caller owns station lifetime. FQ counters already exist; no added
++ * per-packet accounting. Fragment length is read atomically, never walked
++ * while the dequeue worker can remove/free the SKB. */
++void ieee80211_sta_txq_observe(struct ieee80211_sta *pub,
++ struct ieee80211_sta_txq_observation out[IEEE80211_NUM_TIDS + 1])
++{
++ struct sta_info *sta=container_of(pub,struct sta_info,sta);
++ struct ieee80211_local *local=sta->sdata->local;
++ int i;
++ memset(out,0,sizeof(*out)*(IEEE80211_NUM_TIDS+1));
++ spin_lock_bh(&local->fq.lock);
++ for (i=0;i<IEEE80211_NUM_TIDS+1;i++) {
++  struct ieee80211_txq *q=pub->txq[i];
++  struct txq_info *qi;
++  if (!q) continue;
++  qi=to_txq_info(q);
++  out[i].packets=qi->tin.backlog_packets;
++  out[i].bytes=qi->tin.backlog_bytes;
++  out[i].fragments=skb_queue_len(&qi->frags);
++  out[i].dequeued=qi->tin.tx_packets;
++  out[i].flags=READ_ONCE(qi->flags);
++  if (q->ac<IEEE80211_NUM_ACS)
++   out[i].aql=atomic_read(&sta->airtime[q->ac].aql_tx_pending);
++ }
++ spin_unlock_bh(&local->fq.lock);
++}
++EXPORT_SYMBOL(ieee80211_sta_txq_observe);

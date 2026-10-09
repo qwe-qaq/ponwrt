@@ -1,0 +1,88 @@
+Subject: airoha: revoke old flow authorization before repeated REPLACE
+
+A matching cookie does not prove that route, actions or station generation
+are unchanged. Revalidate after revocation; retain the indexed object on
+fence or removal failure. No live object is silently reused.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1331,6 +1331,32 @@
+ 	return 0;
+ }
+ 
++/* A cookie identifies a connection, not immutable actions or authorization.
++ * Revoke the previous policy before revalidating even a now-unsupported rule.
++ * Failed fences keep the object reachable for destroy/recovery and retry. */
++static int airoha_ppe_flow_replace_remove(struct airoha_eth *eth,
++                                         unsigned long cookie)
++{
++	struct airoha_flow_table_entry *e;
++	int err;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	e = rhashtable_lookup(&eth->flow_table, &cookie, airoha_flow_table_params);
++	if (!e)
++		return 0;
++	err = airoha_kite_flow_remove(eth->ppe, e);
++	if (err)
++		return err;
++	airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
++	err = rhashtable_remove_fast(&eth->flow_table, &e->node,
++				     airoha_flow_table_params);
++	if (err)
++		return err;
++	atomic64_inc(&eth->ppe->kite_replace_gc);
++	kfree(e);
++	return 0;
++}
++
+ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 					   struct flow_cls_offload *f)
+ {
+@@ -1345,30 +1371,16 @@
+ 	int err, i, offload_type;
+ 	u16 addr_type = 0;
+ 
++	err = airoha_ppe_flow_replace_remove(eth, f->cookie);
++	if (err)
++		return err;
++
+ 	err = airoha_ppe_flow_check_bridge(rule, f->common.extack);
+ 	if (err) {
+ 		atomic64_inc(&eth->ppe->bridge_policy_fallback);
+ 		return err;
+ 	}
+ 
+-	e = rhashtable_lookup(&eth->flow_table, &f->cookie,
+-			      airoha_flow_table_params);
+-	if (e) {
+-		/* nft_flowtable can replay REPLACE for a still-live conntrack
+-		 * cookie while refreshing its route. Keeping the installed FOE is
+-		 * the idempotent result; reporting -EEXIST leaves the flow in a
+-		 * permanent software-only retry loop. A retired object is safe to
+-		 * collect here because its hardware entry was already invalidated. */
+-		if (READ_ONCE(e->kite_retired)) {
+-			rhashtable_remove_fast(&eth->flow_table, &e->node,
+-					       airoha_flow_table_params);
+-			atomic64_inc(&eth->ppe->kite_replace_gc);
+-			kfree(e);
+-		} else {
+-			atomic64_inc(&eth->ppe->kite_replace_reuse);
+-			return 0;
+-		}
+-	}
+ 
+ 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META))
+ 		return -EOPNOTSUPP;
+@@ -1424,9 +1436,8 @@
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	/* Routed Kite rules carry the exact neighbour pair in the flow
+-	 * dissector.  Seed FOE construction with that key before actions run;
+-	 * bridge rules already have their own key and mangle semantics. */
++	/* Seed the original Ethernet key. Native Ethernet MANGLE actions
++	 * below supply the routed output MACs before FOE construction. */
+ 	if (offload_type != PPE_PKT_TYPE_BRIDGE &&
+ 	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ETH_ADDRS)) {
+ 		struct flow_match_eth_addrs match;

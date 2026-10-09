@@ -1,0 +1,33 @@
+Subject: mt7915: restore radio intent on early Kite reset failure
+
+mt7915_dma_reset() can fail before the common restart error label, after the
+radio state bits have been captured.  Restore both PHY intents on that early
+return as well.  The same guard keeps the move of the state capture safe for
+non-Kite devices whose restart fails after firmware init.
+
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1498,6 +1498,10 @@
+ 
+ 	ret = mt7915_dma_reset(dev, true);
+ 	if (ret) {
++		if (run_main)
++			set_bit(MT76_STATE_RUNNING, &dev->mphy.state);
++		if (run_ext && ext_phy)
++			set_bit(MT76_STATE_RUNNING, &ext_phy->state);
+ 		if (dev->mt76.npu_quarantine)
+ 			dev->recovery.failed = true;
+ 		else
+@@ -1560,6 +1564,12 @@
+ 	}
+ 
+ out:
++	if (ret && !mt76_npu_device_active(mdev)) {
++		if (run_main)
++			set_bit(MT76_STATE_RUNNING, &dev->mphy.state);
++		if (run_ext && ext_phy)
++			set_bit(MT76_STATE_RUNNING, &ext_phy->state);
++	}
+ 	if (ret && mt76_npu_device_active(mdev)) {
+ 		int stop_ret;
+ 

@@ -1,0 +1,123 @@
+From: ponwrt development <noreply@local>
+Subject: [PATCH] mt7915: publish configured QoS under PPE worker fences
+
+Shared datapath ABI 2 rejects mismatched host/firmware layouts.
+Retain PN, A-MSDU, ownership, bridge fallback and recovery protections.
+
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -9,7 +9,7 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_MAGIC 0x4b440001u
++#define KDP_MAGIC 0x4b440002u
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -111,7 +111,8 @@
+ 	unsigned int host_tids, reserved_sta;
+ 	unsigned int tx_tag;
+ 	unsigned char addr[6];
+-	unsigned char tx_blocked, reserved;
++	unsigned char tx_blocked, qos_valid;
++	unsigned char qos_map[64];
+ 	struct kdp_pn pn[KDP_TIDS];
+ };
+ 
+--- a/kite-reorder.h
++++ b/kite-reorder.h
+@@ -64,6 +64,22 @@
+ 	}
+ 	b->head = ssn & 4095;
+ 	b->window = window <= KDP_BA_SLOTS ? window : 0;
++}
++
++/* Advance only within the forward half of the 12-bit sequence space.
++ * Release complete MPDUs in order; incomplete chains are dropped by the
++ * release callback. BAR never resets or bypasses replay state. */
++static inline void kdp_ba_bar(struct kdp_ba *b, unsigned int ssn,
++	const struct kdp_reorder_ops *ops, void *ctx)
++{
++	unsigned int delta = (ssn - b->head) & 4095;
++	if (!b->window || b->window > KDP_BA_SLOTS || delta >= 2048)
++		return;
++	while (delta--)
++		kdp_ba_release(b, ops, ctx);
++	while (b->slot[b->head & (KDP_BA_SLOTS - 1)].count &&
++	       b->slot[b->head & (KDP_BA_SLOTS - 1)].complete)
++		kdp_ba_release(b, ops, ctx);
+ }
+ 
+ /* MT7916 payload-format: 0 single, 3 first, 2 middle, 1 last.
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1134,10 +1134,10 @@
+ 
+ 		sta += !!READ_ONCE(peer->enabled);
+ 		if (READ_ONCE(peer->generation) && READ_ONCE(dev->kite.live[i]))
+-			seq_printf(m, "sta%u generation=%u key_generation=%u cipher=%08x authorized=%u enabled=%u band=%u bss=%u tx_tag=%u tx_blocked=%u host_tids=%02x\n",
++			seq_printf(m, "sta%u generation=%u key_generation=%u cipher=%08x authorized=%u enabled=%u band=%u bss=%u tx_tag=%u tx_blocked=%u host_tids=%02x qos_map=%u\n",
+ 				i, peer->generation, peer->key_generation, peer->cipher,
+ 				peer->authorized, peer->enabled, peer->band, peer->bss,
+-				peer->tx_tag, peer->tx_blocked, peer->host_tids);
++				peer->tx_tag, peer->tx_blocked, peer->host_tids, peer->qos_valid);
+ 	}
+ 	for (i = 0; i < KDP_FLOWS; i++)
+ 		flows += !!READ_ONCE(s->flow[i].version);
+--- a/mt7915/npu-datapath.inc
++++ b/mt7915/npu-datapath.inc
+@@ -242,13 +242,16 @@
+ 	/* WTBL aggregation remains available; use standalone Ethernet MSDUs
+ 	 * until the per-peer A-MSDU size/lifetime contract is explicitly passed. */
+ 	s->amsdu = 0;
++	/* STA/key transactions already hold the RX/worker fence. */
++	memcpy(s->qos_map, vif->offload_qos_map, sizeof(s->qos_map));
++	s->qos_valid = !!(vif->offload_flags & IEEE80211_OFFLOAD_CUSTOM_QOS);
+ 	s->band = msta->vif->phy->mt76->band_idx;
+ 	s->bss = msta->vif->mt76.idx;
+ 	ether_addr_copy(s->addr, sta->addr);
+ 	/* PS/TWT notifications share this byte; preserve their bits. */
+ 	spin_lock_bh(&dev->kite.dp_done_lock);
+ 	s->tx_blocked = (s->tx_blocked & ~4u) |
+-		(((vif->offload_flags & IEEE80211_OFFLOAD_CUSTOM_QOS) || msta->vif->npu_acm) ? 4 : 0);
++		(msta->vif->npu_acm ? 4 : 0);
+ 	spin_unlock_bh(&dev->kite.dp_done_lock);
+ 	s->reserved_sta = vif->type == NL80211_IFTYPE_AP &&
+ 		!test_bit(MT_WCID_FLAG_4ADDR, &msta->wcid.flags) &&
+@@ -354,13 +357,14 @@
+ 	return 0;
+ }
+ 
+-/* The default DSCP/VLAN classifier is implemented in NPU. Configured maps
+- * and ACM require mac80211 policy; revoke existing egress immediately. */
++/* Publish Linux's DSCP classifier under the PPE worker fence. ACM still
++ * requires mac80211 admission policy. PS/TWT bits remain independent. */
+ int mt7915_npu_qos(struct mt7915_dev *dev, struct mt7915_vif *mvif)
+ {
+ 	struct kdp_shared *s = dev->mt76.kite_dp;
+ 	unsigned int wi;
+-	bool block = mvif->npu_qos_custom || mvif->npu_acm;
++	struct ieee80211_vif *vif = container_of((void *)mvif, struct ieee80211_vif, drv_priv);
++	bool block = !!mvif->npu_acm;
+ 	int ret = 0;
+ 
+ 	lockdep_assert_held(&dev->mt76.mutex);
+@@ -370,12 +374,12 @@
+ 		if (!s->sta[wi].generation || s->sta[wi].bss != mvif->mt76.idx ||
+ 		    s->sta[wi].band != mvif->phy->mt76->band_idx)
+ 			continue;
++		mt7915_dp_block_tx(dev, wi, 4, true);
++		ret = airoha_kite_update_qos(rcu_access_pointer(dev->mt76.mmio.ppe_dev), wi,
++					   vif->offload_qos_map, mvif->npu_qos_custom);
++		if (ret)
++			break;
+ 		mt7915_dp_block_tx(dev, wi, 4, block);
+-		if (block) {
+-			ret = airoha_kite_revoke_tx(rcu_access_pointer(dev->mt76.mmio.ppe_dev), wi);
+-			if (ret)
+-				break;
+-		}
+ 	}
+ 	if (ret) {
+ 		mutex_lock(&dev->kite.lock);

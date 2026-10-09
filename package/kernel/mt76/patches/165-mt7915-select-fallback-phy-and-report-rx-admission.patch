@@ -1,0 +1,229 @@
+From: ponwrt development
+Subject: [PATCH] Select the receiving band PHY for host fallback and expose admission diagnostics
+
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -154,6 +154,22 @@
+ 	unsigned int rx_policy_hit, rx_policy_miss, rx_tdma_full;
+ 	unsigned int reserved[9];
+ };
++/* Optional telemetry v2: reuse previously unwritten reserved words.
++ * No shared layout, DMA address or ownership/packet ABI changes. */
++#define KDP_STAT_TX_ADMISSION_DROP 4u
++#define KDP_STAT_RX_ENTER         5u
++#define KDP_STAT_RX_EARLY         6u
++#define KDP_STAT_RX_LAST          7u /* wcid:16, tid:8, reason:8 */
++#define KDP_STAT_RX_WORD2         8u
++#define KDP_RX_EARLY_DISABLED     1u
++#define KDP_RX_EARLY_STA          2u
++#define KDP_RX_EARLY_BAND         3u
++#define KDP_RX_EARLY_BSS          4u
++#define KDP_RX_EARLY_BAR          5u
++#define KDP_RX_EARLY_TID          6u
++#define KDP_RX_EARLY_NON_QOS      7u
++#define KDP_RX_EARLY_UNSUPPORTED  8u
++#define KDP_RX_EARLY_NO_BA        9u
+ struct kdp_shared {
+ 	unsigned int magic, bytes, session, epoch;
+ 	unsigned int enabled, fault, gate, stopped;
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1214,6 +1214,7 @@
+ 	u8 band;
+ 	u16 wcid;
+ 	bool sent;
++	int xmit_error;
+ };
+ 
+ static void mt7915_kite_host_tx_iter(void *data, u8 *mac,
+@@ -1238,7 +1239,9 @@
+ 	skb_reset_network_header(ctx->skb);
+ 	skb_reset_transport_header(ctx->skb);
+ 	ctx->sent = true;
+-	dev_queue_xmit(ctx->skb);
++	/* dev_queue_xmit consumes the skb even on an error. */
++	ctx->xmit_error = dev_queue_xmit(ctx->skb);
++	ctx->xmit_error = net_xmit_eval(ctx->xmit_error);
+ }
+ 
+ static bool mt7915_kite_host_tx(struct mt7915_dev *dev, struct sk_buff *skb,
+@@ -1251,44 +1254,72 @@
+ 	};
+ 	struct mt76_wcid *wcid;
+ 	struct mt7915_sta *msta;
++	struct mt76_phy *mphy;
++	u32 reject;
+ 	struct kdp_shared *dp = READ_ONCE(dev->mt76.kite_dp);
+ 	u32 generation = KDP_HOST_FALLBACK_GENERATION(generation_key);
+ 	u32 key_generation = KDP_HOST_FALLBACK_KEY_GENERATION(generation_key);
+ 
++	reject = MT7915_KITE_HOST_META;
+ 	if (!KDP_HOST_FALLBACK_VALID(meta) || skb->len < ETH_HLEN ||
+-		ctx.band > 1 || ctx.wcid >= MT7916_WTBL_SIZE || !session ||
+-		!generation || !READ_ONCE(dev->kite.active) ||
+-		!READ_ONCE(dev->kite.dp_bound) || !dp ||
+-		READ_ONCE(dp->session) != session || !READ_ONCE(dp->enabled) ||
+-		READ_ONCE(dp->gate) || !READ_ONCE(dp->sta[ctx.wcid].enabled) ||
+-		!READ_ONCE(dp->sta[ctx.wcid].authorized) ||
+-		READ_ONCE(dp->sta[ctx.wcid].band) != ctx.band ||
+-		READ_ONCE(dp->sta[ctx.wcid].generation) != generation ||
+-		READ_ONCE(dp->sta[ctx.wcid].key_generation) != key_generation ||
+-		(READ_ONCE(dp->sta[ctx.wcid].cipher) && !key_generation) ||
+-		READ_ONCE(dev->kite.session) != session ||
+-		!READ_ONCE(dev->kite.live[ctx.wcid]) ||
+-		READ_ONCE(dev->kite.generation[ctx.wcid]) > 0xffffu ||
+-		(READ_ONCE(dev->kite.generation[ctx.wcid]) & 0xffffu) != generation ||
+-		READ_ONCE(dev->kite.key_generation[ctx.wcid]) > 0xffffu ||
+-		(READ_ONCE(dev->kite.key_generation[ctx.wcid]) & 0xffffu) != key_generation)
+-		return false;
++	    ctx.band > 1 || ctx.wcid >= MT7916_WTBL_SIZE || !session ||
++	    !generation)
++		goto reject;
++	reject = MT7915_KITE_HOST_SESSION;
++	if (!READ_ONCE(dev->kite.active) || !READ_ONCE(dev->kite.dp_bound) ||
++	    !dp || READ_ONCE(dp->session) != session ||
++	    READ_ONCE(dev->kite.session) != session)
++		goto reject;
++	reject = MT7915_KITE_HOST_GATE;
++	if (!READ_ONCE(dp->enabled) || READ_ONCE(dp->gate))
++		goto reject;
++	reject = MT7915_KITE_HOST_STA;
++	if (!READ_ONCE(dp->sta[ctx.wcid].enabled) ||
++	    !READ_ONCE(dp->sta[ctx.wcid].authorized) ||
++	    READ_ONCE(dp->sta[ctx.wcid].band) != ctx.band ||
++	    !READ_ONCE(dev->kite.live[ctx.wcid]))
++		goto reject;
++	reject = MT7915_KITE_HOST_GENERATION;
++	if (READ_ONCE(dp->sta[ctx.wcid].generation) != generation ||
++	    READ_ONCE(dp->sta[ctx.wcid].key_generation) != key_generation ||
++	    (READ_ONCE(dp->sta[ctx.wcid].cipher) && !key_generation) ||
++	    READ_ONCE(dev->kite.generation[ctx.wcid]) > 0xffffu ||
++	    (READ_ONCE(dev->kite.generation[ctx.wcid]) & 0xffffu) != generation ||
++	    READ_ONCE(dev->kite.key_generation[ctx.wcid]) > 0xffffu ||
++	    (READ_ONCE(dev->kite.key_generation[ctx.wcid]) & 0xffffu) != key_generation)
++		goto reject;
++	reject = MT7915_KITE_HOST_WCID;
+ 	wcid = mt76_wcid_ptr(dev, ctx.wcid);
+ 	if (!wcid || !wcid->sta)
+-		return false;
++		goto reject;
+ 	msta = container_of(wcid, struct mt7915_sta, wcid);
++	reject = MT7915_KITE_HOST_VIF;
+ 	if (!msta->vif)
+-		return false;
++		goto reject;
+ 	ctx.vif = msta->vif;
+-	ieee80211_iterate_active_interfaces_atomic(dev->mt76.hw,
++	/* The second MT7916 PHY owns its own AP list. The primary hw cannot
++	 * find band1's VIF. mt76_dev_phy falls back to primary if absent, so
++	 * verify the returned band before traversing its interfaces. */
++	reject = MT7915_KITE_HOST_PHY;
++	mphy = mt76_dev_phy(&dev->mt76, ctx.band);
++	if (!mphy || mphy->band_idx != ctx.band || !mphy->hw)
++		goto reject;
++	ieee80211_iterate_active_interfaces_atomic(mphy->hw,
+ 		IEEE80211_IFACE_ITER_NORMAL, mt7915_kite_host_tx_iter, &ctx);
+-	if (ctx.sent)
++	reject = MT7915_KITE_HOST_VIF;
++	if (!ctx.sent)
++		goto reject;
++	if (ctx.xmit_error) {
++		dev->kite.trace_host_reject[MT7915_KITE_HOST_XMIT]++;
++		dev->kite.trace_host_drop++;
++	} else {
+ 		dev->kite.trace_host_sent++;
+-	else {
+-		dev->kite.trace_host_drop++;
+-		dev_kfree_skb(skb);
+ 	}
+ 	return true;
++reject:
++	dev->kite.trace_host_reject[reject]++;
++	/* Caller owns/free the skb until the VIF actually consumes it. */
++	return false;
+ }
+ 
+ void mt7915_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -258,6 +258,19 @@
+ };
+ 
+ #ifdef CONFIG_MT7915_NPU
++enum mt7915_kite_host_reject {
++	MT7915_KITE_HOST_META,
++	MT7915_KITE_HOST_SESSION,
++	MT7915_KITE_HOST_GATE,
++	MT7915_KITE_HOST_STA,
++	MT7915_KITE_HOST_GENERATION,
++	MT7915_KITE_HOST_WCID,
++	MT7915_KITE_HOST_VIF,
++	MT7915_KITE_HOST_PHY,
++	MT7915_KITE_HOST_XMIT,
++	MT7915_KITE_HOST_REJECT_COUNT,
++};
++
+ #define MT7915_KITE_TRACE_RING 64
+ 
+ struct mt7915_kite_trace_event {
+@@ -321,6 +334,7 @@
+ 		u32 trace_head;
+ 		struct mt7915_kite_trace_event trace_ring[MT7915_KITE_TRACE_RING];
+ 		u64 trace_host_fallback, trace_host_sent, trace_host_drop;
++		u64 trace_host_reject[MT7915_KITE_HOST_REJECT_COUNT];
+ 		struct mt76_queue *txq[2];
+ 		bool live[MT7916_WTBL_SIZE];
+ 	} kite;
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1490,9 +1490,9 @@
+ 
+ 		sta += !!READ_ONCE(peer->enabled);
+ 		if (READ_ONCE(peer->generation) && READ_ONCE(dev->kite.live[i]))
+-			seq_printf(m, "sta%u generation=%u key_generation=%u cipher=%08x authorized=%u enabled=%u band=%u bss=%u tx_tag=%u tx_blocked=%u host_tids=%02x qos_map=%u\n",
++			seq_printf(m, "sta%u generation=%u key_generation=%u cipher=%08x authorized=%u enabled=%u band=%u bss=%u omac=%u tx_tag=%u tx_blocked=%u host_tids=%02x qos_map=%u\n",
+ 				i, peer->generation, peer->key_generation, peer->cipher,
+-				peer->authorized, peer->enabled, peer->band, peer->bss,
++				peer->authorized, peer->enabled, peer->band, peer->bss, peer->omac,
+ 				peer->tx_tag, peer->tx_blocked, peer->host_tids, peer->qos_valid);
+ 	}
+ 	for (i = 0; i < KDP_FLOWS; i++)
+@@ -1521,6 +1521,16 @@
+ 			s->stats[b].reserved[KDP_STAT_HOST_FALLBACK_DROP],
+ 			s->tx_sent[b], s->stats[b].tx_bytes, s->tx_freed[b], s->tx_drop[b],
+ 			s->stats[b].tx_stale, s->stats[b].tx_full, s->tx_aborted[b]);
++	for (b = 0; b < 2; b++) {
++		u32 last = READ_ONCE(s->stats[b].reserved[KDP_STAT_RX_LAST]);
++
++		seq_printf(m, "rx_observe_band%u telemetry_abi=2 entered=%u early=%u reason=%u wcid=%u tid=%u word2=%08x tx_admission_drop=%u\n",
++			b, READ_ONCE(s->stats[b].reserved[KDP_STAT_RX_ENTER]),
++			READ_ONCE(s->stats[b].reserved[KDP_STAT_RX_EARLY]),
++			last & 0xff, last >> 16, (last >> 8) & 0xff,
++			READ_ONCE(s->stats[b].reserved[KDP_STAT_RX_WORD2]),
++			READ_ONCE(s->stats[b].reserved[KDP_STAT_TX_ADMISSION_DROP]));
++	}
+ 	seq_printf(m, "host_token_limit=%u dp_token_first=%u dp_token_limit=%u reserved=%u change_error=%d\n",
+ 		dev->mt76.token_size, KDP_TOKEN_BASE, KDP_TOKEN_LIMIT,
+ 		dev->kite.dp_tokens_reserved, dev->kite.dp_change_error);
+@@ -1564,10 +1574,20 @@
+ 		dev->kite.trace_radio_stops, dev->kite.trace_recovery_workers,
+ 		dev->kite.trace_recovery_failures, dev->kite.trace_reset_requests,
+ 		dev->kite.trace_full_attempts);
+-	seq_printf(m, "telemetry_abi=1 host_fallback=%llu host_sent=%llu host_drop=%llu\n",
++	seq_printf(m, "telemetry_abi=2 host_fallback=%llu host_sent=%llu host_drop=%llu\n",
+ 		(unsigned long long)dev->kite.trace_host_fallback,
+ 		(unsigned long long)dev->kite.trace_host_sent,
+ 		(unsigned long long)dev->kite.trace_host_drop);
++	seq_printf(m, "host_reject meta=%llu session=%llu gate=%llu sta=%llu generation=%llu wcid=%llu vif=%llu phy=%llu xmit=%llu\n",
++		(unsigned long long)dev->kite.trace_host_reject[MT7915_KITE_HOST_META],
++		(unsigned long long)dev->kite.trace_host_reject[MT7915_KITE_HOST_SESSION],
++		(unsigned long long)dev->kite.trace_host_reject[MT7915_KITE_HOST_GATE],
++		(unsigned long long)dev->kite.trace_host_reject[MT7915_KITE_HOST_STA],
++		(unsigned long long)dev->kite.trace_host_reject[MT7915_KITE_HOST_GENERATION],
++		(unsigned long long)dev->kite.trace_host_reject[MT7915_KITE_HOST_WCID],
++		(unsigned long long)dev->kite.trace_host_reject[MT7915_KITE_HOST_VIF],
++		(unsigned long long)dev->kite.trace_host_reject[MT7915_KITE_HOST_PHY],
++		(unsigned long long)dev->kite.trace_host_reject[MT7915_KITE_HOST_XMIT]);
+ 	seq_printf(m, "last_event=%u last_op=%u last_error=%d last_state=%u age_ms=%lu\n",
+ 		dev->kite.trace_last_event, dev->kite.trace_last_op,
+ 		dev->kite.trace_last_error, dev->kite.trace_last_state,

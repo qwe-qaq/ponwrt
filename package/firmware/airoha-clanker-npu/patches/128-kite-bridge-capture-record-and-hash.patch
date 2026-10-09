@@ -1,0 +1,50 @@
+Subject: [PATCH] add explicit bridge capture record and normalize L4 policy hash
+
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -110,6 +110,7 @@
+  * complete L3/L4 tuple before choosing the MT7916 fast path. */
+ #define KDP_FLOW_BRIDGE_IPV4 4u
+ #define KDP_FLOW_BRIDGE_IPV6 5u
++#define KDP_FLOW_BRIDGE_CAPTURE 6u
+ #define KDP_SLOT_NONE 0xffffffffu
+ 
+ /* Host-adaptor record for a PPE bridge-policy miss. The Ethernet frame is
+--- a/kite-packet.h
++++ b/kite-packet.h
+@@ -137,7 +137,12 @@
+ 	const unsigned int *src, const unsigned int *dst, unsigned int ports,
+ 	unsigned int protocol, unsigned int type)
+ {
+-	unsigned int i, h = bucket ^ ports ^ (protocol << 24) ^ type;
++	unsigned int i, h;
++	if (type == KDP_FLOW_BRIDGE_IPV4)
++		type = KDP_FLOW_IPV4;
++	else if (type == KDP_FLOW_BRIDGE_IPV6)
++		type = KDP_FLOW_IPV6;
++	h = bucket ^ ports ^ (protocol << 24) ^ type;
+ 	for (i = 0; i < 4; i++) {
+ 		h = (h * 33u) ^ src[i];
+ 		h = (h * 33u) ^ dst[i];
+@@ -179,7 +184,8 @@
+ 		for (i = 0; i < 4; i++)
+ 			if (f->src[i] != p->src[i] || f->dst[i] != p->dst[i])
+ 				return 0;
+-	} else if (f->type != KDP_FLOW_BRIDGE) {
++	} else if (f->type != KDP_FLOW_BRIDGE &&
++		   f->type != KDP_FLOW_BRIDGE_CAPTURE) {
+ 		if (f->type != p->type || f->ports != p->ports ||
+ 		    f->protocol != p->protocol)
+ 			return 0;
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -164,8 +164,7 @@
+ 		volatile struct kdp_flow *f = &s->flow[i];
+ 		u32 version = f->version;
+ 		u32 j;
+-		if (!version || (f->type != KDP_FLOW_BRIDGE_IPV4 &&
+-				f->type != KDP_FLOW_BRIDGE_IPV6) ||
++		if (!version || f->type != KDP_FLOW_BRIDGE_CAPTURE ||
+ 			f->session != s->session || f->generation != sta->generation ||
+ 			f->key_generation != sta->key_generation || f->wcid != wcid ||
+ 			f->band != band || f->bss != sta->bss ||

@@ -1,0 +1,74 @@
+From: ponwrt maintainers
+Subject: [PATCH] r75: Expose validated per-band WA progress without per-token timing.
+
+Native incremental patch on release74. Datapath ABI12 and DMA ownership unchanged.
+
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1749,6 +1749,10 @@
+  seq_printf(m, "notify producer=%u consumer=%u overflow=%u consumed=%u stale=%u scans=%u scan_ready=%u\n",
+   READ_ONCE(s->done.producer), READ_ONCE(s->done.consumer), READ_ONCE(s->done.overflow),
+  READ_ONCE(s->done.consumed), READ_ONCE(s->done.stale), READ_ONCE(s->done.scans), READ_ONCE(s->done.scan_ready));
++ for (u32 b=0;b<2;b++)
++  seq_printf(m, "r75_wa%u token_done=%u event_done=%u overflow_done=%u last_done_ms=%u\n",
++   b,READ_ONCE(dev->kite.wa.token_done[b]),READ_ONCE(dev->kite.wa.event_done[b]),
++   READ_ONCE(dev->kite.wa.overflow_done[b]),READ_ONCE(dev->kite.wa.last_done_ms[b]));
+  seq_printf(m, "notify_host events=%u publish_calls=%u publish_writes=%u publish_skips=%u published=%u\n",
+   READ_ONCE(dev->kite.dp_done_events), READ_ONCE(dev->kite.dp_done_publish_calls),
+   READ_ONCE(dev->kite.dp_done_publish_writes), READ_ONCE(dev->kite.dp_done_publish_skips),
+--- a/mt7915/npu-wa.inc
++++ b/mt7915/npu-wa.inc
+@@ -7,6 +7,7 @@
+  unsigned long flags;
+  u32 producer, consumer, n, overflow = 0;
+  u64 start, elapsed;
++ u32 bands[2]={}, events[2]={}, overflows[2]={};
+  spin_lock_irqsave(&dev->kite.dp_done_lock, flags);
+  s = READ_ONCE(dev->mt76.kite_dp);
+  if (!s || !dev->kite.dp_bound) { dev->kite.tx_unknown += count; goto out; }
+@@ -16,17 +17,19 @@
+  if (s->session != dev->kite.session || s->epoch != dev->kite.dp_epoch) goto fault;
+  for (n = 0; n < count; n++) {
+   volatile struct kdp_token *t;
+-  u32 id = tokens[n] - KDP_TOKEN_BASE, seq;
++  u32 id = tokens[n] - KDP_TOKEN_BASE, seq, band;
+   if (id >= KDP_TOKENS) goto fault;
+   t = &s->token[id]; seq = READ_ONCE(t->submitted);
+   if (READ_ONCE(t->state) != KDP_TOKEN_WIFI || !seq || READ_ONCE(t->wa_done) ||
+       READ_ONCE(t->wcid) >= KDP_WCIDS || READ_ONCE(t->band) > 1) goto fault;
++  band=READ_ONCE(t->band);
++  bands[band]++;
+   dma_wmb(); WRITE_ONCE(t->wa_done, seq);
+-  if ((u32)(producer - consumer) >= KDP_DONE_COUNT) overflow++;
++  if ((u32)(producer - consumer) >= KDP_DONE_COUNT) { overflow++; overflows[band]++; }
+   else {
+    struct kdp_done_entry *e = &s->done.entry[producer & (KDP_DONE_COUNT - 1)];
+    WRITE_ONCE(e->token, id); WRITE_ONCE(e->submitted, seq); producer++;
+-   dev->kite.dp_done_events++;
++   dev->kite.dp_done_events++; events[band]++;
+   }
+  }
+  goto publish;
+@@ -40,6 +43,12 @@
+  dev->kite.dp_done_producer = producer;
+  dev->kite.dp_done_publish_calls++;
+  start = ktime_get_mono_fast_ns();
++ for (n=0;n<2;n++) if (bands[n]) {
++  dev->kite.wa.token_done[n]+=bands[n];
++  dev->kite.wa.event_done[n]+=events[n];
++  dev->kite.wa.overflow_done[n]+=overflows[n];
++  dev->kite.wa.last_done_ms[n]=(u32)div_u64(start,1000000);
++ }
+  if (producer != dev->kite.dp_done_published) {
+   dma_wmb(); WRITE_ONCE(s->done.producer, producer);
+   dev->kite.dp_done_published = producer; dev->kite.dp_done_publish_writes++;
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -349,6 +349,7 @@
+ };
+ struct mt7915_kite_wa_stats {
+  u64 reports, events, batches, errors, total_ns, max_ns, publish_ns, publish_max_ns;
++ u32 token_done[2], event_done[2], overflow_done[2], last_done_ms[2];
+  u64 age[8];
+  u64 mpdu[2], retries[2], final_failed[2], no_status_reports;
+ };

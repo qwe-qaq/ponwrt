@@ -1,0 +1,34 @@
+Subject: mt7915: make reset NAPI stop idempotent after retryable failure
+
+A transient Kite stop failure leaves the reset worker's TX NAPI disabled while
+the recovery latch remains retryable.  A second reset attempt must not call
+napi_disable() on an already disabled NAPI instance; guard both full and
+partial reset paths with the existing tx_napi_disabled ownership bit.
+
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1490,7 +1490,9 @@ mt7915_mac_restart(struct mt7915_dev *dev)
+ 	/* disable all tx/rx napi */
+ 	mt76_worker_disable(&dev->mt76.tx_worker);
+ 	mt7915_dma_napi_disable(dev);
+-	napi_disable(&mdev->tx_napi);
+-	mdev->tx_napi_disabled = true;
++	if (!mdev->tx_napi_disabled) {
++		napi_disable(&mdev->tx_napi);
++		mdev->tx_napi_disabled = true;
++	}
+ 
+ 	ret = mt7915_dma_reset(dev, true);
+@@ -1713,7 +1715,9 @@ void mt7915_mac_reset_work(struct work_struct *work)
+ 
+ 	mt76_worker_disable(&dev->mt76.tx_worker);
+ 	mt7915_dma_napi_disable(dev);
+-	napi_disable(&dev->mt76.tx_napi);
+-	dev->mt76.tx_napi_disabled = true;
++	if (!dev->mt76.tx_napi_disabled) {
++		napi_disable(&dev->mt76.tx_napi);
++		dev->mt76.tx_napi_disabled = true;
++	}
+ 
+ 
+ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed))

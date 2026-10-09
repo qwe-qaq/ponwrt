@@ -1,0 +1,25 @@
+Subject: Reduce healthy periodic summaries; preserve all fault and recovery checks
+
+Only logging cadence changes. Sampling, debugfs counters, watchdog scheduling,
+fault detection, ownership and datapath logic remain unchanged.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -871,7 +871,7 @@
+ 		if (d->quiet[i] >= 3)
+ 			quiet |= BIT(i);
+ 	}
+-	report = d->samples < 2 || !(d->samples % 3) || traps || previous_error ||
++	report = d->samples < 2 || !(d->samples % 12) || traps || previous_error ||
+ 		 (data[1][31] == 0x4b480001 && data[1][35] != d->data[1][35]);
+ 	d->samples++;
+ 	d->moving = moving;
+@@ -963,7 +963,7 @@
+ 	if (err)
+ 		dev_warn(npu->dev, "Clanker status sysfs unavailable: %d\n", err);
+ 	dev_info(npu->dev,
+-		 "Clanker monitor: sample 10s, summary 30s, /sys/bus/platform/devices/%s/clanker_status; RX path is negotiated by mt7915\n",
++		 "Clanker monitor: sample 10s, summary 120s, /sys/bus/platform/devices/%s/clanker_status; RX path is negotiated by mt7915\n",
+ 		 dev_name(npu->dev));
+ 	schedule_delayed_work(&d->work, HZ);
+ }

@@ -1,0 +1,106 @@
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -213,6 +213,18 @@
+ 	unsigned int hint_miss, tx_amsdu, tx_single, retry;
+ 	unsigned int reserved[8];
+ };
++/* ABI8 performance tail. These words were reserved in r55 and therefore do
++ * not move any shared/DMA field. Hart4 is the only writer; ARM reads them as
++ * a cumulative snapshot. The counters mirror the useful H3C stages without
++ * importing its descriptor or host ABI. */
++#define KDP_PERF_TDMA_READY   0u
++#define KDP_PERF_TDMA_EMPTY   1u
++#define KDP_PERF_TDMA_REARM   2u
++#define KDP_PERF_TX_RING_FULL 3u
++#define KDP_PERF_TX_PUBLISH   4u
++#define KDP_PERF_DMA_DONE     5u
++#define KDP_PERF_TX_READY     6u
++#define KDP_PERF_FALLBACK_HOLD 7u
+ /* A-MSDU publication is one aligned word: peer max length and BA TID mask.
+  * No key/PN or authorization is granted by this optional TX capability. */
+ static inline unsigned int kdp_amsdu_contract(unsigned int enabled,
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -378,6 +378,7 @@
+  dp_parse[band].valid = 0;
+  if (!q->count) q->first = idx;
+  REG32(dp_ring + band * DP_TDMA_BYTES + idx * 32 + 8) = dp_payload_pa(token);
++ dp->performance[band].reserved[KDP_PERF_TDMA_REARM]++;
+  q->count++;
+  dp_idx[band] = (idx + 1) % DP_TDMA_COUNT;
+  if (q->count == 8) kite_dp_tx_flush(band);
+@@ -395,6 +396,7 @@
+  dp_observe_reap(id, reusable);
+  dp->perf.reap_probe++;
+  if (!reusable) return 0;
++ dp->performance[t->band].reserved[KDP_PERF_TX_READY]++;
+  dp->tx_freed[t->band]++;
+  dp->perf.reap_ready++;
+  if (dp->perf.flags & KDP_PERF_TOKENQ) {
+@@ -523,11 +525,13 @@
+ 	}
+ 	desc = dp_ring + band * DP_TDMA_BYTES + dp_idx[band] * 32;
+ 	len = REG32(desc + 4);
+-	if (!(len & 0x80000000u)) {
++ if (!(len & 0x80000000u)) {
+ 		dp_obs.band[band].tdma_empty++;
++		dp->performance[band].reserved[KDP_PERF_TDMA_EMPTY]++;
+ 		return 0;
+ 	}
+ 	dp_obs.band[band].tdma_ready++;
++	dp->performance[band].reserved[KDP_PERF_TDMA_READY]++;
+ 	KDP_BARRIER();
+ 	len &= 0xffff;
+ 	addr = REG32(desc + 8);
+@@ -641,6 +645,7 @@
+ 		if (policy == -2)
+ 			goto drop;
+ 		if (policy == 0) {
++			dp->performance[band].reserved[KDP_PERF_FALLBACK_HOLD]++;
+ 			dp_host_bridge_fallback(band, token, addr, len, wcid, sta);
+ 			return 0;
+ 		}
+@@ -751,6 +756,7 @@
+ 	}
+ 	dp_observe_dma(token);
+ 	dp->token[token].dma_done = dp->token[token].submitted;
++	dp->performance[dp->token[token].band].reserved[KDP_PERF_DMA_DONE]++;
+ 	KDP_BARRIER();
+  dp_try_reap(token, dp->token[token].submitted);
+ }
+--- a/npu_kite_tx.c
++++ b/npu_kite_tx.c
+@@ -151,6 +151,7 @@
+ static void kite_tx_publish(struct kite_tx_ring *t, u32 b)
+ {
+  volatile struct kite_tx_shared *s = t->s;
++ volatile struct kdp_shared *dpstats = kite_dp_shared();
+  u32 stamp;
+  kite_dp_tx_flush(b);
+  if (s->hw_producer == t->hw_producer) return;
+@@ -163,6 +164,8 @@
+   s->fault = KITE_TX_FAULT_MMIO;
+  else
+   kite_dp_tx_published(b);
++ if (!s->fault && dpstats)
++  dpstats->performance[b].reserved[KDP_PERF_TX_PUBLISH]++;
+  s->hw_producer = t->hw_producer;
+  kite_dp_observe_batch(b, 0, t->batch_ppe, stamp);
+  t->batch_ppe = 0;
+@@ -172,6 +175,7 @@
+ {
+ 	struct kite_tx_ring *t = &tx[b];
+ 	volatile struct kite_tx_shared *s = t->s;
++	volatile struct kdp_shared *dpstats = kite_dp_shared();
+ 	u32 p, d, n, used, budget = KITE_TX_BUDGET;
+ 	u32 obs_packets = 0, obs_full = 0;
+ 	if (!s || s->fault)
+@@ -257,6 +261,8 @@
+ 			u16 token;
+ 			if (((t->hw_producer + 1) & KITE_TX_MASK) == t->hw_completed) {
+ 				obs_full = 1;
++				if (dpstats)
++					dpstats->performance[b].reserved[KDP_PERF_TX_RING_FULL]++;
+ 				break;
+ 			}
+ 			if (!kite_dp_tx_next(b, &v, &token))

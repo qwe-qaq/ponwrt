@@ -1,0 +1,403 @@
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -9,8 +9,8 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_ABI_VERSION 5u
+-#define KDP_MAGIC 0x4b440005u
++#define KDP_ABI_VERSION 6u
++#define KDP_MAGIC 0x4b440006u
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -199,6 +199,37 @@
+ 	unsigned int txwi_drop, reserved[3];
+ };
+ 
++/* ABI6: boot-only optimization flags, and single hart4 performance counters.
++ * The old DMA regions do not move. The host writes flags only before BIND. */
++#define KDP_PERF_FAST 1u
++#define KDP_PERF_TOKENQ 2u
++struct kdp_perf_control {
++	unsigned int flags, free_count, pending_count, alloc_probe;
++	unsigned int alloc_empty, reap_probe, reap_ready, cache_flush;
++	unsigned int reserved[8];
++};
++struct kdp_perf_band {
++	unsigned int parse_fast, parse_slow, parse_reuse, hint_hit;
++	unsigned int hint_miss, tx_amsdu, tx_single, retry;
++	unsigned int reserved[8];
++};
++/* A-MSDU publication is one aligned word: peer max length and BA TID mask.
++ * No key/PN or authorization is granted by this optional TX capability. */
++static inline unsigned int kdp_amsdu_contract(unsigned int enabled,
++	unsigned int native, unsigned int wme, unsigned int max_len,
++	unsigned int tids)
++{
++	if (!enabled || !native || !wme || max_len < 3839 || max_len > 11454)
++		return 0;
++	return (max_len << 16) | (tids & 0xffu);
++}
++static inline int kdp_amsdu_allowed(unsigned int contract, unsigned int tid,
++	unsigned int len)
++{
++	return tid < 8 && (contract & (1u << tid)) && len <= 1514 &&
++	       len + 64 <= (contract >> 16);
++}
++
+ struct kdp_shared {
+ 	unsigned int magic, bytes, session, epoch;
+ 	unsigned int enabled, fault, gate, stopped;
+@@ -217,10 +248,14 @@
+ 	unsigned char payload[KDP_TOKENS][KDP_BUFFER_BYTES];
+ 	struct kdp_band_stats stats[2];
+ 	struct kdp_quality_stats quality[2];
+-};
+-
+-/* ABI5 extends the tail, never the header or DMA regions. Magic and bytes
++	struct kdp_perf_control perf;
++	struct kdp_perf_band performance[2];
++};
++
++/* ABI6 extends the tail, never the header or DMA regions. Magic and bytes
+  * are both checked so a mixed driver/firmware fails before DMA admission. */
++_Static_assert(sizeof(struct kdp_perf_control) == 64, "Kite perf control");
++_Static_assert(sizeof(struct kdp_perf_band) == 64, "Kite perf counters");
+ _Static_assert(sizeof(struct kdp_quality_stats) == 64, "Kite quality cache line");
+ _Static_assert(sizeof(struct kdp_band_stats) == 64, "Kite statistics cache line");
+ _Static_assert(__builtin_offsetof(struct kdp_shared, sta) == 128, "Kite header");
+--- a/kite-packet.h
++++ b/kite-packet.h
+@@ -85,6 +85,44 @@
+ 		return 0;
+ 	}
+ 	out->ports = kdp_be32(p + l4);
++	return 1;
++}
++
++/* Common downlink: Ethernet II, no VLAN, IPv4 with default QoS, no
++ * options/fragments, complete TCP/UDP and MTU <= 1500. A rejection only
++ * selects the original parser; it never grants an offload policy. */
++static inline int kdp_parse_ipv4_fast(const unsigned char *p, unsigned int len,
++	struct kdp_packet *out)
++{
++	unsigned int end, proto, i;
++	if (len < 42 || len > 1514 || (p[0] & 1) || (p[6] & 1) ||
++	    p[12] != 8 || p[13] || p[14] != 0x45 || p[15] ||
++	    (kdp_be16(p + 20) & 0xbfff))
++		return 0;
++	end = 14 + kdp_be16(p + 16);
++	proto = p[23];
++	if (end > len || end < 42)
++		return 0;
++	if (proto == 6) {
++		if (end < 54 || (p[47] & 7) || (p[46] >> 4) < 5 ||
++		    (unsigned int)(p[46] >> 4) * 4 > end - 34)
++			return 0;
++	} else if (proto != 17 || kdp_be16(p + 38) != end - 34) {
++		return 0;
++	}
++	out->src[0] = kdp_be32(p + 26);
++	out->dst[0] = kdp_be32(p + 30);
++	out->src[1] = out->src[2] = out->src[3] = 0;
++	out->dst[1] = out->dst[2] = out->dst[3] = 0;
++	out->ports = kdp_be32(p + 34);
++	out->protocol = proto;
++	out->type = KDP_FLOW_IPV4;
++	out->vlan = KDP_SLOT_NONE;
++	out->dsfield = 0;
++	for (i = 0; i < 6; i++) {
++		out->dmac[i] = p[i];
++		out->smac[i] = p[i + 6];
++	}
+ 	return 1;
+ }
+ 
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -149,6 +149,8 @@
+ 
+ 	struct mt7915_vif *vif;
+ 
++	/* MCU-acknowledged HW A-MSDU contract; serialized by mt76.mutex. */
++	u16 npu_amsdu_len, npu_amsdu_tids;
+ 	struct list_head rc_list;
+ 	u32 airtime_ac[8];
+ 
+@@ -585,6 +587,9 @@
+ void mt7915_npu_ps(struct mt7915_dev *dev, u16 wcid, bool ps);
+ int mt7915_npu_twt(struct mt7915_dev *dev, u16 wcid, bool active);
+ int mt7915_npu_qos(struct mt7915_dev *dev, struct mt7915_vif *mvif);
++void mt7915_npu_amsdu_update(struct mt7915_dev *dev, struct mt7915_sta *msta);
++int mt7915_npu_amsdu_pause(struct mt7915_dev *dev, struct mt7915_sta *msta);
++void mt7915_npu_amsdu_resume(struct mt7915_dev *dev);
+ bool mt7915_npu_dp_tx_free(struct mt7915_dev *dev, u16 token);
+ int mt7915_npu_tx_halt(struct mt7915_dev *dev);
+ int mt7915_npu_tx_fence(struct mt7915_dev *dev);
+@@ -611,6 +616,9 @@
+ 		      u8 tid, u16 ssn, u16 win_size);
+ int mt7915_npu_sta_del(struct mt7915_dev *dev, u8 band, u16 wcid);
+ #else
++static inline void mt7915_npu_amsdu_resume(struct mt7915_dev *dev) {}
++static inline void mt7915_npu_amsdu_update(struct mt7915_dev *dev, struct mt7915_sta *msta) {}
++static inline int mt7915_npu_amsdu_pause(struct mt7915_dev *dev, struct mt7915_sta *msta) { return 0; }
+ static inline int mt7915_npu_qos(struct mt7915_dev *dev, struct mt7915_vif *mvif) { return 0; }
+ static inline void mt7915_npu_dp_work_stop(struct mt7915_dev *dev) {}
+ static inline void mt7915_npu_ps(struct mt7915_dev *dev, u16 wcid, bool ps) {}
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -761,13 +761,28 @@
+ 	struct mt7915_vif *mvif = msta->vif;
+ 	int ret;
+ 
++	bool fenced;
++
++	ret = mt7915_npu_amsdu_pause(dev, msta);
++	if (ret < 0)
++		return ret;
++	fenced = ret > 0;
+ 	mt7915_tx_worker_disable(dev);
++	msta->npu_amsdu_tids &= ~BIT(params->tid);
+ 	if (enable && !params->amsdu)
+ 		msta->wcid.amsdu = false;
++	mt7915_npu_amsdu_update(dev, msta);
+ 	ret = mt76_connac_mcu_sta_ba(&dev->mt76, &mvif->mt76, params,
+ 				     MCU_EXT_CMD(STA_REC_UPDATE),
+ 				     enable, true);
++	if (!ret && enable && params->amsdu && msta->wcid.amsdu)
++		msta->npu_amsdu_tids |= BIT(params->tid);
++	if (ret)
++		msta->npu_amsdu_tids = 0;
++	mt7915_npu_amsdu_update(dev, msta);
+ 	mt7915_tx_worker_enable(dev);
++	if (fenced)
++		mt7915_npu_amsdu_resume(dev);
+ 
+ 	return ret;
+ }
+@@ -1743,16 +1758,30 @@
+ 	struct mt7915_sta *msta;
+ 	struct sk_buff *skb;
+ 	int ret;
++	bool real_peer, fenced = false;
+ 
+ 	msta = sta ? (struct mt7915_sta *)sta->drv_priv : &mvif->sta;
+ 	link_sta = sta ? &sta->deflink : NULL;
+ 
+ 	if (!wcid)
+ 		wcid = &msta->wcid;
++	real_peer = sta && wcid == &msta->wcid;
++	if (real_peer) {
++		ret = mt7915_npu_amsdu_pause(dev, msta);
++		if (ret < 0)
++			return ret;
++		fenced = ret > 0;
++		msta->npu_amsdu_len = 0;
++		if (newly || conn_state == CONN_STATE_DISCONNECT)
++			msta->npu_amsdu_tids = 0;
++		mt7915_npu_amsdu_update(dev, msta);
++	}
+ 
+ 	skb = mt76_connac_mcu_alloc_sta_req(&dev->mt76, &mvif->mt76, wcid);
+-	if (IS_ERR(skb))
+-		return PTR_ERR(skb);
++	if (IS_ERR(skb)) {
++		ret = PTR_ERR(skb);
++		goto npu_out;
++	}
+ 
+ 	/* starec basic */
+ 	mt76_connac_mcu_sta_basic_tlv(&dev->mt76, skb, &vif->bss_conf, link_sta,
+@@ -1773,7 +1802,7 @@
+ 		ret = mt7915_mcu_sta_wtbl_tlv(dev, skb, vif, sta);
+ 		if (ret) {
+ 			dev_kfree_skb(skb);
+-			return ret;
++			goto npu_out;
+ 		}
+ 	}
+ 
+@@ -1795,17 +1824,27 @@
+ 	ret = mt76_connac_mcu_sta_wed_update(&dev->mt76, skb);
+ 	if (ret) {
+ 		dev_kfree_skb(skb);
+-		return ret;
++		goto npu_out;
+ 	}
+ 
+ 	ret = mt76_mcu_skb_send_msg(&dev->mt76, skb,
+ 				    MCU_EXT_CMD(STA_REC_UPDATE), true);
+ 	if (ret || conn_state == CONN_STATE_DISCONNECT)
+-		return ret;
++		goto npu_out;
++	if (real_peer && msta->wcid.amsdu)
++		msta->npu_amsdu_len = sta->deflink.agg.max_amsdu_len;
+ 
+ 	mt7915_mcu_add_group(dev, vif, sta);
+ 
+-	return 0;
++npu_out:
++	if (real_peer) {
++		if (ret)
++			msta->npu_amsdu_tids = 0;
++		mt7915_npu_amsdu_update(dev, msta);
++	}
++	if (fenced)
++		mt7915_npu_amsdu_resume(dev);
++	return ret;
+ }
+ 
+ int mt7915_mcu_wed_enable_rx_stats(struct mt7915_dev *dev)
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -8,6 +8,14 @@
+ #include "kite-host.h"
+ #include "../dma.h"
+ #include <linux/soc/airoha/airoha_kite.h>
++
++/* Load-time only: changing ownership algorithms with live DMA is forbidden. */
++static bool npu_perf = true;
++module_param(npu_perf, bool, 0400);
++MODULE_PARM_DESC(npu_perf, "Kite IPv4/parse hints and bounded token queues (load time only)");
++static bool npu_amsdu = true;
++module_param(npu_amsdu, bool, 0400);
++MODULE_PARM_DESC(npu_amsdu, "Kite native HW A-MSDU for MCU/BA-approved peers (load time only)");
+ 
+ /* A bounded transition history makes a drop/recovery diagnosable after
+  * printk rotation without adding a printk to the packet path.  The writer is
+@@ -1493,10 +1501,11 @@
+ 
+ 		sta += !!READ_ONCE(peer->enabled);
+ 		if (READ_ONCE(peer->generation) && READ_ONCE(dev->kite.live[i]))
+-			seq_printf(m, "sta%u generation=%u key_generation=%u cipher=%08x authorized=%u enabled=%u band=%u bss=%u omac=%u tx_tag=%u tx_blocked=%u host_tids=%02x qos_map=%u\n",
++			seq_printf(m, "sta%u generation=%u key_generation=%u cipher=%08x authorized=%u enabled=%u band=%u bss=%u omac=%u tx_tag=%u tx_blocked=%u host_tids=%02x qos_map=%u amsdu_tids=%02x amsdu_max=%u\n",
+ 				i, peer->generation, peer->key_generation, peer->cipher,
+ 				peer->authorized, peer->enabled, peer->band, peer->bss, peer->omac,
+-				peer->tx_tag, peer->tx_blocked, peer->host_tids, peer->qos_valid);
++				peer->tx_tag, peer->tx_blocked, peer->host_tids, peer->qos_valid,
++				peer->amsdu & 0xff, peer->amsdu >> 16);
+ 	}
+ 	for (i = 0; i < KDP_FLOWS; i++) {
+ 		u32 type;
+@@ -1553,6 +1562,16 @@
+ 			READ_ONCE(q->format_drop), READ_ONCE(q->control_drop),
+ 			READ_ONCE(q->bridge_parse_fallback), READ_ONCE(q->bridge_policy_fallback),
+ 			READ_ONCE(q->bridge_retired_drop), READ_ONCE(q->host_hold), READ_ONCE(q->txwi_drop));
++	}
++	seq_printf(m, "perf_abi=1 flags=%u queue_free=%u queue_pending=%u alloc_probe=%u alloc_empty=%u reap_probe=%u reap_ready=%u cache_flush=%u amsdu_config=%u\n",
++		s->perf.flags, s->perf.free_count, s->perf.pending_count,
++		s->perf.alloc_probe, s->perf.alloc_empty, s->perf.reap_probe,
++		s->perf.reap_ready, s->perf.cache_flush, npu_amsdu);
++	for (b = 0; b < 2; b++) {
++		struct kdp_perf_band *p = &s->performance[b];
++		seq_printf(m, "perf_band%u parse_fast=%u parse_slow=%u parse_reuse=%u hint_hit=%u hint_miss=%u tx_amsdu=%u tx_single=%u retry=%u\n",
++			b, p->parse_fast, p->parse_slow, p->parse_reuse,
++			p->hint_hit, p->hint_miss, p->tx_amsdu, p->tx_single, p->retry);
+ 	}
+ 	seq_printf(m, "dp_pause=%u dp_resume=%u dp_pause_failed=%u dp_resume_failed=%u\n",
+ 		dev->kite.trace_dp_pauses, dev->kite.trace_dp_resumes,
+@@ -1709,6 +1728,9 @@
+ 		dev->kite.dp_last_freed[i] = 0;
+ 		dev->kite.dp_progress_at[i] = jiffies;
+ 	}
++	memset(&s->perf, 0, sizeof(s->perf));
++	memset(s->performance, 0, sizeof(s->performance));
++	s->perf.flags = npu_perf ? KDP_PERF_FAST | KDP_PERF_TOKENQ : 0;
+ 	s->magic = KDP_MAGIC;
+ 	s->bytes = sizeof(*s);
+ 	s->session = dev->kite.session;
+@@ -1723,8 +1745,8 @@
+ 	ret = mt7915_kite_command(dev, KITE_CTL_DP_BIND, args, 3);
+ 	if (!ret)
+ 		dev_info(dev->mt76.dev,
+-			 "Kite datapath bound: session=%u epoch=%u bytes=%zu; admission closed\n",
+-			 s->session, s->epoch, sizeof(*s));
++			 "Kite datapath bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
++			 s->session, s->epoch, sizeof(*s), s->perf.flags, npu_amsdu);
+ out:
+ 	if (ret)
+ 		mt7915_kite_fault(dev, ret);
+--- a/mt7915/npu-datapath.inc
++++ b/mt7915/npu-datapath.inc
+@@ -241,6 +241,68 @@
+ 	return 0;
+ }
+ 
++/* Update just the optional aggregation word, never station authorization.
++ * The MCU caller has first withdrawn the old publication and, if it was
++ * usable, drained both host and NPU TX before changing the HW contract. */
++void mt7915_npu_amsdu_update(struct mt7915_dev *dev, struct mt7915_sta *msta)
++{
++	struct kdp_shared *s = READ_ONCE(dev->mt76.kite_dp);
++	struct ieee80211_sta *sta = container_of((void *)msta, struct ieee80211_sta, drv_priv);
++	struct ieee80211_vif *vif = container_of((void *)msta->vif, struct ieee80211_vif, drv_priv);
++	u16 wi = msta->wcid.idx;
++	u32 contract;
++
++	if (!s || !dev->kite.dp_bound || !wi || wi >= KDP_WCIDS ||
++	    !READ_ONCE(dev->kite.live[wi]))
++		return;
++	contract = kdp_amsdu_contract(npu_amsdu && vif->type == NL80211_IFTYPE_AP &&
++		!test_bit(MT_WCID_FLAG_4ADDR, &msta->wcid.flags) && !sta->tdls,
++		msta->wcid.amsdu, sta->wme, msta->npu_amsdu_len,
++		msta->npu_amsdu_tids);
++	dma_wmb();
++	WRITE_ONCE(s->sta[wi].amsdu, contract);
++}
++
++int mt7915_npu_amsdu_pause(struct mt7915_dev *dev, struct mt7915_sta *msta)
++{
++	struct kdp_shared *s = READ_ONCE(dev->mt76.kite_dp);
++	u16 wi = msta->wcid.idx;
++	int ret;
++
++	if (!s || !dev->kite.dp_bound || !wi || wi >= KDP_WCIDS)
++		return 0;
++	/* Suppress any newly prepared aggregate before draining already
++	 * published descriptors; a failed proof leaves normal recovery held. */
++	if (!(READ_ONCE(s->sta[wi].amsdu) & 0xff))
++		return 0;
++	/* flow_offload_mutex callbacks may concurrently PARK/RESUME. Hold
++	 * their admission too until this MCU transaction has finished. */
++	mutex_lock(&dev->kite.lock);
++	if (READ_ONCE(dev->kite.dp_changing)) {
++		mutex_unlock(&dev->kite.lock);
++		return -EBUSY;
++	}
++	/* Serialize with the entire RESUME check-and-open critical section,
++	 * not just its flag read: an older callback must not open the gate
++	 * after the drain has begun. Do not hold this mutex while draining. */
++	WRITE_ONCE(dev->kite.dp_changing, true);
++	WRITE_ONCE(s->sta[wi].amsdu, 0);
++	dma_wmb();
++	mutex_unlock(&dev->kite.lock);
++	ret = mt7915_npu_tx_fence(dev);
++	return ret ? ret : 1;
++}
++
++void mt7915_npu_amsdu_resume(struct mt7915_dev *dev)
++{
++	/* Only the caller which acquired this fence releases it. On fence
++	 * failure, normal recovery retains dp_changing and TX ownership. */
++	mutex_lock(&dev->kite.lock);
++	WRITE_ONCE(dev->kite.dp_changing, false);
++	mt7915_npu_tx_unfence(dev);
++	mutex_unlock(&dev->kite.lock);
++}
++
+ static void mt7915_dp_sta_attributes(struct mt7915_dev *dev,
+ 				     struct mt7915_sta *msta)
+ {
+@@ -251,9 +313,8 @@
+ 	s->omac = msta->vif->mt76.omac_idx;
+ 	s->wmm = msta->vif->mt76.wmm_idx;
+ 	s->wme = sta->wme;
+-	/* WTBL aggregation remains available; use standalone Ethernet MSDUs
+-	 * until the per-peer A-MSDU size/lifetime contract is explicitly passed. */
+-	s->amsdu = 0;
++	/* BA TIDs and the length are published only after their native MCU ACK. */
++	mt7915_npu_amsdu_update(dev, msta);
+ 	/* STA/key transactions already hold the RX/worker fence. */
+ 	memcpy(s->qos_map, vif->offload_qos_map, sizeof(s->qos_map));
+ 	s->qos_valid = !!(vif->offload_flags & IEEE80211_OFFLOAD_CUSTOM_QOS);

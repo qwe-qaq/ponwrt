@@ -1,0 +1,102 @@
+Subject: Report optional Clanker PCIe windows and WFDMA RX state
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -584,6 +584,8 @@
+ 	struct delayed_work work;
+ 	struct mutex lock; /* cached snapshot only; never held during mailbox IO */
+ 	u32 data[CLANKER_DIAG_PAGES][CLANKER_DIAG_WORDS];
++	u32 rings[CLANKER_DIAG_WORDS];
++	int ring_error;
+ 	u32 control[CLANKER_CTL_WORDS];
+ 	unsigned long control_updated;
+ 	int control_error;
+@@ -714,8 +716,39 @@
+ }
+ static DEVICE_ATTR_RO(clanker_status);
+ 
++static ssize_t clanker_rx_status_show(struct device *dev,
++				      struct device_attribute *attr, char *buf)
++{
++	struct airoha_npu *npu = dev_get_drvdata(dev);
++	struct airoha_clanker_diag *d = npu->clanker;
++	u32 *r = d->rings;
++	ssize_t n;
++	int i;
++
++	mutex_lock(&d->lock);
++	n = sysfs_emit(buf, "ring_abi=1 last_error=%d age_ms=%u port_type=%u\n",
++		d->ring_error, d->samples ? jiffies_to_msecs(jiffies - d->updated) : 0, r[4]);
++	if (d->ring_error || r[61] != 0x4b520001)
++		goto out;
++	n += sysfs_emit_at(buf, n, "windows reg=%#x base=%#x end=%#x; reg=%#x base=%#x end=%#x\n",
++		r[5], r[6], r[7], r[8], r[9], r[10]);
++	for (i = 0; i < 2; i++) {
++		u32 *b = r + 12 + i * 20;
++
++		n += sysfs_emit_at(buf, n,
++			"band%d ready=%u reg=%#x sram=%#x base=%#x count=%u cpu=%u dma=%u sw=%u desc=%08x/%08x/%08x/%08x glo=%#x\n",
++			i, b[12], b[0], b[1], b[2], b[3], b[4], b[5], b[6],
++			b[7], b[8], b[9], b[10], b[11]);
++	}
++out:
++	mutex_unlock(&d->lock);
++	return n;
++}
++static DEVICE_ATTR_RO(clanker_rx_status);
++
+ static struct attribute *airoha_clanker_attrs[] = {
+ 	&dev_attr_clanker_status.attr,
++	&dev_attr_clanker_rx_status.attr,
+ 	NULL,
+ };
+ static const struct attribute_group airoha_clanker_group = {
+@@ -731,6 +764,8 @@
+ 	u32 data[CLANKER_DIAG_PAGES][CLANKER_DIAG_WORDS] = {};
+ 	u32 moving = 0, traps = 0, quiet = 0;
+ 	u32 control[CLANKER_CTL_WORDS] = {};
++	u32 rings[CLANKER_DIAG_WORDS] = {};
++	int ring_error;
+ 	int i, err = 0, previous_error, control_error;
+ 	bool report, control_changed;
+ 
+@@ -757,7 +792,19 @@
+ 		    control[8] != 544 || control[15] > 2))
+ 			control_error = -EPROTO;
+ 	}
++	ring_error = err;
++	if (!err) {
++		ring_error = airoha_npu_wlan_msg_get(npu, 2,
++			(enum airoha_npu_wlan_get_cmd)32,
++			rings, sizeof(rings), GFP_KERNEL);
++		if (!ring_error && (rings[0] != CLANKER_DIAG_MAGIC ||
++		    rings[1] != 2 || rings[61] != 0x4b520001))
++			ring_error = -EPROTO;
++	}
+ 	mutex_lock(&d->lock);
++	d->ring_error = ring_error;
++	if (!ring_error)
++		memcpy(d->rings, rings, sizeof(rings));
+ 	control_changed = d->control_error != control_error ||
+ 		(!control_error && (!d->control_valid ||
+ 		control[3] != d->control[3] || control[6] != d->control[6] ||
+@@ -819,6 +866,19 @@
+ 			 data[1][12], data[1][13], data[1][10] + data[1][14],
+ 			 data[1][11] + data[1][15], data[0][8], data[0][9],
+ 			 data[0][12], data[0][13]);
++	}
++	if (report && !ring_error) {
++		dev_info(npu->dev,
++			 "Clanker PCIe: port_type=%u win[%#x]=%#x..%#x win[%#x]=%#x..%#x\n",
++			 rings[4], rings[5], rings[6], rings[7], rings[8], rings[9], rings[10]);
++		for (i = 0; i < 2; i++) {
++			u32 *b = rings + 12 + i * 20;
++
++			dev_info(npu->dev,
++				 "Clanker RX ring%u: ready=%u reg=%#x sram=%#x base=%#x count=%u cpu=%u dma=%u sw=%u desc=%08x/%08x glo=%#x\n",
++				 i, b[12], b[0], b[1], b[2], b[3], b[4], b[5], b[6],
++				 b[7], b[8], b[11]);
++		}
+ 	}
+ 	if (report || control_changed) {
+ 		if (control_error)

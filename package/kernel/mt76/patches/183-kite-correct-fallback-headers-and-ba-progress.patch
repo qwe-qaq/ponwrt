@@ -1,0 +1,264 @@
+From: ponwrt development <noreply@local>
+Subject: [PATCH] Normalize host fallback headers, observe native BA progress and default cache on
+
+r69 on r68. Preserve ABI12, exact policy/PN and DMA+WA ownership.
+
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -3,6 +3,8 @@
+ 
+ #include <linux/etherdevice.h>
+ #include <linux/timekeeping.h>
++#include <linux/if_vlan.h>
++#include <net/dsfield.h>
+ #include "coredump.h"
+ #include "mt7915.h"
+ #include "../dma.h"
+@@ -1248,6 +1250,46 @@
+ 
+ #include "../kite-packet.h"
+ 
++/* The copied fallback record is gone; data is a complete Ethernet frame.
++ * Preserve inline VLAN bytes/protocol and let native TX apply its QoS map.
++ * In particular an Ethernet destination byte is never an IP DS field. */
++static bool mt7915_kite_host_headers(struct sk_buff *skb,
++                                     struct mt7915_kite_host_headers *o)
++{
++ __be16 inner;
++ int depth = 0;
++ if (!pskb_may_pull(skb, ETH_HLEN)) return false;
++ skb_scrub_packet(skb, true);
++ skb_clear_hash(skb);
++ __vlan_hwaccel_clear_tag(skb);
++ memset(skb->cb, 0, sizeof(skb->cb));
++ skb->priority = 0;
++ skb_set_queue_mapping(skb, 0);
++ skb->ip_summed = CHECKSUM_NONE;
++ skb->csum = 0;
++ skb->encapsulation = 0;
++ skb_reset_mac_header(skb);
++ skb->mac_len = 0;
++ skb->protocol = eth_hdr(skb)->h_proto;
++ inner = vlan_get_protocol_and_depth(skb, skb->protocol, &depth);
++ if (!inner) return false;
++ if (!depth) depth = ETH_HLEN;
++ skb_set_network_header(skb, depth);
++ skb->transport_header = (typeof(skb->transport_header))~0U;
++ o->protocol = ntohs(inner); o->offset = depth; o->ds = 0;
++ if (inner == htons(ETH_P_IP)) {
++  if (!pskb_may_pull(skb, depth + sizeof(struct iphdr)) ||
++      ip_hdr(skb)->version != 4 || ip_hdr(skb)->ihl < 5 ||
++      !pskb_may_pull(skb, depth + ip_hdr(skb)->ihl * 4)) return false;
++  o->ds = ipv4_get_dsfield(ip_hdr(skb));
++ } else if (inner == htons(ETH_P_IPV6)) {
++  if (!pskb_may_pull(skb, depth + sizeof(struct ipv6hdr)) ||
++      ipv6_hdr(skb)->version != 6) return false;
++  o->ds = ipv6_get_dsfield(ipv6_hdr(skb));
++ }
++ return true;
++}
++
+ struct mt7915_kite_host_tx {
+ 	struct sk_buff *skb;
+ 	struct mt7915_vif *vif;
+@@ -1275,9 +1317,7 @@
+ 	if (!wdev || !wdev->netdev || !netif_running(wdev->netdev))
+ 		return;
+ 	ctx->skb->dev = wdev->netdev;
+-	ctx->skb->protocol = eth_hdr(ctx->skb)->h_proto;
+-	skb_reset_network_header(ctx->skb);
+-	skb_reset_transport_header(ctx->skb);
++	/* Ethernet and network offsets were normalized before VIF iteration. */
+ 	ctx->sent = true;
+ 	/* dev_queue_xmit consumes the skb even on an error. */
+ 	ctx->xmit_error = dev_queue_xmit(ctx->skb);
+@@ -1302,6 +1342,7 @@
+  u32 record[KDP_HOST_RECORD_WORDS], request=0, slot=KDP_SLOT_NONE;
+  bool accounted=false;
+  struct kdp_packet packet;
++ struct mt7915_kite_host_headers headers = {};
+  unsigned long flags;
+ 
+ 	reject = MT7915_KITE_HOST_META;
+@@ -1378,6 +1419,20 @@
+ 	mphy = mt76_dev_phy(&dev->mt76, ctx.band);
+ 	if (!mphy || mphy->band_idx != ctx.band || !mphy->hw)
+ 		goto reject;
++ reject = MT7915_KITE_HOST_META;
++ {
++  bool valid = mt7915_kite_host_headers(skb, &headers);
++  struct mt7915_kite_host_stats *h = &dev->kite.host_headers[ctx.band];
++  spin_lock_irqsave(&dev->kite.dp_done_lock, flags);
++  if (valid) {
++   h->packets++; h->vlan += headers.offset > ETH_HLEN;
++   h->ipv4 += headers.protocol == ETH_P_IP;
++   h->ipv6 += headers.protocol == ETH_P_IPV6;
++   h->last = headers;
++  } else h->bad++;
++  spin_unlock_irqrestore(&dev->kite.dp_done_lock, flags);
++  if (!valid) goto reject;
++ }
+ 	ieee80211_iterate_active_interfaces_atomic(mphy->hw,
+ 		IEEE80211_IFACE_ITER_NORMAL, mt7915_kite_host_tx_iter, &ctx);
+ 	reject = MT7915_KITE_HOST_VIF;
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -1189,6 +1189,7 @@
+ 		break;
+ 	}
+ #ifdef CONFIG_MT7915_NPU
++ mt7915_npu_ba_transition(hw, sta, tid, action, ret);
+  if (action == IEEE80211_AMPDU_TX_OPERATIONAL && !ret)
+   mt7915_npu_ba_event(hw, sta, tid, 4, 0, 0);
+  if (dev->kite.dp_bound)
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -144,6 +144,17 @@
+ };
+ 
+ 
++struct mt7915_kite_ba_wait {
++ u64 started_ns, last_ns, elapsed_ns, max_ns;
++ u32 starts, operational, stops, failures, action;
++ s32 result;
++};
++struct mt7915_kite_host_headers { u32 protocol, offset, ds; };
++struct mt7915_kite_host_stats {
++ u64 packets, ipv4, ipv6, vlan, bad;
++ struct mt7915_kite_host_headers last;
++};
++
+ struct mt7915_sta {
+ 	struct mt76_wcid wcid; /* must be first */
+ 
+@@ -154,6 +165,7 @@
+  u32 npu_amsdu_mcu;
+  bool npu_amsdu_mcu_acked;
+  u16 npu_ba_window[8];
++ struct mt7915_kite_ba_wait npu_ba_wait[8];
+  bool npu_wtbl_pending, npu_wtbl_valid;
+  unsigned long npu_wtbl_at;
+  u32 npu_wtbl[10];
+@@ -407,6 +419,7 @@
+ 		u32 context_wcid[3];
+ 		struct mt7915_kite_trace_event trace_ring[MT7915_KITE_TRACE_RING];
+ 		u64 trace_host_fallback, trace_host_sent, trace_host_drop;
++  struct mt7915_kite_host_stats host_headers[2];
+ 		u64 trace_host_reject[MT7915_KITE_HOST_REJECT_COUNT];
+ 		struct mt76_queue *txq[2];
+ 		bool live[MT7916_WTBL_SIZE];
+@@ -654,6 +667,8 @@
+ int mt7915_npu_dp_bind(struct mt7915_dev *dev);
+ void mt7915_npu_dp_work_init(struct mt7915_dev *dev);
+ void mt7915_npu_dp_work_stop(struct mt7915_dev *dev);
++void mt7915_npu_ba_transition(struct ieee80211_hw *hw, struct ieee80211_sta *sta,
++                             u8 tid, u32 action, int result);
+ void mt7915_npu_ps_progress(struct mt76_dev *mdev);
+ void mt7915_npu_ps_raw(struct mt7915_dev *dev, u16 wi, u32 raw);
+ void mt7915_npu_ps(struct mt7915_dev *dev, u16 wcid, bool ps);
+--- a/mt7915/npu-ba.inc
++++ b/mt7915/npu-ba.inc
+@@ -140,3 +140,49 @@
+   * not depend on a disabled primary PHY scheduling mac_work. */
+  ieee80211_iterate_stations_atomic(phy->mt76->hw, mt7915_kite_ba_station, dev);
+ }
++
++/* Native BA callbacks are scheduling hints, never drain/ownership proof.
++ * MAC80211 may still have STOP set when OPERATIONAL returns. Schedule the
++ * existing worker; its complete queue check and DMA prefix remain mandatory. */
++void mt7915_npu_ba_transition(struct ieee80211_hw *hw, struct ieee80211_sta *sta,
++                             u8 tid, u32 action, int result)
++{
++ struct mt7915_dev *dev = mt7915_hw_dev(hw);
++ struct mt7915_sta *msta = (void *)sta->drv_priv;
++ struct mt7915_kite_ba_wait *b;
++ struct mt7915_kite_ps_state *p;
++ unsigned long flags;
++ u32 wi = msta->wcid.idx;
++ u64 now;
++ bool finish = false;
++ if (tid >= 8 || !wi || wi >= KDP_WCIDS || !READ_ONCE(dev->kite.dp_bound)) return;
++ if (action != IEEE80211_AMPDU_TX_START &&
++     action != IEEE80211_AMPDU_TX_OPERATIONAL &&
++     action != IEEE80211_AMPDU_TX_STOP_CONT &&
++     action != IEEE80211_AMPDU_TX_STOP_FLUSH &&
++     action != IEEE80211_AMPDU_TX_STOP_FLUSH_CONT) return;
++ spin_lock_irqsave(&dev->kite.dp_done_lock, flags);
++ b = &msta->npu_ba_wait[tid]; now = ktime_get_ns();
++ b->last_ns = now; b->action = action; b->result = result;
++ if (action == IEEE80211_AMPDU_TX_START) {
++  b->starts++; b->started_ns = result < 0 ? 0 : now;
++ } else {
++  finish = true;
++  if (action == IEEE80211_AMPDU_TX_OPERATIONAL) b->operational += !result;
++  else b->stops++;
++  if (b->started_ns) {
++   b->elapsed_ns = now - b->started_ns;
++   if (b->elapsed_ns > b->max_ns) b->max_ns = b->elapsed_ns;
++   b->started_ns = 0;
++  }
++ }
++ b->failures += result < 0;
++ p = &dev->kite.ps[wi];
++ if (finish && dev->kite.dp_work_initialized && !dev->kite.dp_work_stopping &&
++     test_bit(wi, dev->kite.dp_ps_pending)) {
++  p->queue_retry_at = jiffies;
++  if (!p->queued_ns) p->queued_ns = now;
++  mod_delayed_work(system_wq, &dev->kite.dp_ps_work, 0);
++ }
++ spin_unlock_irqrestore(&dev->kite.dp_done_lock, flags);
++}
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -14,9 +14,9 @@
+ static bool npu_perf = true;
+ module_param(npu_perf, bool, 0400);
+ MODULE_PARM_DESC(npu_perf, "Kite IPv4/parse hints and bounded token queues (load time only)");
+-static bool npu_cached_hdr;
++static bool npu_cached_hdr = true;
+ module_param(npu_cached_hdr, bool, 0400);
+-MODULE_PARM_DESC(npu_cached_hdr, "Kite r68 opt-in: hart4 reads TX headers through its D-cache after a line invalidate; self-tested on hart4, requires npu_perf (load time only)");
++MODULE_PARM_DESC(npu_cached_hdr, "Kite default-on: hart4 reads TX headers through its D-cache after a line invalidate; self-tested on hart4, requires npu_perf (load time only)");
+ static bool npu_amsdu = true;
+ module_param(npu_amsdu, bool, 0400);
+ MODULE_PARM_DESC(npu_amsdu, "Kite native HW A-MSDU for MCU/BA-approved peers (load time only)");
+@@ -1990,7 +1990,7 @@
+ 	ret = mt7915_kite_command(dev, KITE_CTL_DP_BIND, args, 3);
+ 	if (!ret)
+ 		dev_info(dev->mt76.dev,
+-			 "Kite datapath r68 ABI12 bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
++			 "Kite datapath r69 ABI12 bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
+ 			 s->session, s->epoch, sizeof(*s), s->perf.flags, npu_amsdu);
+ out:
+ 	if (ret)
+--- a/mt7915/npu-r59-observe.inc
++++ b/mt7915/npu-r59-observe.inc
+@@ -64,6 +64,13 @@
+   seq_printf(m, "r59_napi%u polls=%llu budget=%llu packets=%llu total_ns=%llu max_ns=%llu\n",
+              i, z.polls, z.budget, z.packets, z.total_ns, z.max_ns);
+  }
++ for (i = 0; i < 2; i++) {
++  struct mt7915_kite_host_stats h;
++  spin_lock_bh(&dev->kite.dp_done_lock); h = dev->kite.host_headers[i];
++  spin_unlock_bh(&dev->kite.dp_done_lock);
++  seq_printf(m,"r69_host%u packets=%llu ipv4=%llu ipv6=%llu vlan=%llu bad=%llu last_protocol=%u last_offset=%u last_ds=%u\n",
++   i,h.packets,h.ipv4,h.ipv6,h.vlan,h.bad,h.last.protocol,h.last.offset,h.last.ds);
++ }
+  mutex_lock(&dev->mt76.mutex);
+  for (i = 1; i < KDP_WCIDS; i++) {
+   struct mt7915_kite_ps_state p;
+@@ -114,6 +121,14 @@
+   wcid = rcu_dereference_protected(dev->mt76.wcid[i], lockdep_is_held(&dev->mt76.mutex));
+   if (!wcid || !wcid->sta) continue;
+   msta = container_of(wcid, struct mt7915_sta, wcid);
++  for (j = 0; j < 8; j++) {
++   struct mt7915_kite_ba_wait b;
++   spin_lock_bh(&dev->kite.dp_done_lock); b = msta->npu_ba_wait[j];
++   spin_unlock_bh(&dev->kite.dp_done_lock);
++   if (b.starts || b.stops || b.operational)
++    seq_printf(m,"r69_ba%u_%u starts=%u operational=%u stops=%u failures=%u action=%u result=%d started_ns=%llu last_ns=%llu elapsed_ns=%llu max_ns=%llu\n",
++     i,j,b.starts,b.operational,b.stops,b.failures,b.action,b.result,b.started_ns,b.last_ns,b.elapsed_ns,b.max_ns);
++  }
+   seq_printf(m, "r59_agg%u peer_max_bytes=%u native_enabled=%u native_max_subframes=8 tids=%u",
+              i, msta->npu_amsdu_len, wcid->amsdu, msta->npu_amsdu_tids);
+   for (j = 0; j < 8; j++) seq_printf(m, " ba%u=%u", j, msta->npu_ba_window[j]);

@@ -1,0 +1,77 @@
+Subject: Publish and verify complete Kite RX rings while WFDMA is stopped
+
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -66,8 +66,16 @@
+ 				   struct mt76_queue *q, u32 ring_reg)
+ {
+ 	struct airoha_npu *npu = mt7915_npu(dev);
+-	u32 rxdesc_base;
++	u32 rxdesc_base, reg_base = ring_reg & ~0xfff;
++	u32 base, count, cpu, dma;
+ 	int ret;
++
++	/* Initial setup and recovery both require a stopped WFDMA engine. */
++	if (band > 1 || q->ndesc != MT7915_KITE_RX_RING_SIZE ||
++	    upper_32_bits(dev->pcie_bar0 + ring_reg))
++		return -EINVAL;
++	if (mt76_rr(dev, reg_base + 0x208) & MT_WFDMA0_GLO_CFG_RX_DMA_EN)
++		return -EBUSY;
+ 
+ 	/* SET 0 is the WiFi ring's BAR register address. */
+ 	ret = mt7915_npu_set(dev, band, WLAN_FUNC_SET_WAIT_PCIE_ADDR,
+@@ -86,13 +94,33 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	/* Clanker allocated the descriptor block in NPU SRAM. Point the MT7916
+-	 * ring register at the returned address and leave the Linux shadow ring
+-	 * unused while Kite is active. */
++	/* AN7581 has 480 KiB of shared SRAM. Reject a malformed mailbox
++	 * address before handing it to the chip. */
++	if ((rxdesc_base & 15) || rxdesc_base < 0x1e800000 ||
++	    rxdesc_base > 0x1e878000 - MT7915_KITE_RX_RING_SIZE * 16)
++		return -EPROTO;
++
++	/* Keep Linux shadow descriptors unused. Publish the complete ring,
++	 * including indices, after firmware has filled it and while DMA is off. */
+ 	writel(rxdesc_base, &q->regs->desc_base);
+-
+-	dev_info(dev->mt76.dev, "Kite band%u RX descriptors at 0x%08x\n",
+-		 band, rxdesc_base);
++	writel(MT7915_KITE_RX_RING_SIZE, &q->regs->ring_size);
++	writel(0, &q->regs->dma_idx);
++	writel(MT7915_KITE_RX_RING_SIZE - 1, &q->regs->cpu_idx);
++	base = readl(&q->regs->desc_base);
++	count = readl(&q->regs->ring_size);
++	cpu = readl(&q->regs->cpu_idx);
++	dma = readl(&q->regs->dma_idx);
++	if (base != rxdesc_base || count != MT7915_KITE_RX_RING_SIZE ||
++	    cpu != MT7915_KITE_RX_RING_SIZE - 1 || dma) {
++		dev_err(dev->mt76.dev,
++			"Kite band%u RX ring readback failed: base=%#x count=%u cpu=%u dma=%u\n",
++			band, base, count, cpu, dma);
++		return -EIO;
++	}
++	dev_info(dev->mt76.dev,
++		 "Kite band%u RX ring: reg=%#x SRAM=%#x count=%u cpu=%u dma=%u\n",
++		 band, lower_32_bits(dev->pcie_bar0 + ring_reg),
++		 base, count, cpu, dma);
+ 	return 0;
+ }
+ 
+@@ -114,12 +142,11 @@
+ 	#endif
+ 	{
+ 		struct device_node *np = dev->mt76.dev->of_node;
+-		u32 port_type = 2;
++		u32 port_type;
+ 		int ret;
+ 
+ 		if (of_property_read_u32(np, "airoha,npu-pcie-port-type", &port_type))
+-			dev_info(dev->mt76.dev,
+-				 "Kite PCIe port type not specified, using %u\n", port_type);
++			return -EINVAL;
+ 		if (port_type > 3)
+ 			return -EINVAL;
+ 		ret = mt76_npu_init(&dev->mt76, dev->pcie_bar0,

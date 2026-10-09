@@ -1,0 +1,68 @@
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -554,7 +554,14 @@
+ 
+ 	val = res.start;
+ 	return airoha_npu_wlan_msg_send(npu, ifindex, func_id, &val,
+-					sizeof(val), GFP_KERNEL);
++					 sizeof(val), GFP_KERNEL);
++}
++
++static bool airoha_npu_wlan_has_reserved_memory(struct airoha_npu *npu,
++						const char *name)
++{
++	return of_property_match_string(npu->dev->of_node,
++					       "memory-region-names", name) >= 0;
+ }
+ 
+ static int airoha_npu_wlan_init_memory(struct airoha_npu *npu)
+@@ -568,23 +575,27 @@
+ 	if (err)
+ 		return err;
+ 
+-	cmd = WLAN_FUNC_SET_WAIT_TX_BUF_CHECK_ADDR;
+-	err = airoha_npu_wlan_set_reserved_memory(npu, 0, "tx-bufid", cmd);
+-	if (err)
+-		return err;
++	/* Eagle needs TX buffer-id checking; Kite deliberately has no TX pool. */
++	if (airoha_npu_wlan_has_reserved_memory(npu, "tx-bufid")) {
++		cmd = WLAN_FUNC_SET_WAIT_TX_BUF_CHECK_ADDR;
++		err = airoha_npu_wlan_set_reserved_memory(npu, 0, "tx-bufid", cmd);
++		if (err)
++			return err;
++	}
+ 
+ 	cmd = WLAN_FUNC_SET_WAIT_PKT_BUF_ADDR;
+ 	err = airoha_npu_wlan_set_reserved_memory(npu, 0, "pkt", cmd);
+ 	if (err)
+ 		return err;
+ 
+-	cmd = WLAN_FUNC_SET_WAIT_TX_PKT_BUF_ADDR;
+-	err = airoha_npu_wlan_set_reserved_memory(npu, 0, "tx-pkt", cmd);
+-	if (err)
+-		return err;
++	if (airoha_npu_wlan_has_reserved_memory(npu, "tx-pkt")) {
++		cmd = WLAN_FUNC_SET_WAIT_TX_PKT_BUF_ADDR;
++		err = airoha_npu_wlan_set_reserved_memory(npu, 0, "tx-pkt", cmd);
++		if (err)
++			return err;
++	}
+ 
+-	if (of_property_match_string(npu->dev->of_node, "memory-region-names",
+-				     "ba") >= 0) {
++	if (airoha_npu_wlan_has_reserved_memory(npu, "ba")) {
+ 		cmd = WLAN_FUNC_SET_WAIT_DRAM_BA_NODE_ADDR;
+ 		err = airoha_npu_wlan_set_reserved_memory(npu, 0, "ba", cmd);
+ 		if (err)
+@@ -832,8 +843,9 @@
+ 	regmap_write(npu->regmap, REG_CR_BOOT_TRIGGER, 0x1);
+ 	msleep(100);
+ 
+-	if (!airoha_npu_wlan_msg_get(npu, 0, WLAN_FUNC_GET_WAIT_NPU_VERSION,
+-				     &val, sizeof(val), GFP_KERNEL))
++	if (!of_property_read_bool(dev->of_node, "airoha,skip-npu-version-query") &&
++	    !airoha_npu_wlan_msg_get(npu, 0, WLAN_FUNC_GET_WAIT_NPU_VERSION,
++				       &val, sizeof(val), GFP_KERNEL))
+ 		dev_info(dev, "NPU fw version: %0d.%d\n",
+ 			 (val >> 16) & 0xffff, val & 0xffff);
+ 

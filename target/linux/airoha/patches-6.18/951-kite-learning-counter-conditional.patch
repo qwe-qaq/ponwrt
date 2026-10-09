@@ -1,0 +1,19 @@
+Subject: net: airoha: count Kite bridge learning only after commit
+
+The bridge learning counter is evidence of a successful hardware subflow
+commit. Keep it under the same condition as the generic learning counter;
+otherwise every scanned bridge candidate would look like a learned slot.
+
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -409,9 +409,10 @@ static void airoha_kite_learn_work(struct work_struct *work)
+ 			if (e && e->kite_in_wcid && airoha_kite_flow_live(ppe, e) &&
+ 			    ((e->kite_key.vlan == KDP_SLOT_NONE ? 0 : e->kite_key.vlan) ==
+ 			     hwe->l2b.ingress_vlan) &&
+-			    !airoha_ppe_foe_commit_subflow_entry(ppe, e, slot, true))
++			    !airoha_ppe_foe_commit_subflow_entry(ppe, e, slot, true)) {
+ 				atomic64_inc(&ppe->kite_learned);
+ 				atomic64_inc(&ppe->kite_l2_learned);
++			}
+ 			goto unlock;
+ 		}

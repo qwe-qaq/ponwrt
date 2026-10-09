@@ -1,0 +1,220 @@
+Subject: [PATCH] mt76: validate Kite chains and reject incomplete ownership
+
+Check complete chains before consuming pages, reserve unallocated slots and
+keep checksum validation on the host. The legacy Kite stop/key/PPE protocols
+are incomplete, so npu_enable alone must not hand over DMA ownership.
+
+--- /dev/null
++++ b/kite-rx.h
+@@ -0,0 +1,45 @@
++/* SPDX-License-Identifier: ISC */
++#ifndef __MT76_KITE_RX_H
++#define __MT76_KITE_RX_H
++
++#define MT76_KITE_SEGMENTS 7
++#define MT76_KITE_BUFFER_LEN 3500
++
++struct mt76_kite_segment {
++	u32 ctrl;
++	u32 info;
++	u32 data;
++};
++
++/* Complete snapshots only. A pending chain is handled before calling this.
++ * Both families put segment count at 31:29, but Kite's low word1 fields
++ * are WCID/A-MSDU, and word2 is a boolean rate-limit indication, not PPE. */
++static inline bool mt76_kite_rx_valid(const struct mt76_kite_segment *s,
++				    unsigned int n)
++{
++	unsigned int total, count;
++	unsigned int bytes = 0, i;
++
++	if (!n || n > MT76_KITE_SEGMENTS)
++		return false;
++	total = (s[0].ctrl >> 15) & 0x3fff;
++	count = s[0].info >> 29;
++	if (!total || n != (count ? count : 1))
++		return false;
++	for (i = 0; i < n; i++) {
++		unsigned int len = (s[i].ctrl >> 1) & 0x3fff;
++		unsigned int part = (s[i].info >> 26) & 7;
++
++		if (!(s[i].ctrl & 1) || !len || len > MT76_KITE_BUFFER_LEN ||
++		    ((s[i].ctrl >> 15) & 0x3fff) != total ||
++		    (s[i].info >> 29) != count || s[i].data > 1 ||
++		    (s[i].info & 0x03e00000) ||
++		    !!(s[i].ctrl & (1u << 29)) != (i == n - 1))
++			return false;
++		if (count ? part != i + 1 : part != 0)
++			return false;
++		bytes += len;
++	}
++	return bytes == total;
++}
++#endif
+--- a/npu.c
++++ b/npu.c
+@@ -9,6 +9,7 @@
+ 
+ #include "mt76.h"
+ #include "dma.h"
++#include "kite-rx.h"
+ #include "mt76_connac.h"
+ 
+ #define MT76_NPU_RX_BUF_SIZE	(1800 + \
+@@ -70,6 +71,8 @@
+ 	struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
+ 	int i, nframes, index = q->tail;
+ 	struct sk_buff *skb = NULL;
++	struct mt76_kite_segment kite[MT76_KITE_SEGMENTS];
++	bool is_kite = dev->mmio.npu_type == MT76_NPU_TYPE_KITE;
+ 	bool invalid;
+ 	u32 ctrl;
+ 
+@@ -96,10 +99,26 @@
+ 		if (!(ctrl & NPU_RX_DMA_DESC_DONE_MASK))
+ 			return NULL;
+ 		dma_rmb();
++		if (is_kite) {
++			u32 next_info = READ_ONCE(desc[slot].info);
++
++			if (i && ((next_info >> 29) != (kite[0].info >> 29) ||
++				  ((next_info >> 26) & 7) != i + 1)) {
++				nframes = i;
++				invalid = true;
++				break;
++			}
++			kite[i].ctrl = ctrl;
++			kite[i].info = READ_ONCE(desc[slot].info);
++			kite[i].data = READ_ONCE(desc[slot].data);
++		}
+ 		len = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, ctrl);
+ 		if (!len || len > SKB_WITH_OVERHEAD(q->buf_size))
+ 			invalid = true;
+ 	}
++
++	if (is_kite && !mt76_kite_rx_valid(kite, nframes))
++		invalid = true;
+ 
+ 	if (!invalid) {
+ 		struct mt76_queue_entry *e = &q->entry[index];
+@@ -111,6 +130,10 @@
+ 		if (!skb)
+ 			return NULL;
+ 		skb_mark_for_recycle(skb);
++		memset(skb->cb, 0, sizeof(skb->cb));
++		/* Kite word2 does not carry WFDMA checksum error status. */
++		if (is_kite)
++			*(u32 *)skb->cb = BIT(0) | BIT(2) | BIT(3);
+ 	}
+ 
+ 	for (i = 0; i < nframes; i++) {
+@@ -139,7 +162,12 @@
+ 						len, q->buf_size);
+ 		}
+ 
+-		*info = desc[index].info;
++		if (!i)
++			/* Kite puts the bounded security/fallback record in word2.
++			 * word1 remains the chain/count record consumed above; passing
++			 * it to mt7915 would make the host interpret packet-count bits
++			 * as PPE metadata and would silently lose the reorder fence. */
++			*info = is_kite ? desc[index].data : desc[index].info;
+ 		e->buf = NULL;
+ 		index = (index + 1) % q->ndesc;
+ 	}
+--- a/dma.c
++++ b/dma.c
+@@ -865,6 +865,18 @@
+ 	if (ret)
+ 		return ret;
+ 
++	if (mt76_queue_is_npu_rx(q) &&
++	    dev->mmio.npu_type == MT76_NPU_TYPE_KITE) {
++		struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
++		int i;
++
++		/* Zero is firmware-owned. Publish only buffers actually allocated
++		 * by refill, including when page-pool allocation is partial. */
++		for (i = 0; i < q->ndesc; i++)
++			desc[i].ctrl = NPU_RX_DMA_DESC_DONE_MASK;
++		dma_wmb();
++	}
++
+ 	mt76_npu_queue_setup(dev, q);
+ 	ret = mt76_wed_dma_setup(dev, q, false);
+ 	if (ret)
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -22,7 +22,7 @@
+  */
+ static bool npu_enable;
+ module_param(npu_enable, bool, 0400);
+-MODULE_PARM_DESC(npu_enable, "Experimental Kite RX ownership (default off)");
++MODULE_PARM_DESC(npu_enable, "Kite RX request (ownership protocol currently unavailable)");
+ 
+ static struct airoha_npu *mt7915_npu(struct mt7915_dev *dev)
+ {
+@@ -92,57 +92,15 @@
+ 
+ int mt7915_npu_init(struct mt7915_dev *dev)
+ {
+-	struct device_node *np = dev->mt76.dev->of_node;
+-	u32 port_type = 2;
+-	int ret;
+-
+-#if IS_ENABLED(CONFIG_NET_MEDIATEK_SOC_WED)
+-	/* WED and Kite cannot consume the same MT7916 RX rings.  Leave WED in
+-	 * charge when it attached successfully and keep NPU firmware idle. */
+-	if (mtk_wed_device_active(&dev->mt76.mmio.wed)) {
+-		dev_warn(dev->mt76.dev,
+-			 "Kite NPU disabled because WED owns the MT7916 RX rings\n");
+-		return 0;
+-	}
+-#endif
+-
+ 	if (!mt7915_npu_present(dev))
+ 		return 0;
+ 
++	/* The legacy SET27 is a no-op and there is no key/PN handover or PPE
++	 * return contract. Never transfer DMA ownership on a user parameter
++	 * alone. Keep normal mt7915 usable while these contracts are pending. */
+ 	dev_warn(dev->mt76.dev,
+-		 "Experimental Kite RX: reset and firmware stop are not validated\n");
+-
+-	if (of_property_read_u32(np, "airoha,npu-pcie-port-type", &port_type))
+-		dev_info(dev->mt76.dev,
+-			 "Kite PCIe port type not specified, using %u\n", port_type);
+-	if (port_type > 3)
+-		return -EINVAL;
+-
+-	ret = mt76_npu_init(&dev->mt76, dev->pcie_bar0,
+-				    MT76_NPU_TYPE_KITE);
+-	if (ret)
+-		return ret;
+-
+-	/* Clanker uses model 2 for MT7916D DBDC and fast flag bit 0 for the
+-	 * AN7581 pipeline.  The PCIe port type selects the two inbound windows. */
+-	ret = mt7915_npu_set(dev, 0, WLAN_FUNC_SET_WAIT_DRIVER_MODEL, 2);
+-	if (ret)
+-		goto err_deinit;
+-	ret = mt7915_npu_set(dev, 0, WLAN_FUNC_SET_WAIT_PCIE_PORT_TYPE,
+-			     port_type);
+-	if (ret)
+-		goto err_deinit;
+-	ret = mt7915_npu_set(dev, 0, WLAN_FUNC_SET_WAIT_FAST_FLAG, 1);
+-	if (ret)
+-		goto err_deinit;
+-
+-	dev_info(dev->mt76.dev, "Kite NPU profile enabled (port type %u)\n",
+-		 port_type);
+-	return 0;
+-
+-err_deinit:
+-	mt76_npu_deinit(&dev->mt76);
+-	return ret;
++		 "Kite RX request rejected: stop, replay and PPE contracts incomplete; using host RX\n");
++	return 0;
+ }
+ 
+ int mt7915_npu_start(struct mt7915_dev *dev)

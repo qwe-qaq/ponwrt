@@ -1,0 +1,2075 @@
+Subject: [PATCH] Complete AN7581 MT7916 PPE RX, shared replay and downlink ownership
+
+--- a/Makefile
++++ b/Makefile
+@@ -52,7 +52,7 @@
+            npu_mbox.c npu_sram.c npu_bridge.c npu_printf.c \
+            npu_dba.c npu_tr471.c npu_dbg.c \
+            npu_wifi.c npu_wifi_bufid.c npu_wifi_fwd.c npu_wifi_ba.c \
+-           npu_wifi_rx.c npu_wifi_init.c npu_kite_control.c npu_kite_dma.c npu_kite_tx.c \
++           npu_wifi_rx.c npu_wifi_init.c npu_kite_control.c npu_kite_dma.c npu_kite_tx.c npu_kite_datapath.c npu_kite_secure_rx.c \
+            npu_wifi_kite.c npu_wifi_eagle.c npu_wifi_eagle_dp.c \
+            npu_tdma.c npu_hostadpt.c npu_sta_q.c \
+            npu_tunnel.c npu_ppe.c npu_l4s.c
+@@ -76,7 +76,7 @@
+ 	$(CC) $(ASFLAGS) -c -o $@ $<
+ 
+ $(BUILD)/%.o: %.c npu_config.h npu_regs.h npu_types.h npu_internal.h \
+-		 npu_wifi.h kite_rxd.h kite-control.h kite-host.h kite-tx.h $(FLAGS) | $(BUILD)
++		 npu_wifi.h kite_rxd.h kite-control.h kite-host.h kite-tx.h kite-datapath.h kite-datapath-fw.h kite-packet.h kite-reorder.h kite-secure-rxd.h $(FLAGS) | $(BUILD)
+ 	$(CC) $(CFLAGS) -c -o $@ $<
+ 
+ $(ELF): $(OBJS) link.ld
+--- a/kite-control.h
++++ b/kite-control.h
+@@ -28,6 +28,7 @@
+ #define KITE_CTL_CAP_RX_REORDER 512u /* candidate only; PN remains host-owned */
+ #define KITE_CTL_CAP_META 1024u
+ #define KITE_CTL_CAP_TX 2048u /* OPEN arg3=1: hart4 descriptor submission */
++#define KITE_CTL_CAP_DATAPATH 4096u /* optional, requires explicit DP_BIND */
+ #define KITE_CTL_CAPS 2047u
+ #define KITE_CTL_MODE_DATA 0u
+ #define KITE_CTL_MODE_CONTROL_ONLY 1u
+@@ -72,6 +73,9 @@
+ 	KITE_CTL_DATA_RECOVER, /* stopped session: rearm retained WiFi rings */
+ 	KITE_CTL_TX_BIND, /* band, input PA, hardware ring PA, main-HIF register PA, count */
+ 	KITE_CTL_TX_UNBIND, /* PARKED, stop both TX writers before WFDMA disable */
++	KITE_CTL_DP_BIND, /* shared ARM PA, bytes, epoch; PARKED after TX_BIND */
++	KITE_CTL_DP_UNBIND, /* PPE rules revoked, gate closed, all TX complete */
++	KITE_CTL_DP_RX_PURGE, /* PARKED; readback verifies WFDMA RX disabled */
+ };
+ enum kite_ctl_result {
+ 	KITE_CTL_OK,
+--- /dev/null
++++ b/kite-datapath-fw.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PONWRT_KITE_DATAPATH_FW_H
++#define PONWRT_KITE_DATAPATH_FW_H
++#include "kite-tx.h"
++#include "kite-datapath.h"
++int kite_dp_bind(unsigned int pa, unsigned int bytes,
++		 unsigned int session, unsigned int epoch);
++int kite_dp_unbind(void);
++int kite_dp_tx_halt(void);
++int kite_tx_dma_stopped(void);
++int kite_dp_bound(void);
++int kite_tx_dp_range(unsigned int pa, unsigned int bytes);
++int kite_host_dp_range(unsigned int pa, unsigned int bytes);
++int kite_dp_tx_next(unsigned int band, struct kite_tx_desc *desc,
++		    unsigned short *token);
++void kite_dp_tx_commit(unsigned int band, unsigned short token);
++void kite_dp_tx_dma_done(unsigned short token);
++void kite_dp_tx_reap(void);
++volatile struct kdp_shared *kite_dp_shared(void);
++int kite_dp_rx(unsigned int token, unsigned int len, unsigned int band);
++void kite_dp_ba_set(unsigned int wcid, unsigned int tid,
++		    unsigned int ssn, unsigned int window);
++void kite_dp_sta_invalidate(unsigned int wcid);
++void kite_dp_rx_timeout(unsigned int band);
++unsigned int kite_dp_rx_metadata(unsigned int token,
++		unsigned int *generation, unsigned int *key_generation);
++void kite_dp_rx_return(unsigned int token);
++void kite_dp_rx_discard_all(void);
++int kite_dp_rx_empty(void);
++int kite_wifi_rx_purge(void);
++void kite_wifi_pipeline_discard(void);
++#endif
+--- /dev/null
++++ b/kite-datapath.h
+@@ -0,0 +1,230 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PONWRT_KITE_DATAPATH_H
++#define PONWRT_KITE_DATAPATH_H
++
++/* Host/NPU wire ABI. Little-endian 32-bit words, no pointers or atomics
++ * requiring the RISC-V A extension. Mapping must be uncached on both ends.
++ * KDP_BARRIER must be a full interconnect barrier (not a compiler barrier).
++ * Host PN callers serialize locally; a WCID has exactly one NPU RX owner.
++ */
++#include "kite-reorder.h"
++
++#define KDP_MAGIC 0x4b440001u
++#define KDP_WCIDS 544u
++#define KDP_ROUTES 2048u
++#define KDP_ROUTE_MAX 0x1ffffu
++#define KDP_TIDS 17u
++#define KDP_FLOWS 512u
++#define KDP_FLOW_WAYS 8u
++#define KDP_FLOW_BUCKETS (KDP_FLOWS / KDP_FLOW_WAYS)
++#define KDP_RX_COUNT 256u
++#define KDP_TOKENS 1024u
++#define KDP_TOKEN_BASE 0x7000u
++#define KDP_BUFFER_BYTES 2048u
++#define KDP_TXWI_BYTES 128u
++#define KDP_PN_SPINS 4096u
++#define KDP_CIPHER_CCMP 0x000fac04u
++
++struct kdp_pn {
++	unsigned int want[2], turn;
++	unsigned int generation, key_generation;
++	unsigned int low, high;
++};
++
++/* One PN counter for both accelerated frames and host fallback. An expired
++ * lock attempt fails closed; it does not clear the other participant's flag.
++ * Never reset this object until both participants have stopped using it.
++ */
++#ifdef KDP_BARRIER
++static inline int kdp_pn_lock(volatile struct kdp_pn *p, unsigned int who)
++{
++	unsigned int peer = who ^ 1u, n;
++	p->want[who] = 1;
++	KDP_BARRIER();
++	p->turn = peer;
++	KDP_BARRIER();
++	for (n = 0; n < KDP_PN_SPINS; n++) {
++		if (!p->want[peer] || p->turn != peer) {
++			KDP_BARRIER();
++			return 1;
++		}
++		KDP_BARRIER();
++	}
++	p->want[who] = 0;
++	KDP_BARRIER();
++	return 0;
++}
++
++static inline void kdp_pn_unlock(volatile struct kdp_pn *p, unsigned int who)
++{
++	KDP_BARRIER();
++	p->want[who] = 0;
++	KDP_BARRIER();
++}
++
++/* 1 accepted, 0 replay, -1 unavailable/stale. A-MSDU subframes must be
++ * assembled/validated as ONE MPDU before this function, never allow equal
++ * PN just because a descriptor says it is another subframe.
++ */
++static inline int kdp_pn_accept(volatile struct kdp_pn *p, unsigned int who,
++	unsigned int generation, unsigned int key_generation,
++	unsigned int low, unsigned int high)
++{
++	int result = -1;
++	if (who > 1 || high > 0xffff || !generation || !key_generation ||
++	    !kdp_pn_lock(p, who))
++		return -1;
++	if (p->generation != generation || p->key_generation != key_generation)
++		goto out;
++	result = high > p->high || (high == p->high && low > p->low);
++	if (result) {
++		p->low = low;
++		p->high = high;
++	}
++out:
++	kdp_pn_unlock(p, who);
++	return result;
++}
++#endif
++
++/* Exact ingress policy installed from an accepted Linux flow rule. Version
++ * is zero while being replaced. Firmware samples version twice, including
++ * after matching: replacement/revocation can only cause a slow-path miss.
++ * Never derive a physical PPE slot from this software table's index/hash.
++ */
++struct kdp_flow {
++	unsigned int version, session, generation, key_generation;
++	unsigned int wcid, band, bss, type;
++	unsigned int src[4], dst[4], ports, protocol;
++	unsigned char smac[6], dmac[6];
++	unsigned int vlan, hw_slot, cookie_lo, cookie_hi, dsfield, dsmask;
++};
++#define KDP_FLOW_IPV4 1u
++#define KDP_FLOW_IPV6 2u
++#define KDP_FLOW_BRIDGE 3u
++#define KDP_SLOT_NONE 0xffffffffu
++
++struct kdp_sta {
++	unsigned int generation, key_generation, enabled, band;
++	unsigned int bss, cipher, keyid, authorized;
++	unsigned int omac, wmm, wme, amsdu;
++	unsigned int host_tids, reserved_sta;
++	unsigned int tx_tag;
++	unsigned char addr[6];
++	unsigned char tx_blocked, reserved;
++	struct kdp_pn pn[KDP_TIDS];
++};
++
++/* PPE etype WCID bits and ACTDP low 6 bits transport an opaque 17-bit
++ * route incarnation, never a physical WTBL index. Tags never wrap within
++ * the PPE driver's lifetime; old queued packets cannot acquire a new key.
++ * The NPU recovers the real WCID/BSS from this host-published route. */
++struct kdp_route { unsigned int tag, wcid; };
++struct kdp_tdma_desc { unsigned int word[8]; };
++struct kdp_token {
++	unsigned int state, submitted, dma_done, wa_done;
++	unsigned int generation, key_generation, wcid, band;
++};
++#define KDP_TOKEN_FREE 0u
++#define KDP_TOKEN_TDMA 1u
++#define KDP_TOKEN_WIFI 2u
++#define KDP_TOKEN_QUARANTINE 3u
++
++#define KDP_RX_TOKENS 5600u
++#define KDP_RX_MAGIC 0x4b520000u
++#define KDP_RX_REORDERED 1u
++#define KDP_RX_PN 2u
++#define KDP_RX_PPE_RETURN 4u
++struct kdp_rx_token {
++	unsigned int generation, key_generation, flags;
++	unsigned short next, wcid, len, offset;
++	unsigned char tid, bss, band, reserved;
++};
++
++struct kdp_band_stats {
++	unsigned int tx_bytes, rx_bytes, tx_stale, tx_full;
++	unsigned int reserved[12];
++};
++struct kdp_shared {
++	unsigned int magic, bytes, session, epoch;
++	unsigned int enabled, fault, gate, stopped;
++	unsigned int tx_sent[2], tx_freed[2], tx_drop[2], tx_bad_done;
++	unsigned int rx_ppe[2], rx_host[2], rx_replay[2], rx_stale[2];
++	unsigned int rx_miss[2], rx_free[2], rx_unsupported[2], tx_aborted[2], reserved[1];
++	struct kdp_sta sta[KDP_WCIDS];
++	struct kdp_route route[KDP_ROUTES];
++	struct kdp_flow flow[KDP_FLOWS];
++	struct kdp_token token[KDP_TOKENS];
++	unsigned short ba_index[KDP_WCIDS][8]; /* session index + 1 */
++	struct kdp_ba ba[KDP_BA_SESSIONS];
++	struct kdp_rx_token rx[KDP_RX_TOKENS];
++	struct kdp_tdma_desc tdma[2][KDP_RX_COUNT];
++	unsigned char txwi[KDP_TOKENS][KDP_TXWI_BYTES];
++	unsigned char payload[KDP_TOKENS][KDP_BUFFER_BYTES];
++	struct kdp_band_stats stats[2];
++};
++
++static inline unsigned int kdp_get_le32(const unsigned char *p)
++{
++	return (unsigned int)p[0] | (unsigned int)p[1] << 8 |
++	       (unsigned int)p[2] << 16 | (unsigned int)p[3] << 24;
++}
++static inline void kdp_put_le16(unsigned char *p, unsigned int v)
++{
++	p[0] = v;
++	p[1] = v >> 8;
++}
++static inline void kdp_put_le32(unsigned char *p, unsigned int v)
++{
++	kdp_put_le16(p, v);
++	kdp_put_le16(p + 2, v >> 16);
++}
++
++/* MT7916 connac2 normal cut-through TXD + firmware TXP, NOT Eagle's
++ * zero-TXD WED format. WTBL owns TX PN and sequence for both TX producers:
++ * PN_VALID/SN_VALID remain clear. Layout mirrors mt76_connac2_mac_write_txwi
++ * and mt7915_tx_prepare_skb for a unicast, Ethernet-encapsulated data frame.
++ */
++static inline int kdp_make_txwi(unsigned char *p, unsigned int pa,
++	unsigned int len, unsigned int token, unsigned int wcid,
++	unsigned int band, unsigned int bss, unsigned int omac,
++	unsigned int wmm, unsigned int tid, unsigned int encrypted,
++	unsigned int wme, unsigned int amsdu)
++{
++	static const unsigned char tid_queue[8] = { 1, 0, 0, 1, 2, 2, 3, 3 };
++	unsigned int i, q;
++	if (len < 14 || len > KDP_BUFFER_BYTES || token >= KDP_TOKENS ||
++	    !wcid || wcid >= KDP_WCIDS || band > 1 || bss > 63 || omac > 63 ||
++	    wmm > 3 || tid > 7 || pa < 0x80000000u || pa >= 0xc0000000u ||
++	    KDP_BUFFER_BYTES > 0xc0000000u - pa)
++		return 0;
++	for (i = 0; i < KDP_TXWI_BYTES; i++)
++		p[i] = 0;
++	q = wmm * 4 + tid_queue[tid];
++	kdp_put_le32(p, (len + 32) | (q << 25));
++	kdp_put_le32(p + 4, 0x80008000u | (band << 30) | (omac << 24) |
++			(tid << 20) | wcid);
++	kdp_put_le32(p + 8, 0x20u | (wme ? 8u : 0u));
++	kdp_put_le32(p + 12, (15u << 11) | (encrypted ? 2u : 0u));
++	/* PID 0: payload completion is WA TX-free, not an skb TX-status request. */
++	kdp_put_le32(p + 28, (2u << 20) | (wme ? 8u << 16 : 0u) |
++			 (amsdu ? 1u << 10 : 0u));
++	kdp_put_le16(p + 32, 0x81u | (encrypted ? 0u : 8u));
++	kdp_put_le16(p + 34, KDP_TOKEN_BASE + token);
++	p[36] = bss;
++	kdp_put_le16(p + 37, 0x3ff);
++	p[39] = 1;
++	kdp_put_le32(p + 40, pa);
++	kdp_put_le16(p + 64, len);
++	return 1;
++}
++
++/* Both independent completions are required, even if WA arrives first.
++ * Wrap is not allowed: rebind after a full hardware drain before 2^32 uses.
++ */
++static inline int kdp_token_reusable(const volatile struct kdp_token *t)
++{
++	return t->state == KDP_TOKEN_WIFI && t->submitted &&
++	       t->dma_done == t->submitted && t->wa_done == t->submitted;
++}
++#endif
+--- /dev/null
++++ b/kite-packet.h
+@@ -0,0 +1,162 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PONWRT_KITE_PACKET_H
++#define PONWRT_KITE_PACKET_H
++#include "kite-datapath.h"
++
++struct kdp_packet {
++	unsigned int src[4], dst[4], ports, protocol, type, vlan, dsfield;
++	unsigned char smac[6], dmac[6];
++};
++static inline unsigned int kdp_be16(const unsigned char *p)
++{
++	return (unsigned int)p[0] << 8 | p[1];
++}
++static inline unsigned int kdp_be32(const unsigned char *p)
++{
++	return (unsigned int)kdp_be16(p) << 16 | kdp_be16(p + 2);
++}
++/* Parse only complete unicast TCP/UDP packets suitable for a flow rule.
++ * Fragments, IPv6 extension headers and TCP connection control stay on the
++ * host. This parser cannot grant firewall or station authorization.
++ */
++static inline int kdp_parse_packet(const unsigned char *p, unsigned int len,
++	struct kdp_packet *out)
++{
++	unsigned int i, type, off = 14, end, l4;
++	if (len < 14 || (p[0] & 1) || (p[6] & 1))
++		return 0;
++	for (i = 0; i < 6; i++) {
++		out->dmac[i] = p[i];
++		out->smac[i] = p[i + 6];
++	}
++	out->vlan = KDP_SLOT_NONE;
++	type = kdp_be16(p + 12);
++	if (type == 0x8100) {
++		if (len < 18)
++			return 0;
++		out->vlan = kdp_be16(p + 14); /* PCP/DEI are policy too */
++		type = kdp_be16(p + 16);
++		off = 18;
++	}
++	for (i = 0; i < 4; i++)
++		out->src[i] = out->dst[i] = 0;
++	if (type == 0x0800) {
++		if (len - off < 20 || p[off] != 0x45 ||
++		    (kdp_be16(p + off + 6) & 0xbfff))
++			return 0;
++		end = off + kdp_be16(p + off + 2);
++		if (end > len || end < off + 20)
++			return 0;
++		out->src[0] = kdp_be32(p + off + 12);
++		out->dst[0] = kdp_be32(p + off + 16);
++		out->protocol = p[off + 9];
++		out->dsfield = p[off + 1];
++		out->type = KDP_FLOW_IPV4;
++		l4 = off + 20;
++	} else if (type == 0x86dd) {
++		if (len - off < 40 || (p[off] >> 4) != 6)
++			return 0;
++		end = off + 40 + kdp_be16(p + off + 4);
++		if (end > len)
++			return 0;
++		for (i = 0; i < 4; i++) {
++			out->src[i] = kdp_be32(p + off + 8 + i * 4);
++			out->dst[i] = kdp_be32(p + off + 24 + i * 4);
++		}
++		out->protocol = p[off + 6];
++		out->dsfield = ((p[off] & 15u) << 4) | (p[off + 1] >> 4);
++		out->type = KDP_FLOW_IPV6;
++		l4 = off + 40;
++	} else {
++		return 0;
++	}
++	if (out->protocol == 6) {
++		if (end - l4 < 20 || (p[l4 + 13] & 7) ||
++		    (p[l4 + 12] >> 4) < 5 ||
++		    (unsigned int)(p[l4 + 12] >> 4) * 4 > end - l4)
++			return 0;
++	} else if (out->protocol == 17) {
++		if (end - l4 < 8 || kdp_be16(p + l4 + 4) != end - l4)
++			return 0;
++	} else {
++		return 0;
++	}
++	out->ports = kdp_be32(p + l4);
++	return 1;
++}
++
++/* Default cfg80211 RFC8325 classifier, with an outer VLAN PCP taking
++ * precedence. Egress has already passed the kernel flow rule. */
++static inline unsigned int kdp_packet_tid(const struct kdp_packet *p)
++{
++	unsigned int dscp = p->dsfield >> 2;
++	if (p->vlan != KDP_SLOT_NONE && (p->vlan >> 13))
++		return p->vlan >> 13;
++	switch (dscp) {
++	case 10: case 12: case 14: case 16: return 0;
++	case 18: case 20: case 22: return 3;
++	case 24: case 26: case 28: case 30: return 4;
++	case 44: case 46: return 6;
++	case 48: return 7;
++	default: return p->dsfield >> 5;
++	}
++}
++
++static inline unsigned int kdp_flow_bucket(const unsigned char *smac,
++	const unsigned char *dmac, unsigned int vlan, unsigned int wcid)
++{
++	unsigned int i, h = wcid ^ vlan;
++	for (i = 0; i < 6; i++)
++		h = (h * 33u) ^ smac[i] ^ ((unsigned int)dmac[i] << 8);
++	h ^= h >> 16;
++	return (h & (KDP_FLOW_BUCKETS - 1)) * KDP_FLOW_WAYS;
++}
++
++/* Spread concurrent connections from one peer across the policy table.
++ * Bridge authorization retains its independent MAC/VLAN bucket. */
++static inline unsigned int kdp_flow_l4_bucket(unsigned int bucket,
++	const unsigned int *src, const unsigned int *dst, unsigned int ports,
++	unsigned int protocol, unsigned int type)
++{
++	unsigned int i, h = bucket ^ ports ^ (protocol << 24) ^ type;
++	for (i = 0; i < 4; i++) {
++		h = (h * 33u) ^ src[i];
++		h = (h * 33u) ^ dst[i];
++	}
++	h ^= h >> 16;
++	h *= 0x7feb352du;
++	h ^= h >> 15;
++	return (h & (KDP_FLOW_BUCKETS - 1)) * KDP_FLOW_WAYS;
++}
++
++#ifdef KDP_BARRIER
++static inline int kdp_flow_matches(const volatile struct kdp_flow *f,
++	const struct kdp_packet *p, unsigned int session, unsigned int generation,
++	unsigned int key_generation, unsigned int wcid, unsigned int band,
++	unsigned int bss)
++{
++	unsigned int i, version = f->version;
++	if (!version)
++		return 0;
++	KDP_BARRIER();
++	if (f->session != session || f->generation != generation ||
++	    f->key_generation != key_generation || f->wcid != wcid ||
++	    f->band != band || f->bss != bss || f->vlan != p->vlan ||
++	    ((p->dsfield ^ f->dsfield) & f->dsmask))
++		return 0;
++	for (i = 0; i < 6; i++)
++		if (f->smac[i] != p->smac[i] || f->dmac[i] != p->dmac[i])
++			return 0;
++	if (f->type != KDP_FLOW_BRIDGE) {
++		if (f->type != p->type || f->ports != p->ports ||
++		    f->protocol != p->protocol)
++			return 0;
++		for (i = 0; i < 4; i++)
++			if (f->src[i] != p->src[i] || f->dst[i] != p->dst[i])
++				return 0;
++	}
++	KDP_BARRIER();
++	return f->version == version;
++}
++#endif
++#endif
+--- /dev/null
++++ b/kite-reorder.h
+@@ -0,0 +1,150 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PONWRT_KITE_REORDER_H
++#define PONWRT_KITE_REORDER_H
++
++/* Fixed 12-bit sequence space; windows are at most 256 MPDUs. Storage is
++ * per negotiated BA session, not per possible WCID. A cell owns a complete
++ * A-MSDU chain or an unfinished one. Only complete MPDUs can be indicated.
++ * The caller serializes each session and supplies buffer-release callbacks.
++ */
++#define KDP_BA_SLOTS 256u
++#define KDP_BA_SESSIONS 128u
++#define KDP_BA_NONE 0xffffu
++struct kdp_mpdu {
++	unsigned int pn_low, pn_high, tick;
++	unsigned short head, tail, count, sn;
++	unsigned char complete, encrypted, reserved[2];
++};
++struct kdp_ba {
++	unsigned int generation, key_generation;
++	unsigned short wcid, tid, head, window;
++	struct kdp_mpdu slot[KDP_BA_SLOTS];
++};
++
++/* Buffers have one link while owned by this engine. A callback accepting
++ * a released MPDU becomes its owner, including when it chooses to drop it.
++ * No callback may re-enter this session.
++ */
++struct kdp_reorder_ops {
++	void (*drop)(void *ctx, unsigned short token);
++	void (*link)(void *ctx, unsigned short first, unsigned short next);
++	void (*release)(void *ctx, const struct kdp_mpdu *mpdu);
++};
++
++static inline void kdp_ba_empty(struct kdp_mpdu *m)
++{
++	m->head = m->tail = KDP_BA_NONE;
++	m->count = 0;
++	m->complete = 0;
++}
++
++static inline void kdp_ba_release(struct kdp_ba *b,
++	const struct kdp_reorder_ops *ops, void *ctx)
++{
++	struct kdp_mpdu *m = &b->slot[b->head & (KDP_BA_SLOTS - 1)];
++	if (m->count) {
++		/* release also receives incomplete chains and MUST drop them */
++		ops->release(ctx, m);
++		kdp_ba_empty(m);
++	}
++	b->head = (b->head + 1) & 4095;
++}
++
++static inline void kdp_ba_reset(struct kdp_ba *b, unsigned int ssn,
++	unsigned int window, const struct kdp_reorder_ops *ops, void *ctx)
++{
++	unsigned int i;
++	for (i = 0; i < KDP_BA_SLOTS; i++) {
++		struct kdp_mpdu *m = &b->slot[i];
++		if (m->count) {
++			m->complete = 0;
++			ops->release(ctx, m);
++		}
++		kdp_ba_empty(m);
++	}
++	b->head = ssn & 4095;
++	b->window = window <= KDP_BA_SLOTS ? window : 0;
++}
++
++/* MT7916 payload-format: 0 single, 3 first, 2 middle, 1 last.
++ * Equal PN is permitted only WITHIN one not-yet-released MPDU, with matching
++ * sequence/cipher and an actual first subframe. Replay is checked once by
++ * release, after sequence reorder, for the entire MPDU.
++ */
++static inline void kdp_ba_enqueue(struct kdp_ba *b, unsigned short token,
++	unsigned int sn, unsigned int format, unsigned int encrypted,
++	unsigned int low, unsigned int high, unsigned int tick,
++	const struct kdp_reorder_ops *ops, void *ctx)
++{
++	struct kdp_mpdu *m;
++	unsigned int delta;
++	if (!b->window || b->window > KDP_BA_SLOTS || sn > 4095 ||
++	    format > 3 || high > 0xffff || token == KDP_BA_NONE) {
++		ops->drop(ctx, token);
++		return;
++	}
++	delta = (sn - b->head) & 4095;
++	if (delta >= 2048) {
++		ops->drop(ctx, token);
++		return;
++	}
++	while (delta >= b->window) {
++		kdp_ba_release(b, ops, ctx);
++		delta--;
++	}
++	m = &b->slot[sn & (KDP_BA_SLOTS - 1)];
++	if (format == 0 || format == 3) {
++		if (m->count && m->complete) {
++			ops->drop(ctx, token);
++			return;
++		}
++		if (m->count) {
++			/* A fresh FIRST starts a fresh MPDU. Discard the entire old
++			 * unfinished chain before accepting any new subframes. */
++			ops->release(ctx, m);
++			kdp_ba_empty(m);
++		}
++		m->sn = sn;
++		m->head = m->tail = token;
++		m->count = 1;
++		m->pn_low = low;
++		m->pn_high = high;
++		m->encrypted = !!encrypted;
++		m->complete = format == 0;
++		m->tick = tick;
++		ops->link(ctx, token, KDP_BA_NONE);
++	} else {
++		if (!m->count || m->complete || m->sn != sn || m->count >= 64 ||
++		    m->encrypted != !!encrypted || m->pn_low != low ||
++		    m->pn_high != high) {
++			ops->drop(ctx, token);
++			return;
++		}
++		ops->link(ctx, m->tail, token);
++		ops->link(ctx, token, KDP_BA_NONE);
++		m->tail = token;
++		m->count++;
++		m->complete = format == 1;
++	}
++	while (b->slot[b->head & (KDP_BA_SLOTS - 1)].count &&
++	       b->slot[b->head & (KDP_BA_SLOTS - 1)].complete)
++		kdp_ba_release(b, ops, ctx);
++}
++
++static inline void kdp_ba_timeout(struct kdp_ba *b, unsigned int now,
++	unsigned int timeout, const struct kdp_reorder_ops *ops, void *ctx)
++{
++	unsigned int i, advance = 0;
++	/* Age arithmetic is modulo 2^32. Caller uses a timeout below 2^31. */
++	for (i = 0; i < b->window; i++) {
++		struct kdp_mpdu *m = &b->slot[(b->head + i) & (KDP_BA_SLOTS - 1)];
++		if (m->count && now - m->tick > timeout)
++			advance = i + 1;
++	}
++	while (advance--)
++		kdp_ba_release(b, ops, ctx);
++	while (b->slot[b->head & (KDP_BA_SLOTS - 1)].count &&
++	       b->slot[b->head & (KDP_BA_SLOTS - 1)].complete)
++		kdp_ba_release(b, ops, ctx);
++}
++#endif
+--- /dev/null
++++ b/kite-secure-rxd.h
+@@ -0,0 +1,66 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef PONWRT_KITE_SECURE_RXD_H
++#define PONWRT_KITE_SECURE_RXD_H
++#include "kite-datapath.h"
++struct kdp_rxd {
++	unsigned int wcid, band, bss, tid, sequence, format, offset;
++	unsigned int encrypted, keyid, low, high;
++};
++
++/* Only complete normal unicast QoS data with a group-4 sequence record.
++ * A protected frame additionally requires CCMP, group-1 PN, and no cipher,
++ * integrity, FCS or translation error. Hardware decryption alone is never
++ * interpreted as PN validation. Nontranslated data is reordered but cannot
++ * enter PPE (offset == 0). Management/fragment/control traffic stays in Linux.
++ */
++static inline int kdp_parse_rxd(const unsigned char *p, unsigned int len,
++	unsigned int band, struct kdp_rxd *r)
++{
++	unsigned int w0, w1, w2, w3, fc, seq, off=24, sec;
++	if (len < 40 || len > 3500 || band > 1)
++		return 0;
++	w0=kdp_get_le32(p);w1=kdp_get_le32(p+4);
++	w2=kdp_get_le32(p+8);w3=kdp_get_le32(p+12);
++	if ((w0 & 0xffff) != len || (w0 >> 27) != 2 || !(w1 & (1u<<14)) ||
++	    ((w1>>28)&1) != band || ((w3>>16)&3) != 1 ||
++	    (w1 & (31u<<23)) || (w2 & ((1u<<21) | 0xbf800000u)))
++		return 0;
++	fc=kdp_get_le32(p+24)&0xffff;seq=kdp_get_le32(p+32);
++	if ((fc & 0x3fc) != 0x188 || (fc & (1u<<10)) || (seq & 15))
++		return 0;
++	sec=(w1>>16)&31;
++	if (sec != 0 && sec != 4)
++		return 0;
++	if (!!sec != !!(fc & (1u<<14)))
++		return 0;
++	r->encrypted=!!sec;r->keyid=(w1>>21)&3;
++	r->low=r->high=0;
++	off+=16;
++	if (w1 & (1u<<11)) {
++		if (len - off < 16)
++			return 0;
++		r->low=kdp_get_le32(p+off);
++		r->high=(unsigned int)p[off+4] | (unsigned int)p[off+5]<<8;
++		off+=16;
++	} else if (sec) {
++		return 0;
++	}
++	if (w1 & (1u<<12)) off+=8;
++	if (w1 & (1u<<13)) off+=8;
++	if (w1 & (1u<<15)) {
++		if (!(w1 & (1u<<13))) return 0;
++		off+=72;
++	}
++	off+=2*((w2>>14)&3);
++	if (off > len || len-off < ((w2 & (1u<<13)) ? 14u : 26u))
++		return 0;
++	r->wcid=w1&0x3ff;r->band=band;r->bss=w2&63;
++	r->tid=(seq>>16)&15;r->sequence=(seq>>4)&4095;
++	r->format=kdp_get_le32(p+16)&3;
++	r->offset=(w2 & (1u<<13)) ? off : 0;
++	if (!r->wcid || r->wcid>=KDP_WCIDS || r->tid>7 ||
++	    r->tid!=((w2>>16)&15))
++		return 0;
++	return 1;
++}
++#endif
+--- a/kite-tx.h
++++ b/kite-tx.h
+@@ -1,16 +1,17 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ #ifndef PONWRT_KITE_TX_H
+ #define PONWRT_KITE_TX_H
+-/* ABI 1: little endian words. One input slot maps to the same WFDMA slot.
+- * ARM writes producer and input descriptors; hart 4 writes all other progress
++/* ABI 2: little endian words. Host input and WFDMA indices are independent.
++ * ARM writes producer and input descriptors; hart 4 multiplexes host and PPE
++ * frames onto WFDMA and writes all other progress
+  * fields and the hardware descriptors. Neither index releases payload tokens.
+  * The host retains mappings until WA TX-free, or the full DMA stop barrier.
+  */
+-#define KITE_TX_MAGIC 0x4b540001u
++#define KITE_TX_MAGIC 0x4b540002u
+ #define KITE_TX_COUNT 2048u
+ #define KITE_TX_MASK (KITE_TX_COUNT - 1)
+ #define KITE_TX_HEADER 128u
+-#define KITE_TX_BYTES (KITE_TX_HEADER + KITE_TX_COUNT * 16u)
++#define KITE_TX_BYTES (KITE_TX_HEADER + KITE_TX_COUNT * 18u)
+ #define KITE_TX_BUDGET 32u
+ #define KITE_TX_FAULT_IDENTITY 1u
+ #define KITE_TX_FAULT_INDEX 2u
+@@ -23,8 +24,11 @@
+ 	unsigned int magic, session, epoch, count;
+ 	unsigned int producer, published, completed, fault;
+ 	unsigned int submitted, reaped, polls, wraps;
+-	unsigned int invalid, cancelled, reserved[18];
++	unsigned int invalid, cancelled;
++	unsigned int hw_producer, hw_completed, ppe_submitted, ppe_reaped;
++	unsigned int reserved[14];
+ 	struct kite_tx_desc input[KITE_TX_COUNT];
++	unsigned short owner[KITE_TX_COUNT]; /* NPU-only WFDMA completion ledger */
+ };
+ static inline int kite_tx_range(unsigned long long pa, unsigned int len)
+ {
+--- a/npu_hostadpt.c
++++ b/npu_hostadpt.c
+@@ -1,3 +1,6 @@
++#if defined(AN7581) && defined(MT7916)
++#include "kite-datapath-fw.h"
++#endif
+ /*
+  * AN75XX NPU firmware - host adaptor rings
+  *
+@@ -24,6 +27,21 @@
+ 
+ #if defined(AN7581) && defined(MT7916)
+ static u32 kite_host_session, kite_host_epoch, kite_host_bands;
++
++int kite_host_dp_range(u32 pa, u32 bytes)
++{
++	u32 band;
++	for (band = 0; band < 2; band++) {
++		u32 base;
++		if (!(kite_host_bands & (1u << band)))
++			continue;
++		base = band ? hostadpt_rx_ring_base : hostadpt_tx_ring_base;
++		base = (base & 0x3fffffffu) | 0x80000000u;
++		if (pa < base + KITE_HOST_RING_BYTES && base < pa + bytes)
++			return 0;
++	}
++	return 1;
++}
+ 
+ u32 kite_host_bound(void)
+ {
+@@ -188,6 +206,18 @@
+ 	bridge_dma_copy(3, buf_addr, d[3], dma_len);
+ #endif
+ 
++
++#if defined(AN7581) && defined(MT7916)
++	{
++		u32 gen = 0, keygen = 0;
++		if (buf_addr >= wifi_pkt_dma(0) &&
++		    !((buf_addr - wifi_pkt_dma(0)) & 4095))
++			kite_dp_rx_metadata((buf_addr - wifi_pkt_dma(0)) >> 12,
++					    &gen, &keygen);
++		d[4] = gen;
++		d[5] = keygen;
++	}
++#endif
+ 	d[2] = info;
+ 	d[1] = (wcid & 0xFFFF) | ((amsdu & 0x1F) << 16) |
+ 	       ((u32)(fwd_type & 0x3F) << 26);
+@@ -391,10 +421,16 @@
+ 		/* A segmented RX frame has no complete MT7916 header at any one
+ 		 * source buffer.  Publish an explicit malformed/fallback record so
+ 		 * Linux can never mistake the chain for a reordered plaintext frame. */
++		u32 meta = KITE_HOST_META_PACK(0, 0, KITE_HOST_META_MALFORMED);
++#if defined(AN7581) && defined(MT7916)
++		if (kite_dp_bound()) {
++			u32 generation, key_generation;
++			meta = kite_dp_rx_metadata(*(u32 *)nodes[i], &generation, &key_generation);
++		}
++#endif
+ 		ctrl[i] = host_ring_prepare_desc(slots[i],
+ 			wifi_pkt_dma(*(u32 *)nodes[i]), total, 0, 0,
+-			(n << 3) | (i + 1), *(u16 *)(nodes[i] + 6), i == n - 1,
+-			KITE_HOST_META_PACK(0, 0, KITE_HOST_META_MALFORMED));
++			(n << 3) | (i + 1), *(u16 *)(nodes[i] + 6), i == n - 1, meta);
+ 		if (!ctrl[i])
+ 			return KITE_HOST_HOLD;
+ 	}
+--- a/npu_kite_control.c
++++ b/npu_kite_control.c
+@@ -8,6 +8,7 @@
+ #include "kite-host.h"
+ #include "kite-control.h"
+ #include "kite-tx.h"
++#include "kite-datapath-fw.h"
+ 
+ #if defined(AN7581) && defined(MT7916)
+ struct kite_ctl_sta {
+@@ -24,7 +25,7 @@
+ 
+ static struct {
+ 	u32 session, serial, result, base, mode;
+-	u32 reorder, reorder_fences, tx_enabled;
++	u32 reorder, reorder_fences, tx_enabled, dp_rx_purged;
+ 	volatile u32 park_cookie;
+ 	u32 accepted, rejected, stations, bas, keys;
+ 	u32 last[KITE_CTL_WORDS];
+@@ -110,6 +111,10 @@
+ 		ctl_fence();
+ 		ctl.state = KITE_CTL_PARKED;
+ 	}
++	if (ctl.state == KITE_CTL_STOPPING && (kite_ctl_ack() & 6u) == 6u) {
++		kite_dp_rx_discard_all();
++		kite_wifi_pipeline_discard();
++	}
+ 	if (ctl.state == KITE_CTL_STOPPING &&
+ 	    kite_ctl_ack() ==
+ 		    (ctl.tx_enabled ? KITE_CTL_TX_WORKERS : KITE_CTL_WORKERS) &&
+@@ -186,9 +191,11 @@
+ 	return 1;
+ }
+ 
+-static void kite_ctl_discard(u32 wcid)
++static void kite_ctl_discard_mode(u32 wcid, u32 keep_ba)
+ {
+ 	u32 tid, addr;
++	if (!keep_ba)
++		kite_dp_sta_invalidate(wcid);
+ 
+ 	for (tid = 0; tid < KITE_CTL_TIDS; tid++) {
+ 		addr = ctl.base + (wcid * KITE_CTL_TIDS + tid) * 28;
+@@ -197,6 +204,11 @@
+ 		ba_discard_entry((u32 *)addr);
+ 		npu_memset((void *)addr, 0, 28);
+ 	}
++}
++
++static void kite_ctl_discard(u32 wcid)
++{
++	kite_ctl_discard_mode(wcid, 0);
+ }
+ 
+ /* A consumed RX descriptor does not identify its old STA/key generation.
+@@ -301,6 +313,23 @@
+ 	}
+ 	if (!kite_ctl_quiesced())
+ 		return KITE_CTL_BUSY;
++	if (op == KITE_CTL_DP_RX_PURGE) {
++		if (!kite_dp_bound() || ctl.state != KITE_CTL_PARKED)
++			return KITE_CTL_BUSY;
++		if (!kite_wifi_rx_purge())
++			return KITE_CTL_BUSY;
++		kite_dp_rx_discard_all();
++		ctl.dp_rx_purged = 1;
++		return KITE_CTL_OK;
++	}
++	if (op == KITE_CTL_DP_BIND) {
++		if (!ctl.tx_enabled || ctl.state != KITE_CTL_PARKED || d[7] != d[4])
++			return KITE_CTL_BUSY;
++		return kite_dp_bind(d[5], d[6], ctl.session, d[7]) ?
++			KITE_CTL_OK : KITE_CTL_INVALID;
++	}
++	if (op == KITE_CTL_DP_UNBIND)
++		return kite_dp_unbind() ? KITE_CTL_OK : KITE_CTL_BUSY;
+ 	if (op == KITE_CTL_TX_BIND) {
+ 		if (!ctl.tx_enabled || ctl.state != KITE_CTL_PARKED)
+ 			return KITE_CTL_BUSY;
+@@ -309,6 +338,8 @@
+ 			       KITE_CTL_INVALID;
+ 	}
+ 	if (op == KITE_CTL_TX_UNBIND) {
++		if (kite_dp_bound() && !kite_dp_tx_halt())
++			return KITE_CTL_BUSY;
+ 		kite_tx_unbind();
+ 		return KITE_CTL_OK;
+ 	}
+@@ -341,6 +372,7 @@
+ 		    )
+ 			return KITE_CTL_BUSY;
+ 		ctl_fence();
++		ctl.dp_rx_purged = 0;
+ 		ctl.state = KITE_CTL_RUNNING;
+ 		return KITE_CTL_OK;
+ 	}
+@@ -351,7 +383,7 @@
+ 	if (op == KITE_CTL_CLOSE && kite_ctl_rings_live())
+ 		return KITE_CTL_BUSY;
+ 	if (op == KITE_CTL_CLOSE) {
+-		if (kite_host_bound() || kite_tx_bound())
++		if (kite_host_bound() || kite_tx_bound() || kite_dp_bound())
+ 			return KITE_CTL_BUSY;
+ 		for (i = 1; i < KITE_CTL_WCIDS; i++)
+ 			kite_ctl_discard(i);
+@@ -364,6 +396,8 @@
+ 		ctl.state = KITE_CTL_CLOSED;
+ 		return KITE_CTL_OK;
+ 	}
++	if (kite_dp_bound() && op != KITE_CTL_BA && !ctl.dp_rx_purged)
++		return KITE_CTL_BUSY;
+ 	if (!wcid || wcid >= KITE_CTL_WCIDS || !gen)
+ 		return KITE_CTL_INVALID;
+ 	sta = kite_ctl_sta(wcid);
+@@ -404,7 +438,7 @@
+ 			return KITE_CTL_STALE;
+ 		if (d[9] > 3 && (d[8] || d[9] != 0xffffffffu))
+ 			return KITE_CTL_INVALID;
+-		kite_ctl_discard(wcid);
++		kite_ctl_discard_mode(wcid, kite_dp_bound());
+ 		sta->key_generation = d[7];
+ 		sta->cipher = d[8];
+ 		sta->keyid = d[9];
+@@ -430,6 +464,7 @@
+ 			*(u8 *)(addr + 24) = 4;
+ 			ctl.bas++;
+ 		}
++		kite_dp_ba_set(wcid, tid, d[9], d[8]);
+ 		break;
+ 	default:
+ 		return KITE_CTL_INVALID;
+@@ -445,13 +480,15 @@
+ 
+ 	if (bytes != (KITE_CTL_WORDS + 2) * 4 || (msg[0] & 15) ||
+ 	    d[0] != KITE_CTL_MAGIC || d[1] != KITE_CTL_WORDS ||
+-	    d[2] < KITE_CTL_OPEN || d[2] > KITE_CTL_TX_UNBIND)
+-		return 0;
+-	used = d[2] == KITE_CTL_TX_BIND				      ? 10 :
++	    d[2] < KITE_CTL_OPEN || d[2] > KITE_CTL_DP_RX_PURGE)
++		return 0;
++	used = d[2] == KITE_CTL_DP_BIND ? 8 :
++	       d[2] == KITE_CTL_TX_BIND				      ? 10 :
+ 	       d[2] == KITE_CTL_OPEN				      ? 9 :
+ 	       d[2] == KITE_CTL_STA_DEL				      ? 7 :
+ 	       d[2] == KITE_CTL_STA_ADD || d[2] == KITE_CTL_HOST_BIND ? 9 :
+ 	       d[2] == KITE_CTL_HOST_UNBIND			      ? 6 :
++	       d[2] == KITE_CTL_DP_RX_PURGE ||
+ 	       d[2] == KITE_CTL_DATA_STOP || d[2] == KITE_CTL_DATA_RECOVER ||
+ 			       d[2] == KITE_CTL_TX_UNBIND ?
+ 					      5 :
+@@ -506,7 +543,7 @@
+ 	       KITE_CTL_CAP_DATA_LIFECYCLE;
+ 
+ #ifndef EAGLE_NO_TX_PUSH
+-	d[2] |= KITE_CTL_CAP_TX;
++	d[2] |= KITE_CTL_CAP_TX | KITE_CTL_CAP_DATAPATH;
+ #endif
+ 	d[3] = ctl.session;
+ 	d[4] = ctl.serial;
+--- /dev/null
++++ b/npu_kite_datapath.c
+@@ -0,0 +1,329 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include "npu_internal.h"
++#include "npu_wifi.h"
++#define KDP_BARRIER() __asm__ volatile("fence iorw,iorw" ::: "memory")
++#include "kite-datapath-fw.h"
++#include "kite-packet.h"
++
++#if defined(AN7581) && defined(MT7916)
++/* TDMA descriptor memory is SRAM, as in the AN7581 reference implementation.
++ * Type 133 has 0x1080 bytes on Kite: two rings of 64 * 32 bytes fit without
++ * reallocating/overlapping any existing RX/reorder SRAM allocation.
++ */
++#define DP_TDMA_COUNT 64u
++#define DP_TDMA_BYTES (DP_TDMA_COUNT * 32u)
++static volatile struct kdp_shared *dp;
++static u32 dp_pa, dp_session, dp_epoch, dp_ring, dp_idx[2], dp_alloc, dp_reap;
++static u16 dp_prepared[2], dp_replacement[2];
++
++static u32 dp_payload_pa(u32 token)
++{
++	return dp_pa + __builtin_offsetof(struct kdp_shared, payload) +
++	       token * KDP_BUFFER_BYTES;
++}
++static u32 dp_txwi_pa(u32 token)
++{
++	return dp_pa + __builtin_offsetof(struct kdp_shared, txwi) +
++	       token * KDP_TXWI_BYTES;
++}
++static int dp_identity(void)
++{
++	return dp && dp->magic == KDP_MAGIC && dp->bytes == sizeof(*dp) &&
++	       dp->session == dp_session && dp->epoch == dp_epoch && !dp->fault;
++}
++volatile struct kdp_shared *kite_dp_shared(void)
++{
++	return dp_identity() ? dp : 0;
++}
++int kite_dp_bound(void)
++{
++	return dp != 0;
++}
++static int dp_alloc_token(void)
++{
++	u32 i;
++	for (i = 0; i < KDP_TOKENS; i++) {
++		u32 t = dp_alloc;
++		dp_alloc = (dp_alloc + 1) % KDP_TOKENS;
++		if (dp->token[t].state == KDP_TOKEN_FREE) {
++			dp->token[t].state = KDP_TOKEN_TDMA;
++			return t;
++		}
++	}
++	return -1;
++}
++
++int kite_dp_bind(u32 pa, u32 bytes, u32 session, u32 epoch)
++{
++	volatile struct kdp_shared *s;
++	u32 b, i, ring;
++	if (dp || bytes != sizeof(*s) || (pa & 63) || !session || !epoch ||
++	    !kite_tx_dp_range(pa, bytes) || !kite_tx_bound() ||
++	    (REG32(TDMA_GLB_CFG) & 0xcu))
++		return 0;
++	s = (void *)kite_ctl_pool_alias(pa);
++	KDP_BARRIER();
++	if (s->magic != KDP_MAGIC || s->bytes != bytes || s->session != session ||
++	    s->epoch != epoch || s->enabled || !s->gate || s->fault)
++		return 0;
++	for (i = 0; i < KDP_TOKENS; i++)
++		if (s->token[i].state || s->token[i].submitted ||
++		    s->token[i].dma_done || s->token[i].wa_done)
++			return 0;
++	ring = sram_buf_alloc(133);
++	if (ring < 0x3e800000 || ring > 0x3e878000 - DP_TDMA_BYTES * 2)
++		return 0;
++	dp = s;
++	dp_pa = pa;
++	dp_session = session;
++	dp_epoch = epoch;
++	dp_ring = ring;
++	dp_alloc = dp_reap = 0;
++	npu_memset((void *)ring, 0, DP_TDMA_BYTES * 2);
++	for (b = 0; b < 2; b++) {
++		dp_idx[b] = 0;
++		dp_prepared[b] = dp_replacement[b] = 0xffff;
++		REG32(TDMA_RX_BASE_PTR(b)) =
++			(ring + b * DP_TDMA_BYTES) & 0x1fffffff;
++		REG32(TDMA_RX_BASE_PTR(b) + 4) =
++			(REG32(TDMA_RX_BASE_PTR(b) + 4) & 0xffffe000) | DP_TDMA_COUNT;
++		for (i = 0; i < DP_TDMA_COUNT; i++) {
++			int token = dp_alloc_token();
++			u32 desc = ring + b * DP_TDMA_BYTES + i * 32;
++			/* An empty pool was checked above; 128 < 1024. */
++			if (token < 0) {
++				dp->fault = 1;
++				return 0;
++			}
++			REG32(desc + 8) = dp_payload_pa(token);
++			REG32(desc + 4) = KDP_BUFFER_BYTES;
++		}
++		KDP_BARRIER();
++		REG32(TDMA_RX_BASE_PTR(b) + 8) = DP_TDMA_COUNT - 1;
++		REG32(TDMA_RX_BASE_PTR(b) + 12) = 0;
++	}
++	/* As AN7581 tdma_rx_init: data buffers use ARM physical addresses,
++	 * descriptors use the SRAM bus address. Gate remains closed at bind. */
++	REG32(TDMA_RX_CFG) |= 0x80000000u;
++	KDP_BARRIER();
++	REG32(TDMA_GLB_CFG) |= 4;
++	return 1;
++}
++
++static void dp_rearm(u32 band, u32 token)
++{
++	u32 idx = dp_idx[band];
++	u32 desc = dp_ring + band * DP_TDMA_BYTES + idx * 32;
++	REG32(desc + 8) = dp_payload_pa(token);
++	KDP_BARRIER();
++	REG32(desc + 4) = KDP_BUFFER_BYTES;
++	KDP_BARRIER();
++	REG32(TDMA_RX_BASE_PTR(band) + 8) = idx;
++	dp_idx[band] = (idx + 1) % DP_TDMA_COUNT;
++}
++
++void kite_dp_tx_reap(void)
++{
++	u32 i;
++	if (!dp_identity())
++		return;
++	KDP_BARRIER();
++	for (i = 0; i < 32; i++) {
++		volatile struct kdp_token *t = &dp->token[dp_reap];
++		dp_reap = (dp_reap + 1) % KDP_TOKENS;
++		if (!kdp_token_reusable(t))
++			continue;
++		dp->tx_freed[t->band]++;
++		KDP_BARRIER();
++		t->state = KDP_TOKEN_FREE;
++	}
++}
++
++int kite_dp_tx_next(u32 band, struct kite_tx_desc *out, u16 *id)
++{
++	volatile struct kdp_sta *sta;
++	volatile struct kdp_token *t;
++	u32 desc, len, addr, token, info, wcid, bss, b, i, tag;
++	int replacement;
++	struct kdp_packet packet;
++	if (band > 1 || !dp_identity())
++		return 0;
++	if (dp_prepared[band] != 0xffff) {
++		dp->fault = 2; /* caller must commit each successfully prepared frame */
++		return 0;
++	}
++	desc = dp_ring + band * DP_TDMA_BYTES + dp_idx[band] * 32;
++	len = REG32(desc + 4);
++	if (!(len & 0x80000000u))
++		return 0;
++	KDP_BARRIER();
++	len &= 0xffff;
++	addr = REG32(desc + 8);
++	if (addr < dp_payload_pa(0) ||
++	    addr - dp_payload_pa(0) >= KDP_TOKENS * KDP_BUFFER_BYTES ||
++	    ((addr - dp_payload_pa(0)) % KDP_BUFFER_BYTES)) {
++		dp->fault = 3;
++		return 0;
++	}
++	token = (addr - dp_payload_pa(0)) / KDP_BUFFER_BYTES;
++	t = &dp->token[token];
++	if (t->state != KDP_TOKEN_TDMA) {
++		dp->fault = 4;
++		return 0;
++	}
++	info = REG32(desc + 16);
++	tag = ((info >> 14) & 0x7ff) |
++	      (((REG32(desc + 24) >> 24) & 0x7f) << 11);
++	b = (info >> 25) & 1;
++	if (!tag || tag > KDP_ROUTE_MAX ||
++	    dp->route[tag & (KDP_ROUTES - 1)].tag != tag) {
++		dp->stats[band].tx_stale++;
++		goto drop;
++	}
++	KDP_BARRIER();
++	wcid = dp->route[tag & (KDP_ROUTES - 1)].wcid;
++	if (!wcid || wcid >= KDP_WCIDS || b != band ||
++	    len < 14 || len > KDP_BUFFER_BYTES || !dp->enabled || dp->gate)
++		goto drop;
++	sta = &dp->sta[wcid];
++	bss = sta->bss;
++	if (sta->tx_tag != tag || bss > 63 || sta->tx_blocked || !sta->enabled || !sta->authorized || sta->band != b ||
++	    sta->bss != bss || !sta->generation ||
++	    (sta->cipher && (sta->cipher != KDP_CIPHER_CCMP ||
++			    !sta->key_generation)))
++		goto drop;
++	for (i = 0; i < 6; i++)
++		if (dp->payload[token][i] != sta->addr[i])
++			goto drop;
++	/* A bound bridge rule may also deliver ARP or TCP control packets.
++	 * Ethernet II frames use the same normal TXD; only the QoS classifier
++	 * needs an IP header. Local EAPOL remains exclusively host generated. */
++	if (kdp_be16((const void *)(dp->payload[token] + 12)) < 0x600 ||
++	    kdp_be16((const void *)(dp->payload[token] + 12)) == 0x888e)
++		goto drop;
++	npu_memset(&packet, 0, sizeof(packet));
++	packet.vlan = KDP_SLOT_NONE;
++	kdp_parse_packet((const void *)dp->payload[token], len, &packet);
++	if (t->submitted == 0xffffffffu) {
++		t->state = KDP_TOKEN_QUARANTINE;
++		dp->fault = 5;
++		return 0;
++	}
++	replacement = dp_alloc_token();
++	if (replacement < 0) {
++		dp->stats[band].tx_full++;
++		return 0;
++	} /* keep TDMA ownership until a spare buffer exists */
++	/* No checksum offload requested: PPE supplied the final wire packet.
++	 * Short parse-prefix padding belongs to this exclusive token buffer. */
++	for (i = len; i < 72; i++)
++		dp->payload[token][i] = 0;
++	if (!kdp_make_txwi((void *)dp->txwi[token], addr, len, token, wcid,
++			 band, bss, sta->omac, sta->wmm,
++			 sta->wme ? kdp_packet_tid(&packet) : 0, !!sta->cipher,
++			 sta->wme, sta->amsdu)) {
++		dp->token[replacement].state = KDP_TOKEN_FREE;
++		goto drop;
++	}
++	t->generation = sta->generation;
++	t->key_generation = sta->key_generation;
++	t->wcid = wcid;
++	t->band = band;
++	t->submitted++;
++	t->dma_done = t->wa_done = 0;
++	KDP_BARRIER();
++	t->state = KDP_TOKEN_WIFI;
++	dp_prepared[band] = token;
++	dp_replacement[band] = replacement;
++	out->buf0 = dp_txwi_pa(token);
++	out->buf1 = addr;
++	out->ctrl = (76u << 16) | 0x4000u | 72u;
++	out->info = 0;
++	*id = token;
++	return 1;
++drop:
++	dp->tx_drop[band]++;
++	dp_rearm(band, token);
++	return 0;
++}
++
++void kite_dp_tx_commit(u32 band, u16 token)
++{
++	if (!dp_identity() || band > 1 || dp_prepared[band] != token ||
++	    dp_replacement[band] >= KDP_TOKENS) {
++		if (dp)
++			dp->fault = 6;
++		return;
++	}
++	dp->tx_sent[band]++;
++	dp->stats[band].tx_bytes += kdp_get_le32((const void *)dp->txwi[token]) & 0xffff;
++	dp->stats[band].tx_bytes -= 32; /* exclude hardware TXD */
++	dp_rearm(band, dp_replacement[band]);
++	dp_prepared[band] = dp_replacement[band] = 0xffff;
++}
++
++void kite_dp_tx_dma_done(u16 token)
++{
++	if (!dp_identity() || token >= KDP_TOKENS ||
++	    dp->token[token].state != KDP_TOKEN_WIFI ||
++	    dp->token[token].dma_done) {
++		if (dp)
++			dp->fault = 7;
++		return;
++	}
++	dp->token[token].dma_done = dp->token[token].submitted;
++	KDP_BARRIER();
++}
++
++
++/* PARKED: detach the submitting worker before ARM disables WFDMA. Keep
++ * every outstanding buffer owned until the subsequent physical DMA stop. */
++int kite_dp_tx_halt(void)
++{
++	if (!dp) return 1;
++	if (!dp_identity() || !dp->gate || dp->enabled) return 0;
++	dp->stopped = 1;
++	KDP_BARRIER();
++	return 1;
++}
++
++/* Called with all workers parked, PPE rules revoked and WFDMA TX drained.
++ * Disabling an engine is not completion: a busy timeout retains the mapping.
++ */
++int kite_dp_unbind(void)
++{
++	u32 i, abort;
++	if (!dp)
++		return 1;
++	if (!dp_identity() || !dp->gate)
++		return 0;
++	abort = dp->stopped == 1;
++	if (abort && (!kite_tx_dma_stopped() || !kite_dp_rx_empty()))
++		return 0;
++	for (i = 0; i < KDP_TOKENS / 32; i++)
++		kite_dp_tx_reap();
++	for (i = 0; i < KDP_TOKENS; i++)
++		if (!abort && (dp->token[i].state == KDP_TOKEN_WIFI ||
++		    dp->token[i].state == KDP_TOKEN_QUARANTINE))
++			return 0;
++	REG32(TDMA_GLB_CFG) &= ~4u;
++	KDP_BARRIER();
++	for (i = 0; i < 100000; i++)
++		if (!(REG32(TDMA_GLB_CFG) & 8u))
++			break;
++	if (i == 100000) {
++		dp->fault = 8;
++		return 0;
++	}
++	if (abort)
++		for (i = 0; i < KDP_TOKENS; i++) {
++			if (dp->token[i].state == KDP_TOKEN_WIFI && dp->token[i].band < 2)
++				dp->tx_aborted[dp->token[i].band]++;
++			dp->token[i].state = KDP_TOKEN_FREE;
++		}
++	dp->stopped = 2;
++	KDP_BARRIER();
++	dp = 0;
++	return 1;
++}
++#endif
+--- a/npu_kite_dma.c
++++ b/npu_kite_dma.c
+@@ -8,6 +8,7 @@
+ #include "npu_internal.h"
+ #include "npu_wifi.h"
+ #include "kite-host.h"
++#include "kite-datapath-fw.h"
+ 
+ #if defined(AN7581) && defined(MT7916)
+ #define KITE_COPY_CHANNEL 3u
+@@ -58,7 +59,7 @@
+ {
+ 	return !kite_host_faulted() && !kite_copy.inflight &&
+ 	       kite_tdma_idle() && kite_host_rings_empty() &&
+-	       kite_wifi_ba_empty();
++	       kite_wifi_ba_empty() && kite_dp_rx_empty();
+ }
+ 
+ int kite_host_prepare_recover(void)
+--- /dev/null
++++ b/npu_kite_secure_rx.c
+@@ -0,0 +1,298 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include "npu_internal.h"
++#include "npu_wifi.h"
++#define KDP_BARRIER() __asm__ volatile("fence iorw,iorw" ::: "memory")
++#include "kite-datapath-fw.h"
++#include "kite-secure-rxd.h"
++#include "kite-packet.h"
++
++#if defined(AN7581) && defined(MT7916)
++struct dp_rx_context { volatile struct kdp_shared *s; u32 band; };
++
++static void dp_rx_drop(void *opaque, u16 token)
++{
++	struct dp_rx_context *ctx = opaque;
++	if (token < KDP_RX_TOKENS)
++		buf_id_free(0, ctx->band, token);
++}
++static void dp_rx_link(void *opaque, u16 token, u16 next)
++{
++	struct dp_rx_context *ctx = opaque;
++	ctx->s->rx[token].next = next;
++}
++static void dp_rx_host(volatile struct kdp_shared *s, u16 id)
++{
++	volatile struct kdp_rx_token *r = &s->rx[id];
++	s->rx_host[r->band]++;
++	if (pkt_forward(id, r->len, r->wcid, 0, r->band, 2, r->len, 0, 0))
++		buf_id_free(0, r->band, id);
++}
++static int dp_rx_policy(volatile struct kdp_shared *s, u16 id)
++{
++	volatile struct kdp_rx_token *r = &s->rx[id];
++	volatile struct kdp_sta *sta = &s->sta[r->wcid];
++	struct kdp_packet key;
++	u32 i, bucket, bridge, pass;
++	if (!r->offset || s->gate || !s->enabled || !sta->enabled ||
++	    !sta->authorized || (sta->cipher && !(r->flags & KDP_RX_PN)) ||
++	    sta->generation != r->generation ||
++	    sta->key_generation != r->key_generation ||
++	    !kdp_parse_packet((void *)(wifi_pkt_va(id) + r->offset),
++			     r->len - r->offset, &key))
++		return 0;
++	for (i = 0; i < 6; i++)
++		if (key.smac[i] != sta->addr[i])
++			return 0;
++	bridge = kdp_flow_bucket(key.smac, key.dmac, key.vlan, r->wcid);
++	bucket = kdp_flow_l4_bucket(bridge, key.src, key.dst, key.ports,
++				  key.protocol, key.type);
++	for (pass = 0; pass < 2; pass++) {
++		for (i = bucket; i < bucket + KDP_FLOW_WAYS; i++)
++			if (kdp_flow_matches(&s->flow[i], &key, s->session,
++					r->generation, r->key_generation, r->wcid,
++					r->band, r->bss))
++				return 1;
++		if (bucket == bridge)
++			break;
++		bucket = bridge;
++	}
++	return 0;
++}
++
++static void dp_rx_release(void *opaque, const struct kdp_mpdu *m)
++{
++	struct dp_rx_context *ctx = opaque;
++	volatile struct kdp_shared *s = ctx->s;
++	volatile struct kdp_rx_token *first = &s->rx[m->head];
++	volatile struct kdp_sta *sta = &s->sta[first->wcid];
++	u32 accepted = m->complete, n = 0;
++	u16 id = m->head;
++	if (first->generation != sta->generation ||
++	    first->key_generation != sta->key_generation || !sta->authorized) {
++		s->rx_stale[ctx->band]++;
++		accepted = 0;
++	}
++	if (accepted && m->encrypted) {
++		int ret = kdp_pn_accept(&sta->pn[first->tid], 1,
++			first->generation, first->key_generation, m->pn_low, m->pn_high);
++		if (ret != 1) {
++			if (!ret) s->rx_replay[ctx->band]++;
++			else s->rx_stale[ctx->band]++;
++			accepted = 0;
++		}
++	}
++	while (id != KDP_BA_NONE && n++ < m->count) {
++		volatile struct kdp_rx_token *r = &s->rx[id];
++		u16 next = r->next;
++		if (!accepted) {
++			dp_rx_drop(ctx, id);
++		} else {
++			r->flags |= KDP_RX_REORDERED | (m->encrypted ? KDP_RX_PN : 0);
++			KDP_BARRIER();
++			if (dp_rx_policy(s, id) &&
++			    !tdma_tx_submit(id, r->len - r->offset,
++					    wifi_pkt_va(id) + r->offset, r->band)) {
++				s->rx_ppe[r->band]++;
++				s->stats[r->band].rx_bytes += r->len - r->offset;
++			} else
++				dp_rx_host(s, id);
++		}
++		id = next;
++	}
++}
++static const struct kdp_reorder_ops dp_rx_ops = {
++	dp_rx_drop, dp_rx_link, dp_rx_release
++};
++
++static struct kdp_ba *dp_ba_find(volatile struct kdp_shared *s, u32 wcid, u32 tid)
++{
++	u32 index = s->ba_index[wcid][tid];
++	if (!index || index > KDP_BA_SESSIONS)
++		return 0;
++	if (s->ba[index - 1].wcid != wcid || s->ba[index - 1].tid != tid) {
++		s->fault = 12;
++		return 0;
++	}
++	return (void *)&s->ba[index - 1];
++}
++
++/* PARKED transaction only. Existing nodes are discarded before replacement;
++ * neither ADD/DELBA nor a port transition resets the key's replay counter. */
++void kite_dp_ba_set(u32 wcid, u32 tid, u32 ssn, u32 window)
++{
++	volatile struct kdp_shared *s = kite_dp_shared();
++	struct kdp_ba *ba;
++	struct dp_rx_context ctx;
++	u32 i;
++	if (!s || !wcid || wcid >= KDP_WCIDS || tid >= 8 || window > 256)
++		return;
++	ctx.s = s;
++	ctx.band = s->sta[wcid].band;
++	ba = dp_ba_find(s, wcid, tid);
++	if (!ba && window)
++		for (i = 0; i < KDP_BA_SESSIONS; i++)
++			if (!s->ba[i].wcid) {
++				ba = (void *)&s->ba[i];
++				break;
++			}
++	if (!ba) {
++		if (window) {
++			s->rx_unsupported[ctx.band]++;
++			s->sta[wcid].host_tids |= 1u << tid;
++		}
++		return;
++	}
++	kdp_ba_reset(ba, ssn, window, &dp_rx_ops, &ctx);
++	s->ba_index[wcid][tid] = window ? ba - (struct kdp_ba *)s->ba + 1 : 0;
++	ba->wcid = window ? wcid : 0;
++	ba->tid = tid;
++	ba->generation = s->sta[wcid].generation;
++	ba->key_generation = s->sta[wcid].key_generation;
++	s->sta[wcid].host_tids &= ~(1u << tid);
++}
++
++void kite_dp_sta_invalidate(u32 wcid)
++{
++	volatile struct kdp_shared *s = kite_dp_shared();
++	u32 tid;
++	if (!s || !wcid || wcid >= KDP_WCIDS)
++		return;
++	s->sta[wcid].enabled = 0;
++	KDP_BARRIER();
++	for (tid = 0; tid < 8; tid++)
++		kite_dp_ba_set(wcid, tid, 0, 0);
++}
++
++int kite_dp_rx(u32 token, u32 len, u32 band)
++{
++	volatile struct kdp_shared *s = kite_dp_shared();
++	volatile struct kdp_rx_token *r;
++	volatile struct kdp_sta *sta;
++	struct dp_rx_context ctx;
++	struct kdp_rxd rx;
++	struct kdp_ba *ba;
++	const u8 *p;
++	u32 wcid, tid;
++	if (!s || token >= KDP_RX_TOKENS || band > 1)
++		return 0;
++	r = &s->rx[token];
++	r->flags = KDP_RX_MAGIC;
++	r->generation = r->key_generation = 0;
++	r->len = len;
++	r->band = band;
++	r->offset = 0;
++	p = (void *)wifi_pkt_va(token);
++	if (len < 24 || (kdp_get_le32(p) >> 27) != 2)
++		return 0;
++	wcid = kdp_get_le32(p + 4) & 0x3ff;
++	tid = (kdp_get_le32(p + 8) >> 16) & 15;
++	if (!wcid || wcid >= KDP_WCIDS)
++		return 0;
++	sta = &s->sta[wcid];
++	r->generation = sta->generation;
++	r->key_generation = sta->key_generation;
++	r->wcid = wcid;
++	r->bss = kdp_get_le32(p + 8) & 63;
++	r->tid = tid;
++	if (!s->enabled || !sta->enabled || !sta->authorized ||
++	    sta->band != band || r->bss != sta->bss || tid > 7 ||
++	    (sta->host_tids & (1u << tid)))
++		return 0;
++	/* Non-QoS control/management traffic does not belong to the TID's BA
++	 * sequence space and must not permanently latch its data path to Linux. */
++	if ((kdp_get_le32(p + 4) & (1u << 14)) && len >= 40 &&
++	    (kdp_get_le32(p + 24) & 0xfcu) != 0x88u)
++		return 0;
++	ctx.s = s;
++	ctx.band = band;
++	ba = dp_ba_find(s, wcid, tid);
++	if (!kdp_parse_rxd(p, len, band, &rx) ||
++	    (rx.encrypted ? (sta->cipher != KDP_CIPHER_CCMP ||
++			    sta->keyid != rx.keyid || !sta->key_generation) : 0) ||
++	    (rx.format && !rx.offset)) {
++		/* A mixed unsupported stream cannot use two reorder authorities.
++		 * Flush queued complete MPDUs, then latch this TID to Linux until
++		 * a new BA transaction. Shared PN state still rejects replays. */
++		sta->host_tids |= 1u << tid;
++		if (ba)
++			for (u32 i = 0; i < ba->window; i++)
++				kdp_ba_release(ba, &dp_rx_ops, &ctx);
++		s->rx_unsupported[band]++;
++		return 0;
++	}
++	r->offset = rx.offset;
++	if (!ba || !ba->window) {
++		/* No BA means Linux also owns A-MSDU assembly. */
++		if (rx.format)
++			return 0;
++		struct kdp_mpdu single = {
++			.head=token, .tail=token, .count=1, .sn=rx.sequence,
++			.complete=1, .encrypted=rx.encrypted,
++			.pn_low=rx.low, .pn_high=rx.high,
++		};
++		r->next = KDP_BA_NONE;
++		dp_rx_release(&ctx, &single);
++		return 1;
++	}
++	kdp_ba_enqueue(ba, token, rx.sequence, rx.format, rx.encrypted,
++		       rx.low, rx.high, KITE_TICK, &dp_rx_ops, &ctx);
++	return 1;
++}
++
++void kite_dp_rx_timeout(u32 band)
++{
++	volatile struct kdp_shared *s = kite_dp_shared();
++	struct dp_rx_context ctx = { s, band };
++	u32 i;
++	if (!s)
++		return;
++	for (i = 0; i < KDP_BA_SESSIONS; i++) {
++		struct kdp_ba *b = (void *)&s->ba[i];
++		if (b->wcid && s->sta[b->wcid].band == band)
++			kdp_ba_timeout(b, KITE_TICK, wifi_flushone_timeout, &dp_rx_ops, &ctx);
++	}
++}
++
++u32 kite_dp_rx_metadata(u32 token, u32 *generation, u32 *key_generation)
++{
++	volatile struct kdp_shared *s = kite_dp_shared();
++	if (!s || token >= KDP_RX_TOKENS)
++		return 0;
++	*generation = s->rx[token].generation;
++	*key_generation = s->rx[token].key_generation;
++	return s->rx[token].flags;
++}
++void kite_dp_rx_return(u32 token)
++{
++	volatile struct kdp_shared *s = kite_dp_shared();
++	if (!s || token >= KDP_RX_TOKENS)
++		return;
++	s->rx[token].flags |= KDP_RX_PPE_RETURN;
++	s->rx_miss[s->rx[token].band]++;
++}
++
++/* Caller has both RX-worker acknowledgements; hart3 owns only detached
++ * host chains. Keep the negotiated BA window/head, discard every old MPDU. */
++void kite_dp_rx_discard_all(void)
++{
++	volatile struct kdp_shared *s = kite_dp_shared();
++	u32 i;
++	if (!s) return;
++	for (i = 0; i < KDP_BA_SESSIONS; i++) {
++		struct kdp_ba *ba = (void *)&s->ba[i];
++		struct dp_rx_context ctx = { s, ba->wcid ? s->sta[ba->wcid].band : 0 };
++		if (ba->wcid)
++			kdp_ba_reset(ba, ba->head, ba->window, &dp_rx_ops, &ctx);
++	}
++}
++int kite_dp_rx_empty(void)
++{
++	volatile struct kdp_shared *s = kite_dp_shared();
++	u32 i, j;
++	if (!s) return 1;
++	for (i = 0; i < KDP_BA_SESSIONS; i++)
++		for (j = 0; j < KDP_BA_SLOTS; j++)
++			if (s->ba[i].slot[j].count) return 0;
++	return 1;
++}
++#endif
+--- a/npu_kite_tx.c
++++ b/npu_kite_tx.c
+@@ -7,12 +7,14 @@
+ #include "npu_wifi.h"
+ #include "kite-control.h"
+ #include "kite-tx.h"
++#include "kite-datapath-fw.h"
+ #if defined(AN7581) && defined(MT7916)
+ #define tx_fence() __asm__ volatile("fence iorw,iorw" ::: "memory")
+ struct kite_tx_ring {
+ 	volatile struct kite_tx_shared *volatile s;
+ 	volatile struct kite_tx_desc *ring;
+ 	u32 reg, session, epoch, producer, completed;
++	u32 hw_producer, hw_completed;
+ };
+ static struct kite_tx_ring tx[2];
+ _Static_assert(sizeof(struct kite_tx_shared) == KITE_TX_BYTES, "TX ABI size");
+@@ -25,6 +27,31 @@
+ {
+ 	return a < b + blen && b < a + alen;
+ }
++int kite_tx_dp_range(u32 pa, u32 bytes)
++{
++	u32 i, other;
++
++	if (!kite_tx_range(pa, bytes))
++		return 0;
++	other = (wifi_dram_ba_node_addr & 0x3fffffffu) | 0x80000000u;
++	if (tx_overlap(pa, bytes, other, 0x200000))
++		return 0;
++	other = (wifi_pkt_buf_addr & 0x3fffffffu) | 0x80000000u;
++	if (!wifi_pkt_buf_addr || tx_overlap(pa, bytes, other, 5600u * 4096u))
++		return 0;
++	for (i = 0; i < 2; i++) {
++		if (!tx[i].s)
++			continue;
++		other = ((u32)tx[i].s & 0x3fffffffu) | 0x80000000u;
++		if (tx_overlap(pa, bytes, other, KITE_TX_BYTES))
++			return 0;
++		other = ((u32)tx[i].ring & 0x3fffffffu) | 0x80000000u;
++		if (tx_overlap(pa, bytes, other, KITE_TX_COUNT * 16))
++			return 0;
++	}
++	return kite_host_dp_range(pa, bytes);
++}
++
+ int kite_tx_bind(u32 session, u32 epoch, const u32 *a)
+ {
+ 	u32 b = a[0], pa = a[1], ring = a[2], reg = a[3], i, ba;
+@@ -74,6 +101,7 @@
+ 	tx[b].session = session;
+ 	tx[b].epoch = epoch;
+ 	tx[b].producer = tx[b].completed = 0;
++	tx[b].hw_producer = tx[b].hw_completed = 0;
+ 	tx_fence();
+ 	tx[b].s = s;
+ 	tx_fence();
+@@ -102,6 +130,24 @@
+ 	return !d->info && (d->ctrl & 0xc000c000u) == 0x4000u &&
+ 	       kite_tx_range(d->buf0, n0) && kite_tx_range(d->buf1, n1);
+ }
++/* Owner values below KITE_TX_COUNT are host input indices; higher values
++ * name a PPE token. Never release payloads from this descriptor ledger. */
++static int kite_tx_push(struct kite_tx_ring *t, const struct kite_tx_desc *v,
++		       u16 owner)
++{
++	u32 i = t->hw_producer, next = (i + 1) & KITE_TX_MASK;
++	if (next == t->hw_completed)
++		return 0;
++	t->s->owner[i] = owner;
++	t->ring[i].buf0 = v->buf0;
++	t->ring[i].buf1 = v->buf1;
++	t->ring[i].info = v->info;
++	tx_fence();
++	t->ring[i].ctrl = v->ctrl;
++	t->hw_producer = next;
++	return 1;
++}
++
+ static void kite_tx_step(u32 b)
+ {
+ 	struct kite_tx_ring *t = &tx[b];
+@@ -122,17 +168,34 @@
+ 		s->fault = KITE_TX_FAULT_INDEX;
+ 		return;
+ 	}
+-	used = kite_tx_distance(t->producer, t->completed);
+-	n = kite_tx_distance(d, t->completed);
++	used = kite_tx_distance(t->hw_producer, t->hw_completed);
++	n = kite_tx_distance(d, t->hw_completed);
+ 	if (n > used) {
+ 		s->fault = KITE_TX_FAULT_INDEX;
+ 		return;
+ 	}
+-	s->reaped += n;
+-	t->completed = d;
+-	s->completed = d;
+-	/* Host ring capacity uses HW dma_idx, so producer must never lap it. */
+-	if (kite_tx_distance(p, d) < kite_tx_distance(t->producer, d)) {
++	while (t->hw_completed != d) {
++		u16 owner = t->s->owner[t->hw_completed];
++		if (owner >= KITE_TX_COUNT) {
++			kite_dp_tx_dma_done(owner - KITE_TX_COUNT);
++			s->ppe_reaped++;
++		} else {
++			if (owner != t->completed) {
++				s->fault = KITE_TX_FAULT_INDEX;
++				return;
++			}
++			t->completed = (owner + 1) & KITE_TX_MASK;
++			s->reaped++;
++		}
++		t->hw_completed = (t->hw_completed + 1) & KITE_TX_MASK;
++	}
++	tx_fence();
++	s->hw_completed = t->hw_completed;
++	s->completed = t->completed;
++	/* Host capacity is released only by actual WFDMA completion of its
++	 * descriptors, never just by copying them out of the input ring. */
++	if (kite_tx_distance(p, t->completed) <
++	    kite_tx_distance(t->producer, t->completed)) {
+ 		s->fault = KITE_TX_FAULT_INDEX;
+ 		return;
+ 	}
+@@ -149,26 +212,38 @@
+ 			s->fault = KITE_TX_FAULT_DESC;
+ 			break;
+ 		}
+-		t->ring[idx].buf0 = v.buf0;
+-		t->ring[idx].buf1 = v.buf1;
+-		t->ring[idx].info = v.info;
+-		t->ring[idx].ctrl = v.ctrl;
++		if (!kite_tx_push(t, &v, idx))
++			break;
+ 		t->producer = (idx + 1) & KITE_TX_MASK;
+ 		s->submitted++;
+ 		if (!t->producer)
+ 			s->wraps++;
+ 	}
+-	/* Publish valid prefix even if a later descriptor was malformed. A
+-  * fault never returns an uncompleted token or switches to a host writer.
+-  */
+-	tx_fence();
+-	if (s->published != t->producer) {
+-		REG32(t->reg + 8) = t->producer;
++	/* Bounded service for both producers. Host control traffic always gets
++	 * the first batch; PPE packets use remaining hardware capacity. */
++	if (!s->fault) {
++		for (n = 0; n < KITE_TX_BUDGET; n++) {
++			struct kite_tx_desc v;
++			u16 token;
++			if (((t->hw_producer + 1) & KITE_TX_MASK) == t->hw_completed)
++				break;
++			if (!kite_dp_tx_next(b, &v, &token))
++				break;
++			/* Ring capacity was checked; hart4 is its only producer. */
++			kite_tx_push(t, &v, KITE_TX_COUNT + token);
++			kite_dp_tx_commit(b, token);
++			s->ppe_submitted++;
++		}
++	}
++	tx_fence();
++	if (s->hw_producer != t->hw_producer) {
++		REG32(t->reg + 8) = t->hw_producer;
+ 		tx_fence();
+-		if (REG32(t->reg + 8) != t->producer)
++		if (REG32(t->reg + 8) != t->hw_producer)
+ 			s->fault = KITE_TX_FAULT_MMIO;
+-		s->published = t->producer;
+-	}
++		s->hw_producer = t->hw_producer;
++	}
++	s->published = t->producer;
+ 	tx_fence();
+ }
+ void kite_tx_loop(void)
+@@ -178,8 +253,20 @@
+ 		npu_dbg_poll();
+ 		if (kite_ctl_pausepoint(4))
+ 			continue;
++		kite_dp_tx_reap();
+ 		kite_tx_step(0);
+ 		kite_tx_step(1);
+ 	}
+ }
+ #endif
++
++#if defined(AN7581) && defined(MT7916)
++int kite_tx_dma_stopped(void)
++{
++	u32 b;
++	for (b = 0; b < 2; b++)
++		if (tx[b].reg && (REG32((tx[b].reg & ~0xfffu) + 0x208) & 0xfu))
++			return 0;
++	return 1;
++}
++#endif
+--- a/npu_tdma.c
++++ b/npu_tdma.c
+@@ -8,6 +8,9 @@
+ 
+ #include "npu_internal.h"
+ #include "npu_wifi.h"
++#if defined(AN7581) && defined(MT7916)
++#include "kite-datapath-fw.h"
++#endif
+ 
+ 
+ /* ================================================================
+@@ -514,14 +517,16 @@
+ 		kite_tdma_returned[band]++;
+ 		__asm__ volatile("fence iorw,iorw" ::: "memory");
+ 		if (v & PPE_WIFI_BUF_FREE) {
++			volatile struct kdp_shared *dp = kite_dp_shared();
++			if (dp) dp->rx_free[band]++;
+ 			buf_id_free(0, band, id);
+ 			wifi_cnt_inc(2, 4);
+ 		} else {
+ 			/* INFO is still WCID/A-MSDU metadata, never a FOE slot. */
+ 			wifi_cnt_inc(2, 8);
+-			if ((info & PPE_WIFI_BUF_WCID) >= 544 ||
+-			    pkt_forward_kite_return(id, info & PPE_WIFI_BUF_WCID,
+-					    (info >> 16) & 31, band) != 0) {
++			if (pkt_forward_kite_return(id,
++				REG32(wifi_pkt_va(id) + 4) & 0x3ff,
++				(info >> 16) & 31, band) != 0) {
+ 				buf_id_free(0, band, id);
+ 				wifi_cnt_inc(2, 12);
+ 			}
+@@ -614,8 +619,15 @@
+ 	plic_register_isr(95, kite_ppe_return_isr);
+ 	REG32(TDMA_FC_CFG2) = 3;
+ #endif
++	/* Buffer RXD layout follows the Wi-Fi family, not the AN7581 CPU.
++	 * The upstream AN7581 stock image is Eagle; Kite needs its own mode. */
++#ifdef WIFI_KITE
+ 	REG32(TDMA_WIFI_BUF_CFG) =
+-		(REG32(TDMA_WIFI_BUF_CFG) & 0xFFF300FF) | 0x190100;
++		(REG32(TDMA_WIFI_BUF_CFG) & 0xFFF300FF) | 0x590100;
++#else
++	REG32(TDMA_WIFI_BUF_CFG) =
++		(REG32(TDMA_WIFI_BUF_CFG) & 0xFFB300FF) | 0x190100;
++#endif
+ }
+ #endif /* AN7581 */
+ 
+--- a/npu_wifi_ba.c
++++ b/npu_wifi_ba.c
+@@ -7,6 +7,9 @@
+ #include "npu_wifi.h"
+ #include "kite-host.h"
+ #include "kite_rxd.h"
++#if defined(AN7581) && defined(MT7916)
++#include "kite-datapath-fw.h"
++#endif
+ 
+ #ifdef WIFI_KITE
+ 
+@@ -384,6 +387,12 @@
+ 	u32 wcid, tid;
+ 	u32 *e;
+ 
++#if defined(AN7581) && defined(MT7916)
++	if (kite_dp_bound()) {
++		kite_dp_rx_timeout(band);
++		return;
++	}
++#endif
+ 	for (wcid = 1; wcid <= max; wcid++) {
+ 		for (tid = 0; tid < 8; tid++) {
+ 			e = ba_band_entry(band, wcid, tid);
+--- a/npu_wifi_fwd.c
++++ b/npu_wifi_fwd.c
+@@ -8,6 +8,9 @@
+ #include "kite-control.h"
+ #include "kite-host.h"
+ #include "kite_rxd.h"
++#if defined(AN7581) && defined(MT7916)
++#include "kite-datapath-fw.h"
++#endif
+ 
+ 
+ /* per-band per-queue stats: 16 queues x u64 */
+@@ -30,6 +33,11 @@
+ 	u32 w0 = len >= 4 ? kite_get_le32(p) : 0;
+ 	u32 generation = 0, key_generation = 0;
+ 	u32 reason = KITE_HOST_META_MALFORMED;
++#if defined(AN7581) && defined(MT7916)
++	if (kite_dp_bound())
++		return kite_dp_rx_metadata(buf_id, &generation, &key_generation);
++#endif
++
+ 
+ 	/* SEC_MODE is encryption evidence. NON_AMPDU, NDATA, NULL, FRAG,
+ 	 * MU_BAR and RX error bits are not. This counter is observational;
+@@ -240,6 +248,13 @@
+ 	}
+ 	if (sum != total)
+ 		return 1;
++#if defined(AN7581) && defined(MT7916)
++	/* total exceeds the secure parser's contiguous-buffer limit. Capture
++	 * this frame's epochs and force the entire affected BA stream to host;
++	 * never reuse PN proof left by an earlier owner of ids[0]. */
++	if (kite_dp_bound())
++		kite_dp_rx(ids[0], total, band);
++#endif
+ 	__asm__ volatile("fence iorw,iorw" ::: "memory");
+ 	for (i = 0; i < n; i++) {
+ 		*(u32 *)nodes[i] = ids[i];
+@@ -284,6 +299,7 @@
+ 	if (len < 24 || len > 3500 || ((w0 >> 27) & 31) != 2 ||
+ 	    (w1 & 0x3ff) != wcid || ((w1 >> 28) & 1) != band)
+ 		return -1;
++	kite_dp_rx_return(buf_id);
+ 	return pkt_forward(buf_id, len, wcid, info, band, 2, len, 0, 1);
+ }
+ #endif
+--- a/npu_wifi_rx.c
++++ b/npu_wifi_rx.c
+@@ -6,6 +6,9 @@
+ #include "npu_internal.h"
+ #include "npu_wifi.h"
+ #include "kite_rxd.h"
++#if defined(AN7581) && defined(MT7916)
++#include "kite-datapath-fw.h"
++#endif
+ 
+ #ifdef WIFI_KITE
+ 
+@@ -47,7 +50,7 @@
+ 
+ u32 wifi_pipeline_base;
+ #if MAX_CORE_NUM > 2
+-static u16 wifi_pipeline_widx;
++static u16 wifi_pipeline_widx, wifi_pipeline_ridx;
+ #endif
+ static u8 rxd_2g_kick;
+ 
+@@ -243,6 +246,12 @@
+ 	u16 idx = 0xFFFF;
+ 	s32 hdr, fs;
+ 
++	npu_memset(&pn, 0, sizeof(pn));
++
++#if defined(AN7581) && defined(MT7916)
++	if (kite_dp_bound())
++		return kite_dp_rx(buf_id, len, band) ? -1 : buf_id;
++#endif
+ 	if (wifi_no_ba_test != 0 && !kite_ctl_active()) {
+ 		hdr = kite_rx_hdr_len(buf_id, len, band);
+ 		if (hdr == -1)
+@@ -475,6 +484,12 @@
+ 	struct kite_node pn;
+ 	s32 hdr;
+ 
++	npu_memset(&pn, 0, sizeof(pn));
++
++#if defined(AN7581) && defined(MT7916)
++	if (kite_dp_bound())
++		return kite_dp_rx(buf_id, len, band) ? -1 : buf_id;
++#endif
+ 	if (wifi_no_ba_test != 0 && !kite_ctl_active()) {
+ 		hdr = kite_rx_hdr_len(buf_id, len, band);
+ 		if (hdr == -1)
+@@ -497,6 +512,7 @@
+ 	struct kite_node pn;
+ 	u32 e, last;
+ 
++	npu_memset(&pn, 0, sizeof(pn));
+ 	if (wifi_no_ba_test != 0 || (wifi_debug_flags & 4))
+ 		return kite_classify(buf_id, len, band);
+ 	if (kite_rx_parse(buf_id, &pn, len, band) == -1)
+@@ -634,6 +650,10 @@
+ 		off += frag;
+ 		idx = (idx >= KITE_RX_RING_LAST) ? 0 : idx + 1;
+ 	}
++#if defined(AN7581) && defined(MT7916)
++	if (kite_dp_bound() && kite_dp_rx(id, len, band))
++		goto out;
++#endif
+ 	if (pkt_forward(id, len & 0xFFFF, 0, 0, band, 2, len & 0xFFFF,
+ 			0, 0) != 0)
+ 		buf_id_free(0, band, (u16)id);
+@@ -906,7 +926,6 @@
+ static void __attribute__((noreturn)) kite_pipeline_worker(void)
+ {
+ 	volatile u32 *slot;
+-	u16 ridx = 0;
+ 	s32 id, r;
+ 	u16 len;
+ 
+@@ -927,13 +946,13 @@
+ 			ba_timeout_scan(1);
+ 			rxd_5g_flush_tick = KITE_TICK;
+ 		}
+-		slot = (volatile u32 *)(wifi_pipeline_base + ridx * 8);
++		slot = (volatile u32 *)(wifi_pipeline_base + wifi_pipeline_ridx * 8);
+ 		id = (s32)*slot;
+ 		if (id == -1)
+ 			continue;
+ 		__asm__ volatile("fence iorw,iorw" ::: "memory");
+ 		len = *(volatile u16 *)(slot + 1);
+-		ridx = (ridx + 1 == KITE_PIPE_ENTRIES) ? 0 : ridx + 1;
++		wifi_pipeline_ridx = (wifi_pipeline_ridx + 1 == KITE_PIPE_ENTRIES) ? 0 : wifi_pipeline_ridx + 1;
+ 		*(volatile u16 *)(slot + 1) = 0;
+ 		__asm__ volatile("fence iorw,iorw" ::: "memory");
+ 		*slot = (u32)-1;
+@@ -1004,3 +1023,53 @@
+ {
+ 	npu_dbg_idle();
+ }
++
++#if defined(AN7581) && defined(MT7916)
++/* A PARK acknowledgement alone does not identify unread frames' epochs.
++ * This command is allowed only after ARM physically disables WFDMA RX.
++ * Discard descriptor contents without freeing the buffers that still belong
++ * to the hardware ring, then synchronize the next software consumer index. */
++int kite_wifi_rx_purge(void)
++{
++	u32 b, i, reg, ring, next[2];
++	for (b = 0; b < 2; b++) {
++		reg = b ? pcie_base_5g : pcie_base_2g;
++		if (!(b ? rxd_5g_init_done : rxd_2g_init_done)) continue;
++		if (!reg || (REG32((reg & ~0xfffu) + 0x208) & 12u)) return 0;
++		next[b] = REG32(reg + 12);
++		if (next[b] > KITE_RX_RING_LAST) return 0;
++	}
++	for (b = 0; b < 2; b++) {
++		reg = b ? pcie_base_5g : pcie_base_2g;
++		ring = b ? rxd_base_5g : rxd_base_2g;
++		if (!(b ? rxd_5g_init_done : rxd_2g_init_done)) continue;
++		for (i = 0; i <= KITE_RX_RING_LAST; i++)
++			REG32(ring + i * 16 + 4) = KITE_RX_BUF_LEN << 16;
++		__asm__ volatile("fence iorw,iorw" ::: "memory");
++		if (REG32(reg + 12) != next[b]) return 0;
++		if (b) rxd_5g_cpu_idx = next[b];
++		else { rxd_2g_cpu_idx = next[b]; rxd_2g_kick = 0; }
++		REG32(reg + 8) = next[b] ? next[b] - 1 : KITE_RX_RING_LAST;
++	}
++	kite_wifi_pipeline_discard();
++	return 1;
++}
++#endif
++
++#if defined(AN7581) && defined(MT7916)
++void kite_wifi_pipeline_discard(void)
++{
++	u32 i;
++	if (!wifi_pipeline_base) return;
++	for (i = 0; i < KITE_PIPE_ENTRIES; i++) {
++		volatile u32 *p = (void *)(wifi_pipeline_base + i * 8);
++		if (p[0] != 0xffffffffu) {
++			buf_id_free(0, 1, p[0]);
++			p[0] = 0xffffffffu;
++			p[1] = 0;
++		}
++	}
++	wifi_pipeline_widx = wifi_pipeline_ridx = 0;
++	__asm__ volatile("fence iorw,iorw" ::: "memory");
++}
++#endif

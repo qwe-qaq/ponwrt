@@ -1,0 +1,365 @@
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -26,6 +26,7 @@
+ #define KDP_TOKEN_BASE (KDP_TOKEN_LIMIT - KDP_TOKENS)
+ #define KDP_BUFFER_BYTES 2048u
+ #define KDP_TXWI_BYTES 128u
++#define KDP_TXWI_DMA_BYTES 76u /* connac2 TXD32 + firmware TXP44 */
+ #define KDP_PN_SPINS 4096u
+ #define KDP_CIPHER_CCMP 0x000fac04u
+ 
+@@ -196,6 +197,10 @@
+ 
+ /* ABI5 appends diagnostics only. All existing DMA offsets stay unchanged.
+  * TX/bridge fields have hart4 as their sole writer; host_hold has hart3. */
++/* r66 observation extension, unchanged layout: service.seq protects
++ * quality[0].reserved={pressure_requests,coalesced,cycles},
++ * quality[1].reserved={pressure_max_cycles,snapshot_cycles,snapshot_max_cycles}.
++ * Available only when perf.reserved[5] (service revision) >= 3. */
+ struct kdp_quality_stats {
+ 	unsigned int gate_drop, disabled_drop, sta_disabled_drop;
+ 	unsigned int unauthorized_drop, blocked_drop, identity_drop;
+@@ -472,12 +477,12 @@
+  t->queue = wmm * 4;
+  return 1;
+ }
+-static inline void kdp_write_txwi_validated(unsigned char *p, const struct kdp_txwi_template *t,
++static inline void kdp_write_txwi_dma(unsigned char *p, const struct kdp_txwi_template *t,
+  unsigned int pa, unsigned int len, unsigned int token, unsigned int tid, unsigned int amsdu)
+ {
+  static const unsigned char queue[8] = {1, 0, 0, 1, 2, 2, 3, 3};
+  volatile kdp_word *d = (void *)p;
+- /* Full overwrite, including reserved words: no DMA-mutation assumption. */
++ /* Overwrite every DMA-visible word, including all reserved TXP slots. */
+  d[0] = (len + 32) | ((t->queue + queue[tid]) << 25);
+  d[1] = t->w1 | (tid << 20); d[2] = t->w2; d[3] = t->w3;
+  d[4] = 0; d[5] = 1; d[6] = 0; /* native NO_SKB, not NO_ACK/WED */
+@@ -486,7 +491,15 @@
+  d[9] = t->w9; d[10] = pa;
+  d[11] = 0; d[12] = 0; d[13] = 0; d[14] = 0; d[15] = 0;
+  d[16] = len;
+- d[17] = 0; d[18] = 0; d[19] = 0; d[20] = 0; d[21] = 0;
++ d[17] = 0; d[18] = 0;
++}
++/* Checked/public callers retain the full 128-byte buffer contract. */
++static inline void kdp_write_txwi_validated(unsigned char *p, const struct kdp_txwi_template *t,
++ unsigned int pa, unsigned int len, unsigned int token, unsigned int tid, unsigned int amsdu)
++{
++ volatile kdp_word *d = (void *)p;
++ kdp_write_txwi_dma(p,t,pa,len,token,tid,amsdu);
++ d[19] = 0; d[20] = 0; d[21] = 0;
+  d[22] = 0; d[23] = 0; d[24] = 0; d[25] = 0; d[26] = 0;
+  d[27] = 0; d[28] = 0; d[29] = 0; d[30] = 0; d[31] = 0;
+ }
+--- a/kite-observe.inc
++++ b/kite-observe.inc
+@@ -30,13 +30,20 @@
+  while (i < 7 && ticks > dp_age_limit[i]) i++;
+  dp_r59.band[band].age[kind][i]++;
+ }
+-static u32 dp_pressure_armed;
++static u32 dp_pressure_armed, dp_pressure_at, dp_pressure_period, dp_pressure_valid, dp_pressure_due;
++static u32 dp_diag[6] __attribute__((section(".kite_observe")));
+ static u32 dp_observe_tick(void);
+ static u32 dp_born[KDP_TOKENS] __attribute__((section(".kite_observe")));
+ static void dp_pressure(u32 peak)
+ {
+- u32 i, now;
++ u32 i, now, start, elapsed;
+  if (!peak && !dp_pressure_armed) return;
++ dp_diag[0]++;
++ start = csr_read(mcycle);
++ if (dp_pressure_valid && (u32)(start-dp_pressure_at)<dp_pressure_period) {
++  dp_diag[1]++; dp_pressure_due=1; return;
++ }
++ dp_pressure_at=start; dp_pressure_valid=1; dp_pressure_due=0;
+  if (!peak) dp_pressure_armed = 0;
+  dp_r63.pressure_tick=dp_observe_tick();
+  dp_tune.pressure_events++; dp_tune.pressure_pending = dp_wait_count;
+@@ -46,7 +53,7 @@
+  for (i = 0; i < KDP_TOKENS; i++) {
+   u32 pending = !!(dp_pending[i >> 5] & (1u << (i & 31)));
+   if (pending != (dp->token[i].state == KDP_TOKEN_WIFI)) {
+-   dp_tune.bitmap_fault++; dp->fault = 4; return;
++   dp_tune.bitmap_fault++; dp->fault = 4; break;
+   }
+   if (!pending) continue;
+   volatile struct kdp_token *t = &dp->token[i];
+@@ -56,6 +63,8 @@
+   dp_tune.ready_wait += dma == seq && wa == seq;
+   if (age > dp_tune.oldest_ticks) dp_tune.oldest_ticks = age;
+  }
++ elapsed=(u32)csr_read(mcycle)-start; dp_diag[2]+=elapsed;
++ if (elapsed>dp_diag[3]) dp_diag[3]=elapsed;
+ }
+ /* perf.reserved[0..5]: submit samples/cycles/packets, other samples/cycles,
+  * revision. Published under service.seq; ABI8 layout is unchanged. */
+@@ -66,7 +75,7 @@
+ }
+ static u32 dp_observe_needs_init, dp_prepare_at[2];
+ static u32 dp_loop_stamp, dp_loop_sent, dp_loop_sampling;
+-static u32 dp_observe_mask, dp_observe_loop, dp_observe_published;
++static u32 dp_observe_mask, dp_observe_loop, dp_observe_published, dp_snapshot_poll;
+ static u32 dp_observe_serial[2];
+ struct dp_observe_token {
+  u32 start, ready_at, prepare_at, wire_at;
+@@ -138,8 +147,10 @@
+  npu_memset(&dp_r59, 0, sizeof(dp_r59)); dp_r59.revision = 59;
+  { static const u32 us[7] = {64,256,1000,4000,16000,64000,256000};
+    for (u32 i = 0; i < 7; i++) dp_age_limit[i] = us[i] * cpu_clock_get() / 256; }
+- dp_pressure_armed = 1;
+- dp_load[5] = 2; /* service interval starts after the PARK/resume check */
++ dp_pressure_armed = 1; dp_pressure_valid=dp_pressure_due=0;
++ dp_pressure_period=cpu_clock_get()*250000u; /* at most four full proofs/s */
++ npu_memset(dp_diag,0,sizeof(dp_diag));
++ dp_load[5] = 3; /* service interval starts after the PARK/resume check */
+  dp_observe_needs_init = 0;
+  npu_memset(dp_observe_tokens, 0, sizeof(dp_observe_tokens));
+  npu_memset(dp_observe_active, 0, sizeof(dp_observe_active));
+@@ -148,7 +159,7 @@
+  dp_obs.sample_shift = dp->perf.sample_shift;
+  dp_obs.clock_mhz = cpu_clock_get();
+  dp_observe_mask = dp_obs.sample_shift ? (1u << dp_obs.sample_shift) - 1 : 0;
+- dp_observe_loop = 0;
++ dp_observe_loop = dp_snapshot_poll = 0;
+  dp_observe_published = csr_read(mcycle);
+  npu_memcpy((void *)&dp->observe, &dp_obs, sizeof(dp_obs));
+ }
+@@ -276,19 +287,25 @@
+   dp_observe_active[token >> 5] &= ~(1u << (token & 31));
+  }
+ }
++static void dp_snapshot_words(volatile void *dst, const void *src, u32 bytes)
++{
++ volatile kdp_word *d=dst; const kdp_word *s=src;
++ for (u32 i=0;i<bytes/sizeof(*d);i++) d[i]=s[i];
++}
+ void kite_dp_observe_snapshot(void)
+ {
+- u32 seq;
++ u32 seq, start, elapsed;
+  if (!dp || dp_observe_needs_init) return;
+- dp_observe_published = csr_read(mcycle);
++ start = csr_read(mcycle);
++ dp_observe_published = start;
+  dp_obs.publishes++;
+  seq=dp->r63.seq+1; dp->r63.seq=seq; KDP_BARRIER();
+  dp->r63.tick=dp_observe_tick(); dp->r63.pressure_tick=dp_r63.pressure_tick;
+- npu_memcpy((void *)dp->r63.band,dp_r63.band,sizeof(dp_r63.band));
++ dp_snapshot_words((void *)dp->r63.band,dp_r63.band,sizeof(dp_r63.band));
+  KDP_BARRIER(); dp->r63.seq=seq+1;
+  /* All performance[] writers are hart4. Stats may lag one publication;
+   * tx_sent/freed, gate/fault and DMA/WA proof remain immediate. */
+- npu_memcpy((void *)dp->performance, dp_performance, sizeof(dp_performance));
++ dp_snapshot_words((void *)dp->performance, dp_performance, sizeof(dp_performance));
+  dp->perf.alloc_probe = dp_account.alloc_probe;
+  dp->perf.alloc_empty = dp_account.alloc_empty;
+  dp->perf.reap_probe = dp_account.reap_probe;
+@@ -298,28 +315,34 @@
+  seq = dp->tuning.stats.seq + 1;
+  dp->tuning.stats.seq = seq;
+  KDP_BARRIER();
+- npu_memcpy((void *)&dp->tuning.stats.pending_peak, &dp_tune.pending_peak,
++ dp_snapshot_words((void *)&dp->tuning.stats.pending_peak, &dp_tune.pending_peak,
+             sizeof(dp_tune) - sizeof(dp_tune.seq));
+  KDP_BARRIER();
+  dp->tuning.stats.seq = seq + 1;
+  seq = dp->r59.seq + 1; dp->r59.seq = seq; KDP_BARRIER();
+- npu_memcpy((void *)&dp->r59.revision, &dp_r59.revision, sizeof(dp_r59) - 4);
++ dp_snapshot_words((void *)&dp->r59.revision, &dp_r59.revision, sizeof(dp_r59) - 4);
+  KDP_BARRIER(); dp->r59.seq = seq + 1;
+  seq = dp->observe.seq + 1;
+  dp->observe.seq = seq;
+  KDP_BARRIER();
+- npu_memcpy((void *)&dp->observe.sample_shift, &dp_obs.sample_shift,
++ dp_snapshot_words((void *)&dp->observe.sample_shift, &dp_obs.sample_shift,
+             sizeof(dp_obs) - sizeof(dp_obs.seq));
+  KDP_BARRIER();
+  dp->observe.seq = seq + 1;
+  seq = dp->service.seq + 1;
+  dp->service.seq = seq;
+  KDP_BARRIER();
+- npu_memcpy((void *)dp->perf.reserved, dp_load, sizeof(dp_load));
+- npu_memcpy((void *)&dp->service.loop_samples, &dp_service.loop_samples,
++ dp_snapshot_words((void *)dp->perf.reserved, dp_load, sizeof(dp_load));
++ dp_snapshot_words((void *)&dp->service.loop_samples, &dp_service.loop_samples,
+             sizeof(dp_service) - sizeof(dp_service.seq));
+  KDP_BARRIER();
+- dp->service.seq = seq + 1;
++ /* Cost includes previous copies/fences, excludes this six-word report.
++  * Outer loop timing still includes the entire snapshot, when sampled. */
++ elapsed=(u32)csr_read(mcycle)-start; dp_diag[4]+=elapsed;
++ if (elapsed>dp_diag[5]) dp_diag[5]=elapsed;
++ dp_snapshot_words((void *)dp->quality[0].reserved,dp_diag,12);
++ dp_snapshot_words((void *)dp->quality[1].reserved,dp_diag+3,12);
++ KDP_BARRIER(); dp->service.seq = seq + 1;
+ }
+ void kite_dp_observe_poll(void)
+ {
+@@ -329,10 +352,15 @@
+  dp_observe_loop++;
+  dp_observe_sample[0] = dp_observe_sample[1] =
+   dp_observe_mask && !(dp_observe_loop & dp_observe_mask);
+- /* Check publication only every 64 worker passes; ~93ms at 720MHz.
+-  * Counter values are always local until this bounded snapshot copy. */
+- if (dp_observe_loop & 63u) return;
++ /* 67 is coprime to all supported sampling periods. Do not force every
++  * snapshot into a profiled loop, or move it outside the outer timer. */
++ if (++dp_snapshot_poll < 67) return;
++ dp_snapshot_poll=0;
+  now = csr_read(mcycle);
++ /* A retained full head skips allocation retries. A deferred full proof
++  * must still run, even without another allocator/peak event. */
++ if (dp_pressure_due && (u32)(now-dp_pressure_at)>=dp_pressure_period)
++  dp_pressure(1);
+  if ((u32)(now - dp_observe_published) < (1u << 26)) return;
+  kite_dp_observe_snapshot();
+ }
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -20,7 +20,7 @@
+ static u16 dp_freeq[KDP_TOKENS];
+ static u32 dp_free_head, dp_free_tail, dp_free_count;
+ static u32 dp_wait_count, dp_scan_left, dp_scan_at, dp_overflow_seen;
+-static u32 dp_batch_valid, dp_publish_limit;
++static u32 dp_batch_valid, dp_publish_limit, dp_perf_flags;
+ static u32 dp_pending[KDP_TOKENS / 32];
+ static u32 dp_ba_request, dp_ba_wcid, dp_ba_tids;
+ static u32 dp_ba_generation, dp_ba_key_generation;
+@@ -151,7 +151,7 @@
+ static int dp_alloc_token(void)
+ {
+ 	u32 i;
+-	if (dp->perf.flags & KDP_PERF_TOKENQ) {
++	if (dp_perf_flags & KDP_PERF_TOKENQ) {
+ 		u32 t;
+ 		if (!dp_free_count) {
+ 			dp_account.alloc_empty++;
+@@ -198,7 +198,7 @@
+ 	}
+ 	KDP_BARRIER();
+ 	dp->token[id].state = KDP_TOKEN_FREE;
+-	if (dp->perf.flags & KDP_PERF_TOKENQ) {
++	if (dp_perf_flags & KDP_PERF_TOKENQ) {
+ 		dp_freeq[dp_free_tail] = id;
+ 		dp_free_tail = (dp_free_tail + 1) % KDP_TOKENS;
+ 	}
+@@ -250,6 +250,10 @@
+ 	dp_alloc = dp_reap = 0;
+ 	dp_free_head = dp_free_tail = dp_wait_count = 0;
+  dp_publish_limit = s->tuning.publish_batch;
++ dp_perf_flags = s->perf.flags;
++ /* DMA can only read 76 bytes. Keep the allocation tail deterministic at
++  * every BIND, even when a caller reuses the shared allocation. */
++ npu_memset((void *)s->txwi, 0, sizeof(s->txwi));
+  dp_ba_request = dp_ba_wcid = dp_ba_tids = 0;
+  npu_memset(dp_pending, 0, sizeof(dp_pending));
+  npu_memset(&dp_account, 0, sizeof(dp_account));
+@@ -565,7 +569,7 @@
+   * No second mutable ledger read can change the decision. */
+  KDP_BARRIER();
+  dp->token[id].state = KDP_TOKEN_FREE;
+- if (dp->perf.flags & KDP_PERF_TOKENQ) {
++ if (dp_perf_flags & KDP_PERF_TOKENQ) {
+   dp_freeq[dp_free_tail] = id;
+   dp_free_tail = (dp_free_tail + 1) % KDP_TOKENS;
+  }
+@@ -613,7 +617,7 @@
+  }
+  /* Periodic proof-based rescue covers even a missed notification without
+   * overflow. Overflow starts a pass immediately; no endless busy rescans. */
+- if (!(dp->perf.flags & KDP_PERF_TOKENQ)) dp_scan_left = KDP_TOKENS;
++ if (!(dp_perf_flags & KDP_PERF_TOKENQ)) dp_scan_left = KDP_TOKENS;
+  /* At most 32 bitmap words and 32 live candidates per pass. Empty words
+   * cost no uncached token reads. Cursor advances even under new traffic. */
+  u32 scanned = 0, ready = 0, candidates = 0;
+@@ -716,8 +720,10 @@
+  packet = &dp_private.scratch[band];
+  compact = &dp_private.compact[band];
+  /* Keep an empty fallback FIFO off the per-packet cold-call path. */
+- if (dp_host_head[band] != dp_host_tail[band]) dp_host_reap(band);
+- if (kdp_failed(dp)) return 0;
++ if (dp_host_head[band] != dp_host_tail[band]) {
++  dp_host_reap(band);
++  if (kdp_failed(dp)) return 0;
++ } /* Empty FIFO cannot have raised a new hart4 fault after dp_tx_shared. */
+ 	if (dp_prepared[band] != 0xffff) {
+ 		dp->fault = 2; /* caller must commit each successfully prepared frame */
+ 		return 0;
+@@ -815,7 +821,7 @@
+   * other band are outside this helper. Revalidate exact policy as soon as
+   * a spare arrives, before handing anything to either WiFi or host. */
+  cache=&dp_parse[band];
+- if (!dp_free_count && (dp->perf.flags & KDP_PERF_FAST) && cache->valid &&
++ if (!dp_free_count && (dp_perf_flags & KDP_PERF_FAST) && cache->valid &&
+      cache->token==token && cache->len==len && cache->tag==tag) {
+   dp_r63.band[band].full_skip++;
+   dp_performance[band].retry++; dp->stats[band].tx_full++;
+@@ -827,14 +833,14 @@
+  cache = &dp_parse[band];
+  if (cache->valid && (cache->token != token || cache->len != len || cache->tag != tag))
+   cache->valid = 0;
+- if ((dp->perf.flags & KDP_PERF_FAST) && cache->valid && cache->fast == 2) {
++ if ((dp_perf_flags & KDP_PERF_FAST) && cache->valid && cache->fast == 2) {
+   /* Owned, unchanged head: retain wire key, but revalidate all live gates,
+    * identity and policy versions on every retry, including below. */
+   compact_valid = fast = parsed = 1; packet_valid = 0;
+   dp_performance[band].parse_reuse++;
+  } else {
+   fast = 0;
+-  if ((dp->perf.flags & KDP_PERF_FAST) && len >= 48 &&
++  if ((dp_perf_flags & KDP_PERF_FAST) && len >= 48 &&
+       !((unsigned long)payload & 3))
+    compact_valid = dp_parse_ipv4_key((const volatile kdp_word *)payload, len, compact);
+   if (compact_valid) {
+@@ -848,12 +854,12 @@
+    if (kdp_be16(payload + 12) < 0x600 || kdp_be16(payload + 12) == 0x888e) {
+     dp->quality[band].control_drop++; goto drop;
+    }
+-   if ((dp->perf.flags & KDP_PERF_FAST) && cache->valid) {
++   if ((dp_perf_flags & KDP_PERF_FAST) && cache->valid) {
+     dp_packet_copy(packet, &cache->packet);
+     parsed=cache->parsed; fast=cache->fast;
+     dp_performance[band].parse_reuse++;
+    } else {
+-    if ((dp->perf.flags & KDP_PERF_FAST) &&
++    if ((dp_perf_flags & KDP_PERF_FAST) &&
+         (len < 48 || ((unsigned long)payload & 3)))
+      fast = kdp_parse_ipv4_fast(payload, len, packet);
+     parsed = fast ? 1 : dp_parse_slow(payload, len, packet);
+@@ -872,7 +878,7 @@
+  {
+   int policy;
+   int wan = compact_valid ? dp_wan_ipv4(dp, &sc->value, compact, wcid, band) :
+-     ((dp->perf.flags & KDP_PERF_FAST) && dp_wan_matches(dp, &sc->value, packet, wcid, band));
++     ((dp_perf_flags & KDP_PERF_FAST) && dp_wan_matches(dp, &sc->value, packet, wcid, band));
+   if (wan) policy = -1;
+   else if (fast && (compact_valid ? dp_hint_ipv4(dp, &sc->value, compact, wcid, band) :
+                     dp_hint_matches(dp, &sc->value, packet, wcid, band))) {
+@@ -911,7 +917,7 @@
+ 	if (replacement < 0) {
+ 		/* Cache only a held packet-> The common successful submission
+ 		 * pays no packet-key copy or cache-line writes. */
+-		if ((dp->perf.flags & KDP_PERF_FAST) && !cache->valid) {
++		if ((dp_perf_flags & KDP_PERF_FAST) && !cache->valid) {
+    dp_hold_packet(cache, packet, compact_valid,
+                   token, len, tag, parsed, fast);
+ 		}
+@@ -928,7 +934,7 @@
+ 		kdp_amsdu_allowed(sta->amsdu, tid, len);
+  /* TDMA admission proved address/range/len/token, and TID above is
+   * bounded before either bitmap use or the indexed TXWI queue map. */
+- kdp_write_txwi_validated((void *)dp->txwi[token], &sc->txwi, addr, len, token, tid, amsdu);
++ kdp_write_txwi_dma((void *)dp->txwi[token], &sc->txwi, addr, len, token, tid, amsdu);
+ 	if (dp_observe_sample[band]) dp_observe_time(band, KDP_OBS_TXWI, stamp, 1);
+ 	if (amsdu)
+ 		dp_performance[band].tx_amsdu++;
+@@ -954,7 +960,7 @@
+ 	dp_replacement[band] = replacement;
+ 	out->buf0 = dp_txwi_pa(token);
+ 	out->buf1 = addr;
+-	out->ctrl = (76u << 16) | 0x4000u | 72u;
++	out->ctrl = (KDP_TXWI_DMA_BYTES << 16) | 0x4000u | 72u;
+ 	out->info = 0;
+ 	*id = token;
+  if (dp_observe_sample[0]) dp_hot(KDP_HOT_BUILD, hot, 1);

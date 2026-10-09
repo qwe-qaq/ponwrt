@@ -1,0 +1,107 @@
+From: ponwrt development <noreply@local>
+Subject: [PATCH] Seed per-token immutable DMA TXWI words at BIND; batch exact-hit statistics
+
+r69 on r68. Preserve ABI12, exact policy/PN and DMA+WA ownership.
+
+--- a/kite-fast.inc
++++ b/kite-fast.inc
+@@ -220,7 +220,7 @@
+   KDP_BARRIER();
+   if (s->flow[h->capture].version != h->cap_version ||
+       s->flow[h->exact].version != h->exact_version) continue;
+-  s->stats[band].reserved[KDP_STAT_BRIDGE_HIT]++;
++  dp_bridge_delta[band]++;
+   return 1;
+  }
+  return 0;
+@@ -390,7 +390,7 @@
+  if (s->flow[h->capture].version!=h->cap_version ||
+      s->flow[h->exact].version!=h->exact_version) goto next;
+  dp_private.last_hint[band] = index + 1;
+- s->stats[band].reserved[KDP_STAT_BRIDGE_HIT]++; return 1;
++ dp_bridge_delta[band]++; return 1;
+  return 0;
+ }
+ static int dp_wan_ipv4(volatile struct kdp_shared *s, const struct kdp_sta *sta,
+@@ -432,3 +432,19 @@
+  if (!compact_valid) dp_packet_copy(&cache->packet,packet);
+  cache->valid=1;
+ }
++
++/* Eight mutable DMA words; the other eleven words were seeded at BIND.
++ * STA, key/protection, band/BSS, queue/TID, length and A-MSDU always refresh.
++ * This private entry requires TDMA's exact token-address and length proof.
++ * Public arbitrary-buffer writers retain their full overwrite contract. */
++static inline void dp_write_txwi(unsigned char *p, const struct kdp_txwi_template *t,
++ unsigned int len, unsigned int token, unsigned int tid, unsigned int amsdu)
++{
++ static const unsigned char queue[8] = {1, 0, 0, 1, 2, 2, 3, 3};
++ volatile kdp_word *d = (void *)p;
++ d[0] = (len + 32) | ((t->queue + queue[tid]) << 25);
++ d[1] = t->w1 | (tid << 20); d[2] = t->w2; d[3] = t->w3;
++ d[7] = t->w7 | (amsdu ? 1u << 10 : 0u);
++ d[8] = t->w8 | ((KDP_TOKEN_BASE + token) << 16);
++ d[9] = t->w9; d[16] = len;
++}
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -37,7 +37,7 @@
+ static u32 dp_gate_active[2], dp_gate_since[2];
+ /* Statistics only, never token/ownership authority. Flush at every bounded
+  * TDMA batch and at every transport tail, including held/full tails. */
+-static u32 dp_sent_delta[2], dp_bytes_delta[2];
++static u32 dp_sent_delta[2], dp_bytes_delta[2], dp_bridge_delta[2];
+ struct dp_parse_cache {
+ 	u32 valid, token, len, tag;
+ 	int parsed, fast;
+@@ -257,6 +257,13 @@
+  /* DMA can only read 76 bytes. Keep the allocation tail deterministic at
+   * every BIND, even when a caller reuses the shared allocation. */
+  npu_memset((void *)s->txwi, 0, sizeof(s->txwi));
++ /* Device reads TXWI only. Token payload addresses are session constants;
++  * DMA+WA completion precedes reuse. Every BIND reconstructs invariants. */
++ for (i = 0; i < KDP_TOKENS; i++) {
++  volatile kdp_word *d = (void *)s->txwi[i];
++  d[5] = 1;
++  d[10] = dp_payload_pa(i);
++ }
+  dp_ba_request = dp_ba_wcid = dp_ba_tids = 0;
+  npu_memset(dp_pending, 0, sizeof(dp_pending));
+  npu_memset(&dp_account, 0, sizeof(dp_account));
+@@ -271,6 +278,7 @@
+ 	dp_private_needs_init = 1; /* hart4 initializes its own cached DRAM */
+  npu_memset(dp_sent_delta,0,sizeof(dp_sent_delta));
+  npu_memset(dp_bytes_delta,0,sizeof(dp_bytes_delta));
++ npu_memset(dp_bridge_delta,0,sizeof(dp_bridge_delta));
+  npu_memset((void *)dp_host, 0, sizeof(dp_host));
+  npu_memset((void *)dp_host_tail, 0, sizeof(dp_host_tail));
+  npu_memset((void *)dp_host_consume, 0, sizeof(dp_host_consume));
+@@ -373,7 +381,7 @@
+ 			(s->flow[i].type == KDP_FLOW_BRIDGE_IPV4 ||
+ 			 s->flow[i].type == KDP_FLOW_BRIDGE_IPV6)) {
+ 			dp_hint_save(s, packet, wcid, band, capture, i);
+-			s->stats[band].reserved[KDP_STAT_BRIDGE_HIT]++;
++			dp_bridge_delta[band]++;
+ 			return 1;
+ 		}
+ 	s->quality[band].bridge_policy_fallback++;
+@@ -526,6 +534,10 @@
+   dp->tx_sent[band] += dp_sent_delta[band];
+   dp->stats[band].tx_bytes += dp_bytes_delta[band];
+   dp_sent_delta[band] = dp_bytes_delta[band] = 0;
++ }
++ if (dp_bridge_delta[band]) {
++  dp->stats[band].reserved[KDP_STAT_BRIDGE_HIT] += dp_bridge_delta[band];
++  dp_bridge_delta[band] = 0;
+  }
+  if (!q->count) return;
+  KDP_BARRIER(); /* all replacement addresses before any ready control */
+@@ -950,7 +962,7 @@
+ 		kdp_amsdu_allowed(sta->amsdu, tid, len);
+  /* TDMA admission proved address/range/len/token, and TID above is
+   * bounded before either bitmap use or the indexed TXWI queue map. */
+- kdp_write_txwi_dma((void *)dp->txwi[token], &sc->txwi, addr, len, token, tid, amsdu);
++ dp_write_txwi((void *)dp->txwi[token], &sc->txwi, len, token, tid, amsdu);
+ 	if (dp_observe_sample[band]) dp_observe_time(band, KDP_OBS_TXWI, stamp, 1);
+ 	if (amsdu)
+ 		dp_performance[band].tx_amsdu++;

@@ -1,0 +1,21 @@
+Subject: Keep non-ABI2 Kite variants on untrusted host metadata
+
+--- a/kite-control.h
++++ b/kite-control.h
+@@ -112,6 +112,16 @@
+ static inline int kite_ctl_stop_requested(void) { return 0; }
+ static inline int kite_ctl_active(void) { return 0; }
+ static inline int kite_ctl_rx_held(void) { return 0; }
++/* Other Kite variants have no ABI2 station/key mirror. They must never
++ * synthesize trusted generation metadata from an absent control plane. */
++static inline int kite_ctl_rx_meta(u32 band, u32 wcid, u32 bss,
++				   u32 *generation, u32 *key_generation)
++{
++	(void)band; (void)wcid; (void)bss;
++	*generation = 0;
++	*key_generation = 0;
++	return 0;
++}
+ static inline u32 kite_ctl_ba_address(u32 band, u32 wcid, u32 tid)
+ {
+ 	(void)band; (void)wcid; (void)tid;

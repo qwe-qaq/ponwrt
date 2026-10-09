@@ -1,0 +1,335 @@
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -26,6 +26,7 @@
+ #define KDP_TOKEN_BASE (KDP_TOKEN_LIMIT - KDP_TOKENS)
+ #define KDP_BUFFER_BYTES 2048u
+ #define KDP_TXWI_BYTES 128u
++#define KDP_TXWI_DMA_BYTES 76u /* connac2 TXD32 + firmware TXP44 */
+ #define KDP_PN_SPINS 4096u
+ #define KDP_CIPHER_CCMP 0x000fac04u
+ 
+@@ -196,6 +197,10 @@
+ 
+ /* ABI5 appends diagnostics only. All existing DMA offsets stay unchanged.
+  * TX/bridge fields have hart4 as their sole writer; host_hold has hart3. */
++/* r66 observation extension, unchanged layout: service.seq protects
++ * quality[0].reserved={pressure_requests,coalesced,cycles},
++ * quality[1].reserved={pressure_max_cycles,snapshot_cycles,snapshot_max_cycles}.
++ * Available only when perf.reserved[5] (service revision) >= 3. */
+ struct kdp_quality_stats {
+ 	unsigned int gate_drop, disabled_drop, sta_disabled_drop;
+ 	unsigned int unauthorized_drop, blocked_drop, identity_drop;
+@@ -472,12 +477,12 @@
+  t->queue = wmm * 4;
+  return 1;
+ }
+-static inline void kdp_write_txwi_validated(unsigned char *p, const struct kdp_txwi_template *t,
++static inline void kdp_write_txwi_dma(unsigned char *p, const struct kdp_txwi_template *t,
+  unsigned int pa, unsigned int len, unsigned int token, unsigned int tid, unsigned int amsdu)
+ {
+  static const unsigned char queue[8] = {1, 0, 0, 1, 2, 2, 3, 3};
+  volatile kdp_word *d = (void *)p;
+- /* Full overwrite, including reserved words: no DMA-mutation assumption. */
++ /* Overwrite every DMA-visible word, including all reserved TXP slots. */
+  d[0] = (len + 32) | ((t->queue + queue[tid]) << 25);
+  d[1] = t->w1 | (tid << 20); d[2] = t->w2; d[3] = t->w3;
+  d[4] = 0; d[5] = 1; d[6] = 0; /* native NO_SKB, not NO_ACK/WED */
+@@ -486,7 +491,15 @@
+  d[9] = t->w9; d[10] = pa;
+  d[11] = 0; d[12] = 0; d[13] = 0; d[14] = 0; d[15] = 0;
+  d[16] = len;
+- d[17] = 0; d[18] = 0; d[19] = 0; d[20] = 0; d[21] = 0;
++ d[17] = 0; d[18] = 0;
++}
++/* Checked/public callers retain the full 128-byte buffer contract. */
++static inline void kdp_write_txwi_validated(unsigned char *p, const struct kdp_txwi_template *t,
++ unsigned int pa, unsigned int len, unsigned int token, unsigned int tid, unsigned int amsdu)
++{
++ volatile kdp_word *d = (void *)p;
++ kdp_write_txwi_dma(p,t,pa,len,token,tid,amsdu);
++ d[19] = 0; d[20] = 0; d[21] = 0;
+  d[22] = 0; d[23] = 0; d[24] = 0; d[25] = 0; d[26] = 0;
+  d[27] = 0; d[28] = 0; d[29] = 0; d[30] = 0; d[31] = 0;
+ }
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -1063,17 +1063,21 @@
+ 		if (!is_mt7915(&dev->mt76)) {
+ 			amsdu->max_mpdu_size =
+ 				IEEE80211_VHT_CAP_MAX_MPDU_LENGTH_11454;
+-			return;
++			goto record;
+ 		}
+ 		fallthrough;
+ 	case IEEE80211_MAX_MPDU_LEN_HT_7935:
+ 	case IEEE80211_MAX_MPDU_LEN_VHT_7991:
+ 		amsdu->max_mpdu_size = IEEE80211_VHT_CAP_MAX_MPDU_LENGTH_7991;
+-		return;
++		break;
+ 	default:
+ 		amsdu->max_mpdu_size = IEEE80211_VHT_CAP_MAX_MPDU_LENGTH_3895;
+-		return;
+-	}
++		break;
++	}
++record:
++ msta->npu_amsdu_mcu=amsdu->amsdu_en | (amsdu->max_amsdu_num<<8) |
++                       (amsdu->max_mpdu_size<<16);
++
+ }
+ 
+ static int
+@@ -1777,6 +1781,7 @@
+ 			return ret;
+ 		fenced = ret > 0;
+ 		msta->npu_amsdu_len = 0;
++  msta->npu_amsdu_mcu=0; msta->npu_amsdu_mcu_acked=false;
+ 		if (newly || conn_state == CONN_STATE_DISCONNECT)
+ 			msta->npu_amsdu_tids = 0;
+ 		mt7915_npu_amsdu_update(dev, msta);
+@@ -1836,8 +1841,10 @@
+ 				    MCU_EXT_CMD(STA_REC_UPDATE), true);
+ 	if (ret || conn_state == CONN_STATE_DISCONNECT)
+ 		goto npu_out;
+-	if (real_peer && msta->wcid.amsdu)
++	if (real_peer && msta->wcid.amsdu) {
+ 		msta->npu_amsdu_len = sta->deflink.agg.max_amsdu_len;
++  msta->npu_amsdu_mcu_acked=!!msta->npu_amsdu_mcu;
++ }
+ 
+ 	mt7915_mcu_add_group(dev, vif, sta);
+ 
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -151,6 +151,8 @@
+ 
+ 	/* MCU-acknowledged HW A-MSDU contract; serialized by mt76.mutex. */
+ 	u16 npu_amsdu_len, npu_amsdu_tids;
++ u32 npu_amsdu_mcu;
++ bool npu_amsdu_mcu_acked;
+  u16 npu_ba_window[8];
+  bool npu_wtbl_pending, npu_wtbl_valid;
+  unsigned long npu_wtbl_at;
+@@ -301,6 +303,11 @@
+  u64 probe_ns, probe_max_ns;
+  u32 progress_wakes, worker_runs, seen_consumed, seen_drained, seen_reaped, seen_staged;
+  u32 progress_coalesced;
++ u32 negative_probes, confirm_probes, txq_nudges;
++ u32 backlog_request, backlog_staged, backlog_reaped, backlog_queue_flags;
++ u32 backlog_non_aql;
++ u64 backlog_ns;
++ struct ieee80211_sta_txq_observation backlog[IEEE80211_NUM_TIDS+1];
+  unsigned long queue_retry_at;
+  u64 queued_ns, queue_delay_ns, queue_delay_max_ns;
+  u64 awake_ns, drain_ns, revoke_ns, sleep_at_ns, sleep_ns;
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1595,7 +1595,7 @@
+ }
+ #include "npu-r59-observe.inc"
+ 
+-static int mt7915_kite_datapath_show(struct seq_file *m, void *unused)
++static int mt7915_kite_datapath_read(struct seq_file *m, bool detail)
+ {
+ 	struct mt7915_dev *dev = m->private;
+ 	struct kdp_shared *s = READ_ONCE(dev->mt76.kite_dp);
+@@ -1623,7 +1623,7 @@
+ 		struct kdp_sta *peer = &s->sta[i];
+ 
+ 		sta += !!READ_ONCE(peer->enabled);
+-		if (READ_ONCE(peer->generation) && READ_ONCE(dev->kite.live[i]))
++		if (detail && READ_ONCE(peer->generation) && READ_ONCE(dev->kite.live[i]))
+ 			seq_printf(m, "sta%u generation=%u key_generation=%u cipher=%08x authorized=%u enabled=%u band=%u bss=%u omac=%u tx_tag=%u tx_blocked=%u host_tids=%02x qos_map=%u amsdu_tids=%02x amsdu_max=%u\n",
+ 				i, peer->generation, peer->key_generation, peer->cipher,
+ 				peer->authorized, peer->enabled, peer->band, peer->bss, peer->omac,
+@@ -1631,7 +1631,7 @@
+ 				peer->amsdu & 0xff, peer->amsdu >> 16);
+ 	}
+  /* Read-only per-STA/TID actual publication evidence; no MAC/key data. */
+- for (i = 1; i < KDP_WCIDS; i++) {
++ if (detail) for (i = 1; i < KDP_WCIDS; i++) {
+   struct kdp_tx_activity v, *a = &s->activity[i];
+   struct kdp_sta *peer = &s->sta[i];
+   u32 seq;
+@@ -1722,7 +1722,7 @@
+ 	seq_printf(m, "host_token_limit=%u dp_token_first=%u dp_token_limit=%u reserved=%u change_error=%d\n",
+ 		dev->mt76.token_size, KDP_TOKEN_BASE, KDP_TOKEN_LIMIT,
+ 		dev->kite.dp_tokens_reserved, dev->kite.dp_change_error);
+-	for (b = 0; b < 2; b++) {
++	if (detail) for (b = 0; b < 2; b++) {
+ 		struct mt7915_dp_pending pending = mt7915_dp_pending(dev, b);
+ 		struct mt76_queue *q = dev->kite.txq[b];
+ 		struct kite_tx_shared *tx = q ? q->kite_tx : NULL;
+@@ -1744,13 +1744,14 @@
+   READ_ONCE(dev->kite.ba_starts), READ_ONCE(dev->kite.ba_start_failed));
+  {
+   struct kdp_service v;
+-  u32 load[6], seq, end;
++  u32 load[6], diag[6], seq, end;
+   int retry;
+   for (retry = 0; retry < 3; retry++) {
+    seq = READ_ONCE(s->service.seq);
+    if (seq & 1) continue;
+    dma_rmb(); memcpy(&v, &s->service, sizeof(v));
+-   memcpy(load, s->perf.reserved, sizeof(load)); dma_rmb();
++   memcpy(load, s->perf.reserved, sizeof(load));
++   memcpy(diag,s->quality[0].reserved,12); memcpy(diag+3,s->quality[1].reserved,12); dma_rmb();
+    end = READ_ONCE(s->service.seq);
+    if (seq == end && !(end & 1)) break;
+   }
+@@ -1761,6 +1762,9 @@
+    retry < 3, retry < 3 ? load[5] : 0, retry < 3 ? load[0] : 0,
+    retry < 3 ? load[1] : 0, retry < 3 ? load[2] : 0,
+    retry < 3 ? load[3] : 0, retry < 3 ? load[4] : 0);
++  if (retry < 3 && load[5]>=3)
++   seq_printf(m,"r66_observe pressure_requests=%u pressure_coalesced=%u pressure_cycles=%u pressure_max_cycles=%u snapshot_cycles=%u snapshot_max_cycles=%u detail=%u\n",
++    diag[0],diag[1],diag[2],diag[3],diag[4],diag[5],detail);
+   if (retry < 3) for (b = 0; b < 2; b++) {
+    struct kdp_service_band *z = &v.band[b];
+    seq_printf(m, "service_band%u index_reads=%u idle_skips=%u tdma_publishes=%u wifi_publishes=%u prepare_samples=%u prepare_ticks=%u prepare_max_ticks=%u wire_dma_samples=%u wire_dma_ticks=%u wire_dma_max_ticks=%u\n",
+@@ -1792,11 +1796,16 @@
+    READ_ONCE(s->tuning.ba.wcid), READ_ONCE(s->tuning.ba.tids));
+  }
+ 	mt7915_kite_observe_show(m, dev, s);
+- mt7915_kite_r59_show(m, dev, s);
++ mt7915_kite_r59_show(m, dev, s, detail);
+ 	seq_puts(m, "rx_ppe=TDMA submission; rx_free_only=buffer return, not delivery proof; tx_freed=DMA+WA completion, not peer ACK; counters wrap at 32 bits\n");
+ 	return 0;
+ }
++static int mt7915_kite_datapath_show(struct seq_file *m, void *unused)
++{ return mt7915_kite_datapath_read(m,true); }
++static int mt7915_kite_datapath_light_show(struct seq_file *m, void *unused)
++{ return mt7915_kite_datapath_read(m,false); }
+ DEFINE_SHOW_ATTRIBUTE(mt7915_kite_datapath);
++DEFINE_SHOW_ATTRIBUTE(mt7915_kite_datapath_light);
+ 
+ static int mt7915_kite_trace_show(struct seq_file *m, void *unused)
+ {
+@@ -1875,6 +1884,7 @@
+ void mt7915_npu_tx_debugfs(struct mt7915_dev *dev, struct dentry *dir)
+ {
+ 	debugfs_create_file("kite_datapath", 0400, dir, dev, &mt7915_kite_datapath_fops);
++ debugfs_create_file("kite_datapath_light",0400,dir,dev,&mt7915_kite_datapath_light_fops);
+ 	debugfs_create_file("kite_tx", 0400, dir, dev, &mt7915_kite_tx_fops);
+ 	debugfs_create_file("kite_rx", 0400, dir, dev, &mt7915_kite_rx_fops);
+ 	debugfs_create_file("kite_trace", 0400, dir, dev, &mt7915_kite_trace_fops);
+@@ -1976,7 +1986,7 @@
+ 	ret = mt7915_kite_command(dev, KITE_CTL_DP_BIND, args, 3);
+ 	if (!ret)
+ 		dev_info(dev->mt76.dev,
+-			 "Kite datapath r65 ABI12 bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
++			 "Kite datapath r66 ABI12 bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
+ 			 s->session, s->epoch, sizeof(*s), s->perf.flags, npu_amsdu);
+ out:
+ 	if (ret)
+--- a/mt7915/npu-ps.inc
++++ b/mt7915/npu-ps.inc
+@@ -94,11 +94,52 @@
+  struct mt76_queue *q;
+  unsigned long flags;
+  u32 pending,band=READ_ONCE(dev->mt76.kite_dp->sta[wi].band);
++ struct ieee80211_sta_txq_observation obs[IEEE80211_NUM_TIDS+1];
++ struct mt7915_kite_ps_state *p=&dev->kite.ps[wi];
++ unsigned int i;
++ bool backlog=false;
+  wcid=rcu_dereference_protected(dev->mt76.wcid[wi],lockdep_is_held(&dev->mt76.mutex));
+  if (!wcid || !wcid->sta || band>=ARRAY_SIZE(dev->kite.txq)) return MT7915_KITE_PS_IDENTITY;
+  msta=container_of(wcid,struct mt7915_sta,wcid);
+  sta=container_of((void *)msta,struct ieee80211_sta,drv_priv);
+  q=dev->kite.txq[band];
++ ieee80211_sta_txq_observe(sta,obs);
++ pending=0;
++ for (i=0;i<ARRAY_SIZE(obs);i++) {
++  if (obs[i].packets) pending |= IEEE80211_STA_TX_TXQ;
++  if (obs[i].fragments) pending |= IEEE80211_STA_TX_FRAG;
++ }
++ if (!skb_queue_empty(&wcid->tx_pending)) pending |= MT7915_KITE_PS_HOST;
++ if (!skb_queue_empty(&wcid->tx_offchannel)) pending |= MT7915_KITE_PS_OFFCHANNEL;
++ if (pending) {
++  /* A negative observation only prolongs fencing. Keep dequeue running,
++   * and reschedule nonempty TXQs through the normal airtime scheduler.
++   * Do not clear PS, AQL, queue stop or driver pressure flags. */
++  for (i=0;i<ARRAY_SIZE(obs);i++)
++   if ((obs[i].packets || obs[i].fragments) && sta->txq[i]) {
++    ieee80211_schedule_txq(mt76_phy_hw(&dev->mt76,wcid->phy_idx),sta->txq[i]);
++    backlog=true;
++   }
++  mt76_worker_schedule(&dev->mt76.tx_worker);
++  spin_lock_irqsave(&dev->kite.dp_done_lock,flags);
++  p->negative_probes++; p->txq_nudges+=backlog;
++  p->backlog_request=p->request; p->backlog_ns=ktime_get_ns();
++  p->backlog_non_aql=atomic_read(&wcid->non_aql_packets);
++  memcpy(p->backlog,obs,sizeof(obs));
++  if (q) {
++   p->backlog_staged=READ_ONCE(q->kite_staged);
++   p->backlog_reaped=q->kite_tx?kite_tx_read(&q->kite_tx->reaped):0;
++   p->backlog_queue_flags=(!!READ_ONCE(q->stopped)) |
++    (!!READ_ONCE(q->blocked)<<1) | (!!READ_ONCE(q->kite_tx_blocked)<<2) |
++    (!!READ_ONCE(q->kite_tx_pressure)<<3);
++  }
++  spin_unlock_irqrestore(&dev->kite.dp_done_lock,flags);
++  return pending;
++ }
++ /* Candidate-empty is not proof: stop dequeue and repeat all original
++  * PS/FQ/fragment/local/qdisc/driver checks before capturing the prefix. */
++ spin_lock_irqsave(&dev->kite.dp_done_lock,flags); p->confirm_probes++;
++ spin_unlock_irqrestore(&dev->kite.dp_done_lock,flags);
+  mt76_worker_disable(&dev->mt76.tx_worker);
+  pending=ieee80211_sta_tx_pending(sta);
+  if (!skb_queue_empty(&wcid->tx_pending)) pending |= MT7915_KITE_PS_HOST;
+--- a/mt7915/npu-r59-observe.inc
++++ b/mt7915/npu-r59-observe.inc
+@@ -1,7 +1,7 @@
+ /* SPDX-License-Identifier: ISC */
+ /* Reader only. No diagnostic MMIO writes, no read-to-clear MIB registers. */
+ static void mt7915_kite_r59_show(struct seq_file *m, struct mt7915_dev *dev,
+-                               struct kdp_shared *s)
++                               struct kdp_shared *s, bool detail)
+ {
+  struct kdp_r59 v = {};
+  struct kdp_r63_band r63[2];
+@@ -101,6 +101,16 @@
+   seq_printf(m,"r64_ps%u progress_coalesced=%u\n",i,p.progress_coalesced);
+   seq_printf(m,"r63_ps%u progress_wakes=%u worker_runs=%u queue_delay_ns=%llu queue_delay_max_ns=%llu\n",
+    i,p.progress_wakes,p.worker_runs,p.queue_delay_ns,p.queue_delay_max_ns);
++  seq_printf(m,"r66_ps%u negative=%u confirm=%u nudges=%u backlog_request=%u backlog_ns=%llu staged=%u reaped=%u queue_flags=%u non_aql=%u\n",
++   i,p.negative_probes,p.confirm_probes,p.txq_nudges,p.backlog_request,p.backlog_ns,
++   p.backlog_staged,p.backlog_reaped,p.backlog_queue_flags,p.backlog_non_aql);
++  if (!detail) continue;
++  for (j=0;j<ARRAY_SIZE(p.backlog);j++) {
++   struct ieee80211_sta_txq_observation *v=&p.backlog[j];
++   if (v->packets || v->fragments || v->dequeued || v->flags || v->aql)
++    seq_printf(m,"r66_txq%u_%u packets=%u bytes=%u fragments=%u dequeued=%u flags=%u aql=%u\n",
++     i,j,v->packets,v->bytes,v->fragments,v->dequeued,v->flags,v->aql);
++  }
+   wcid = rcu_dereference_protected(dev->mt76.wcid[i], lockdep_is_held(&dev->mt76.mutex));
+   if (!wcid || !wcid->sta) continue;
+   msta = container_of(wcid, struct mt7915_sta, wcid);
+@@ -108,6 +118,9 @@
+              i, msta->npu_amsdu_len, wcid->amsdu, msta->npu_amsdu_tids);
+   for (j = 0; j < 8; j++) seq_printf(m, " ba%u=%u", j, msta->npu_ba_window[j]);
+   seq_putc(m, '\n');
++  seq_printf(m,"r66_agg%u mcu_acked=%u enable=%u max_subframes=%u mpdu_code=%u\n",
++   i,msta->npu_amsdu_mcu_acked,msta->npu_amsdu_mcu&0xff,
++   (msta->npu_amsdu_mcu>>8)&0xff,(msta->npu_amsdu_mcu>>16)&0xff);
+   seq_printf(m,"r60_wtbl%u valid=%u age_jiffies=%lu",i,
+    READ_ONCE(msta->npu_wtbl_valid),jiffies-READ_ONCE(msta->npu_wtbl_at));
+   for (j=0;j<10;j++) seq_printf(m," dw%u=%08x",j,READ_ONCE(msta->npu_wtbl[j]));
+@@ -117,7 +130,7 @@
+   WRITE_ONCE(msta->npu_wtbl_pending,true);
+ 
+  }
+- for (i=0;i<MT7915_KITE_PS_EVENTS;i++) {
++ if (detail) for (i=0;i<MT7915_KITE_PS_EVENTS;i++) {
+   struct mt7915_kite_ps_event e;
+   spin_lock_bh(&dev->kite.dp_done_lock); e=dev->kite.ps_events[i];
+   spin_unlock_bh(&dev->kite.dp_done_lock);
+@@ -141,7 +154,7 @@
+  }
+  /* These are configuration registers. Preserve raw values; undocumented
+   * bitfields are not advertised as a measured aggregation-size limit. */
+- if (dev->kite.dp_bound && !dev->kite.failed &&
++ if (detail && dev->kite.dp_bound && !dev->kite.failed &&
+      !test_bit(MT76_RESET, &dev->mphy.state))
+   for (b = 0; b < 2; b++)
+    seq_printf(m, "r59_agg_hw%u awscr0=%u awscr1=%u awscr2=%u awscr3=%u atcr0=%u atcr1=%u atcr3=%u\n", b,

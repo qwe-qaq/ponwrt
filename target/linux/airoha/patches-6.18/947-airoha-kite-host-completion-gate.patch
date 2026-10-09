@@ -1,0 +1,53 @@
+From: ponwrt development <noreply@local>
+Subject: [PATCH] Kite: preserve firmware fault identity on host WA errors
+
+Keep host completion failure in its saturating counter. Both sides close
+admission on either error; stopping still evaluates the original firmware
+ownership fault. A late WA cannot turn quarantine into recoverable fault 9.
+
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -44,7 +44,7 @@
+ 
+ 	if (!in && !out)
+ 		return true;
+-	if (!s || s->session != e->kite_session || !s->enabled || s->gate || s->fault)
++	if (!s || s->session != e->kite_session || !s->enabled || s->gate || kdp_failed(s))
+ 		return false;
+ 	if (in && (!s->sta[in].enabled || !s->sta[in].authorized ||
+ 		   s->sta[in].generation != e->kite_in_gen ||
+@@ -114,7 +114,7 @@
+ 	u32 wi = p->airoha_npu.wcid;
+ 
+ 	if (!s || p->type != DEV_PATH_AIROHA_NPU || !wi || wi >= KDP_WCIDS ||
+-	    !READ_ONCE(s->enabled) || READ_ONCE(s->gate) || READ_ONCE(s->fault))
++	    !READ_ONCE(s->enabled) || READ_ONCE(s->gate) || kdp_failed(s))
+ 		return false;
+ 	sta = &s->sta[wi];
+ 	return p->airoha_npu.session == READ_ONCE(s->session) &&
+@@ -373,7 +373,7 @@
+ 	bool again = false;
+ 
+ 	mutex_lock(&flow_offload_mutex);
+-	if (!ppe->kite_dp || READ_ONCE(ppe->kite_dp->fault) ||
++	if (!ppe->kite_dp || kdp_failed(ppe->kite_dp) ||
+ 	    READ_ONCE(ppe->kite_dp->gate) || list_empty(&ppe->kite_flows))
+ 		goto out;
+ 	/* Read actual physical SRAM/DRAM entries. The software tuple hash only
+--- a/include/linux/soc/airoha/kite-datapath.h
++++ b/include/linux/soc/airoha/kite-datapath.h
+@@ -164,6 +164,14 @@
+ 	unsigned char payload[KDP_TOKENS][KDP_BUFFER_BYTES];
+ 	struct kdp_band_stats stats[2];
+ };
++
++/* Separate writers: firmware fault identity is never overwritten by a
++ * host WA parser. tx_bad_done is a saturating host error latch until a
++ * proved stop and fresh shared session initialization. */
++static inline int kdp_failed(const volatile struct kdp_shared *s)
++{
++	return s->fault || s->tx_bad_done;
++}
+ 
+ static inline unsigned int kdp_get_le32(const unsigned char *p)
+ {

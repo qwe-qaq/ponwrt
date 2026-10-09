@@ -1,0 +1,129 @@
+From: ponwrt maintainers
+Subject: [PATCH] r75: Skip truly empty PS mutation and publish cached KF1 resource evidence.
+
+Native incremental patch on release74. Datapath ABI12 and DMA ownership unchanged.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -600,6 +600,10 @@
+ 	int path_error;
+ 	unsigned long path_updated;
+ 	bool path_valid;
++	u32 queue[CLANKER_DIAG_WORDS];
++	int queue_error;
++	unsigned long queue_updated, queue_advanced;
++	bool queue_valid;
+ 	u32 cost[2][CLANKER_DIAG_WORDS];
+ 	int cost_error[2];
+ 	unsigned long cost_updated[2], cost_advanced[2];
+@@ -884,7 +888,33 @@
+ }
+ static DEVICE_ATTR_RO(clanker_cost_status);
+ 
++/* Cached KF1: read-only, no debugfs/sysfs-triggered mailbox or token scans. */
++static ssize_t clanker_queue_status_show(struct device *dev,
++                                        struct device_attribute *attr, char *buf)
++{
++ struct airoha_clanker_diag *d=((struct airoha_npu *)dev_get_drvdata(dev))->clanker;
++ ssize_t n=0;
++ unsigned int b;
++ const u32 *v;
++ mutex_lock(&d->lock);
++ v=d->queue+4;
++ n+=sysfs_emit_at(buf,n,"queue available=%u last_error=%d age_ms=%u producer_age_ms=%u valid=%u seq=%u session=%u epoch=%u revision=%u mhz=%u tick=%u free=%u pending=%u producer=%u consumer=%u reserve=%u extra_reaps=%u pressure_tick=%u\n",
++  d->queue_valid,d->queue_error,
++  d->queue_valid ? jiffies_to_msecs(jiffies-d->queue_updated) : 0,
++  d->queue_valid ? jiffies_to_msecs(jiffies-d->queue_advanced) : 0,
++  v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9],v[10],v[11],v[48],v[49]);
++ if (d->queue_valid && v[0]) for (b=0;b<2;b++) {
++  const u32 *p=v+12+b*18;
++  n+=sysfs_emit_at(buf,n,"queue_band%u pending=%u peak=%u demand=%u credit_hold=%u no_buffer=%u wait_kind=%u wait_at=%u no_buffer_cycles=%u credit_cycles=%u released=%u dma_wait=%u wa_wait=%u ready_wait=%u owner_wcid=%u owner_pending=%u sta_peak=%u no_buffer_cycles_hi=%u credit_cycles_hi=%u\n",
++   b,p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15],p[16],p[17]);
++ }
++ n+=sysfs_emit_at(buf,n,"scope=KF1_u32_counters waits_not_drops pressure_fields_only_at_pressure_tick per_STA_FIFO_not_bypassed\n");
++ mutex_unlock(&d->lock);return n;
++}
++static DEVICE_ATTR_RO(clanker_queue_status);
++
+ static struct attribute *airoha_clanker_attrs[] = {
++	&dev_attr_clanker_queue_status.attr,
+ 	&dev_attr_clanker_cost_status.attr,
+ 	&dev_attr_clanker_status.attr,
+ 	&dev_attr_clanker_rx_status.attr,
+@@ -1018,6 +1048,26 @@
+ 		}
+ 		mutex_unlock(&d->lock);
+ 	}
++ /* KF1 is optional diagnostics, independent of ownership and KC1. */
++ {
++  int queue_error=err;
++  if (!err) {
++   memset(path,0,sizeof(path));
++   queue_error=airoha_npu_wlan_msg_get(npu,7,
++    (enum airoha_npu_wlan_get_cmd)32,path,sizeof(path),GFP_KERNEL);
++   if (!queue_error && (path[0]!=CLANKER_DIAG_MAGIC || path[1]!=7 ||
++       path[61]!=0x4b460001 || (path[4] && path[8]!=75))) queue_error=-EPROTO;
++  }
++  mutex_lock(&d->lock);
++  d->queue_error=queue_error;
++  if (!queue_error) {
++   if (!d->queue_valid || (path[4] &&
++       (path[5]!=d->queue[5] || path[6]!=d->queue[6] || path[7]!=d->queue[7])))
++    d->queue_advanced=jiffies;
++   memcpy(d->queue,path,sizeof(path));d->queue_updated=jiffies;d->queue_valid=true;
++  }
++  mutex_unlock(&d->lock);
++ }
+ 	mutex_lock(&d->lock);
+ 	previous_error = d->error;
+ 	d->error = err;
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -1350,6 +1350,26 @@
+  if (!s || !wi || wi>=KDP_WCIDS || !request ||
+      READ_ONCE(s->r60.ps[wi].request)!=request ||
+      !(READ_ONCE(s->sta[wi].tx_blocked)&KDP_TX_BLOCK_SOFTWARE)) { ret=-EINVAL; goto out; }
++ /* flow_offload_mutex serializes every rule publisher. An empty record
++  * set AND empty shared policy/soft tables means no global mutation. This
++  * does NOT prove no in-flight packets: request/active and the full wake
++  * drain contract still apply. Partial suspend records force the old path. */
++ {
++  bool mutate=false;
++  u32 i;
++  list_for_each_entry(e,&ppe->kite_flows,kite_node)
++   if (e->kite_out_wcid==wi) { mutate=true; break; }
++  for (i=0; !mutate && i<KDP_FLOWS; i++)
++   if ((READ_ONCE(s->flow[i].version) && READ_ONCE(s->flow[i].wcid)==wi) ||
++       (READ_ONCE(s->r60.soft[i].version) && READ_ONCE(s->r60.soft[i].wcid)==wi))
++    mutate=true;
++  if (!mutate) {
++   dma_wmb(); WRITE_ONCE(s->r60.ps[wi].active,request); dma_wmb();
++   atomic64_inc(&ppe->kite_ps_empty);
++   goto out;
++  }
++ }
++ atomic64_inc(&ppe->kite_ps_parked);
+  ret=ppe->kite_ops->pause(ppe->kite_priv); if (ret) goto out;
+  list_for_each_entry(e,&ppe->kite_flows,kite_node) {
+   struct kdp_flow key;
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -771,6 +771,7 @@
+ 	atomic64_t kite_path_out_npu, kite_path_in_npu, kite_egress_blocked;
+ 	/* A live cookie may be replaced repeatedly while its route is refreshed. */
+ 	atomic64_t kite_replace_reuse, kite_replace_gc;
++ atomic64_t kite_ps_empty, kite_ps_parked;
+  atomic64_t kite_ps_reauth_requested, kite_ps_reauth_ok, kite_ps_reauth_missing;
+  atomic64_t kite_l2_reindexed, kite_soft_preserved, kite_scan_stopped;
+  atomic64_t kite_learn_reason[8];
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -234,6 +234,8 @@
+ 		atomic64_read(&ppe->kite_path_out_npu),
+ 		atomic64_read(&ppe->kite_path_in_npu),
+ 		atomic64_read(&ppe->kite_egress_blocked));
++ seq_printf(m, "r75_ps empty=%lld parked=%lld scope=transactions_not_packets\n",
++  atomic64_read(&ppe->kite_ps_empty), atomic64_read(&ppe->kite_ps_parked));
+ 	seq_printf(m, "kite_capture_shared=%lld kite_capture_new=%lld kite_capture_guarded=%lld kite_policy_full=%lld kite_capture_full=%lld kite_full_bucket=%u kite_l2_promoted=%lld\n",
+ 		atomic64_read(&ppe->kite_capture_shared), atomic64_read(&ppe->kite_capture_new),
+ 		atomic64_read(&ppe->kite_capture_guarded), atomic64_read(&ppe->kite_policy_full),

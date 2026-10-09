@@ -1,0 +1,16 @@
+From: ponwrt maintainers
+Subject: [PATCH] r77: Retain PS transition history across recorder intervals.
+
+Native incremental patch on release76. Ownership and datapath ABI12 unchanged.
+
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -326,7 +326,7 @@
+  unsigned long changed_at;
+  u64 blocked_ns, since_ns, max_blocked_ns;
+ };
+-#define MT7915_KITE_PS_EVENTS 128
++#define MT7915_KITE_PS_EVENTS 1024
+ struct mt7915_kite_ps_event {
+  u64 ns;
+  u32 serial, event, wcid, raw, generation, key_generation;

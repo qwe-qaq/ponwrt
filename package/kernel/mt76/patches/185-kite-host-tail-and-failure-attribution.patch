@@ -1,0 +1,442 @@
+From: ponwrt maintainers
+Subject: [PATCH] r73: Observe sampled host tails, final-MPDU sources and active aggregation.
+
+Native incremental patch on release72. Ownership and datapath ABI unchanged.
+
+--- a/npu.c
++++ b/npu.c
+@@ -28,8 +28,10 @@
+ 		int offset;
+ 
+ 		e->buf = mt76_get_page_pool_buf(q, &offset, q->buf_size);
+-		if (!e->buf)
++		if (!e->buf) {
++			q->kite_alloc_fail++;
+ 			break;
++		}
+ 
+ 		e->dma_len[0] = SKB_WITH_OVERHEAD(q->buf_size);
+ 		page = virt_to_head_page(e->buf);
+@@ -254,6 +256,15 @@
+ }
+ EXPORT_SYMBOL_GPL(mt76_npu_check_ppe);
+ 
++
++static void mt76_kite_refill(struct mt76_dev *dev, struct mt76_queue *q,
++                            bool sample, u64 *elapsed)
++{
++ u64 at = sample ? ktime_get_mono_fast_ns() : 0;
++ mt76_npu_fill_rx_queue(dev, q);
++ if (sample) *elapsed += ktime_get_mono_fast_ns() - at;
++}
++
+ static int mt76_npu_rx_poll(struct napi_struct *napi, int budget)
+ {
+ 	struct mt76_dev *dev = mt76_priv(napi->dev);
+@@ -262,6 +273,8 @@
+ 	bool kite = dev->mmio.npu_type == MT76_NPU_TYPE_KITE;
+ 	struct airoha_npu *npu;
+ 	int done = 0, frames = 0;
++ bool sample = false;
++ u64 sample_at = 0, refill_ns = 0, deliver_at = 0, irq_at;
+  u64 observed_at = dev->drv->rx_poll_observe ? ktime_get_mono_fast_ns() : 0;
+ 
+ 	if (budget <= 0)
+@@ -271,8 +284,21 @@
+ 	if (!npu)
+ 		goto out;
+ 
+-	if (kite)
+-		q->kite_rx_polls++;
++	if (kite) {
++  q->kite_rx_polls++;
++  sample = !(q->kite_rx_polls & 63);
++  if (sample) sample_at = ktime_get_mono_fast_ns();
++  irq_at = atomic64_xchg(&q->kite_irq_at, 0);
++  if (irq_at) {
++   static const u32 bins[] = {1000,4000,16000,64000,256000,1000000,4000000};
++   u64 age = ktime_get_mono_fast_ns() - irq_at;
++   u32 i = 0;
++   while (i < ARRAY_SIZE(bins) && age > bins[i]) i++;
++   q->kite_irq_bins[i]++; q->kite_irq_samples++;
++   q->kite_irq_ns += age;
++   q->kite_irq_max_ns = max(q->kite_irq_max_ns, age);
++  }
++ }
+ 	while (done < budget) {
+ 		struct sk_buff *skb;
+ 		u32 info[3] = {};
+@@ -295,10 +321,11 @@
+ 		 * remain owned by those SKBs; refill obtains fresh pool pages.
+ 		 */
+ 		if (kite && !(done & 15))
+-			mt76_npu_fill_rx_queue(dev, q);
+-	}
+-
+-	mt76_npu_fill_rx_queue(dev, q);
++			mt76_kite_refill(dev, q, sample, &refill_ns);
++	}
++
++	mt76_kite_refill(dev, q, sample, &refill_ns);
++ if (sample) deliver_at = ktime_get_mono_fast_ns();
+ 	if (kite) {
+ 		q->kite_rx_frames += frames;
+ 		q->kite_rx_empty += !done;
+@@ -313,6 +340,18 @@
+ 			q->kite_rx_batches++;
+ 		}
+ 	}
++ if (sample) {
++  u64 end = ktime_get_mono_fast_ns();
++  q->kite_poll_samples++;
++  q->kite_process_ns += deliver_at - sample_at - refill_ns;
++  q->kite_refill_ns += refill_ns;
++  q->kite_delivery_ns += end - deliver_at;
++  if (end - sample_at > q->kite_poll_max_ns) {
++   q->kite_poll_max_ns = end - sample_at; q->kite_worst_at_ns = end;
++   q->kite_worst_head = q->head; q->kite_worst_tail = q->tail;
++   q->kite_worst_queued = q->queued; q->kite_worst_frames = frames;
++  }
++ }
+ out:
+  if (dev->drv->rx_poll_observe)
+   dev->drv->rx_poll_observe(dev, qid, done, budget, ktime_get_mono_fast_ns() - observed_at);
+@@ -345,8 +384,14 @@
+ 	airoha_npu_wlan_set_irq_status(npu, status);
+ 
+ 	airoha_npu_wlan_disable_irq(npu, index);
+-	if (READ_ONCE(dev->npu_napi_enabled[index]))
+-		napi_schedule(&dev->napi[qid]);
++	if (READ_ONCE(dev->npu_napi_enabled[index]) &&
++     napi_schedule_prep(&dev->napi[qid])) {
++  /* Same schedule contract as napi_schedule; timestamp before publication.
++   * Budget continuations have no new IRQ sample. 1/64 IRQ attempts. */
++  if (dev->mmio.npu_type == MT76_NPU_TYPE_KITE && !(q->kite_rx_irqs & 63))
++   atomic64_set(&q->kite_irq_at, ktime_get_mono_fast_ns());
++  __napi_schedule(&dev->napi[qid]);
++ }
+ out:
+ 	rcu_read_unlock();
+ 
+--- a/mt76.h
++++ b/mt76.h
+@@ -259,6 +259,13 @@
+ 	u32 kite_rx_empty, kite_rx_budget, kite_rx_refill_short,
+ 		kite_rx_max_batch;
+ 	u32 kite_rx_irqs, kite_rx_irq_empty;
++ /* Observations only: IRQ writer uses atomics; NAPI owns timing totals. */
++ atomic64_t kite_irq_at;
++ u64 kite_irq_samples, kite_irq_ns, kite_irq_max_ns;
++ u64 kite_poll_samples, kite_process_ns, kite_refill_ns, kite_delivery_ns;
++ u64 kite_poll_max_ns, kite_worst_at_ns;
++ u32 kite_alloc_fail, kite_worst_head, kite_worst_tail, kite_worst_queued;
++ u32 kite_worst_frames, kite_irq_bins[8];
+ 	unsigned long kite_progress_at;
+ 	struct mt76_queue_regs __iomem *regs;
+ 
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1040,6 +1040,9 @@
+ 	u16 total, count = 0;
+ 	u32 txd;
+ 	__le32 *cur_info;
++#ifdef CONFIG_MT7915_NPU
++ u16 failure_wcid = 0xffff;
++#endif
+ 
+ #ifdef CONFIG_MT7915_NPU
+  struct mt7915_kite_wa_batch batch;
+@@ -1058,8 +1061,12 @@
+ 		u32 msdu, info;
+ 		u8 i;
+ 
+-		if (WARN_ON_ONCE((void *)(cur_info + 1) > end))
++		if (WARN_ON_ONCE((void *)(cur_info + 1) > end)) {
++#ifdef CONFIG_MT7915_NPU
++   batch.failed.incomplete = 1;
++#endif
+ 			goto finish;
++  }
+ 
+ 		/*
+ 		 * 1'b1: new wcid pair.
+@@ -1070,7 +1077,13 @@
+ 			struct mt7915_sta *msta;
+ 			u16 idx;
+ 
++#ifdef CONFIG_MT7915_NPU
++   if (batch.failed_active) mt7915_npu_wa_failure_end(dev, &batch);
++#endif
+ 			idx = FIELD_GET(MT_TX_FREE_WLAN_ID, info);
++#ifdef CONFIG_MT7915_NPU
++   failure_wcid = idx;
++#endif
+ 			wcid = mt76_wcid_ptr(dev, idx);
+ 			sta = wcid_to_sta(wcid);
+ 			if (!sta)
+@@ -1081,6 +1094,14 @@
+ 			continue;
+ 		}
+ 
++#ifdef CONFIG_MT7915_NPU
++  if ((v3 && (info & MT_TX_FREE_MPDU_HEADER_V3)) ||
++      (!v3 && (info & MT_TX_FREE_MPDU_HEADER))) {
++   if (batch.failed_active) mt7915_npu_wa_failure_end(dev, &batch);
++   if (v3 ? FIELD_GET(MT_TX_FREE_STAT_V3, info) : FIELD_GET(MT_TX_FREE_STAT, info))
++    mt7915_npu_wa_failure_start(dev, &batch, wcid, failure_wcid, info, txd);
++  }
++#endif
+ 		if (!mtk_wed_device_active(&mdev->mmio.wed) && wcid) {
+ 			u32 tx_retries = 0, tx_failed = 0, count;
+ 
+@@ -1124,6 +1145,7 @@
+ 			}
+ 			count++;
+ #ifdef CONFIG_MT7915_NPU
++			if (batch.failed_active) mt7915_npu_wa_failure_token(dev, &batch, msdu);
+ 			if (mt7915_npu_wa_add(dev, &batch, msdu))
+ 				continue;
+ #endif
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -332,7 +332,18 @@
+  u32 serial, event, wcid, raw, generation, key_generation;
+  u32 request, blocked, issued, consumed;
+ };
++struct mt7915_kite_failed_event {
++ u64 ns;
++ u32 serial, session, generation, info, txd;
++ u16 wcid;
++ u8 band, peer, source, incomplete;
++};
++struct mt7915_kite_failed_wcid {
++ u32 generation, count[4];
++};
+ struct mt7915_kite_wa_batch {
++ struct mt7915_kite_failed_event failed;
++ bool failed_active;
+  u16 token[32]; u32 count, events; u64 start_ns;
+  u32 mpdu[2], retries[2], final_failed[2];
+ };
+@@ -398,6 +409,10 @@
+   struct mt7915_kite_ps_event ps_events[MT7915_KITE_PS_EVENTS];
+   struct mt7915_kite_ps_state ps[KDP_WCIDS];
+   struct mt7915_kite_wa_stats wa;
++  struct mt7915_kite_failed_event failed_events[32];
++  struct mt7915_kite_failed_wcid failed_wcid[MT7916_WTBL_SIZE];
++  u32 failed_serial;
++  u64 failed_class[3][4]; /* band0, band1, unknown; source unknown/native/KDP/mixed */
+   struct mt7915_kite_napi_stats napi[__MT_RXQ_MAX];
+ 		DECLARE_BITMAP(dp_ps_pending, KDP_WCIDS);
+ 		bool dp_work_stopping, dp_work_initialized;
+@@ -685,6 +700,10 @@
+ void mt7915_npu_amsdu_resume(struct mt7915_dev *dev);
+ bool mt7915_npu_dp_tx_free(struct mt7915_dev *dev, u16 token);
+ void mt7915_npu_dp_tx_done_publish(struct mt7915_dev *dev);
++void mt7915_npu_wa_failure_end(struct mt7915_dev *dev, struct mt7915_kite_wa_batch *batch);
++void mt7915_npu_wa_failure_start(struct mt7915_dev *dev, struct mt7915_kite_wa_batch *batch,
++                               struct mt76_wcid *wcid, u16 idx, u32 info, u32 txd);
++void mt7915_npu_wa_failure_token(struct mt7915_dev *dev, struct mt7915_kite_wa_batch *batch, u16 token);
+ void mt7915_npu_wa_begin(struct mt7915_kite_wa_batch *batch);
+ bool mt7915_npu_wa_add(struct mt7915_dev *dev, struct mt7915_kite_wa_batch *batch, u16 token);
+ void mt7915_npu_wa_end(struct mt7915_dev *dev, struct mt7915_kite_wa_batch *batch);
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1534,6 +1534,17 @@
+ 			READ_ONCE(q->kite_rx_irqs),
+ 			READ_ONCE(q->kite_rx_irq_empty), READ_ONCE(q->queued),
+ 			q->ndesc);
++  seq_printf(seq, "r73_host%u alloc_fail=%u irq_samples=%llu irq_ns=%llu irq_max_ns=%llu poll_samples=%llu process_ns=%llu refill_ns=%llu delivery_ns=%llu max_ns=%llu worst_at_ns=%llu head=%u tail=%u queued=%u frames=%u poll_shift=6 irq_shift=6 coherent=0\n",
++   b, READ_ONCE(q->kite_alloc_fail), READ_ONCE(q->kite_irq_samples),
++   READ_ONCE(q->kite_irq_ns), READ_ONCE(q->kite_irq_max_ns),
++   READ_ONCE(q->kite_poll_samples), READ_ONCE(q->kite_process_ns),
++   READ_ONCE(q->kite_refill_ns), READ_ONCE(q->kite_delivery_ns),
++   READ_ONCE(q->kite_poll_max_ns), READ_ONCE(q->kite_worst_at_ns),
++   READ_ONCE(q->kite_worst_head), READ_ONCE(q->kite_worst_tail),
++   READ_ONCE(q->kite_worst_queued), READ_ONCE(q->kite_worst_frames));
++  seq_printf(seq, "r73_irq%u", b);
++  for (int i = 0; i < 8; i++) seq_printf(seq, " bin%u=%u", i, READ_ONCE(q->kite_irq_bins[i]));
++  seq_putc(seq, '\n');
+ 	}
+ 	mutex_unlock(&dev->mt76.mutex);
+ 	return 0;
+@@ -1889,6 +1900,7 @@
+ 	debugfs_create_file("kite_datapath", 0400, dir, dev, &mt7915_kite_datapath_fops);
+  debugfs_create_file("kite_datapath_light",0400,dir,dev,&mt7915_kite_datapath_light_fops);
+ 	debugfs_create_file("kite_tx", 0400, dir, dev, &mt7915_kite_tx_fops);
++	debugfs_create_file("kite_aggregation", 0400, dir, dev, &mt7915_kite_aggregation_fops);
+ 	debugfs_create_file("kite_rx", 0400, dir, dev, &mt7915_kite_rx_fops);
+ 	debugfs_create_file("kite_trace", 0400, dir, dev, &mt7915_kite_trace_fops);
+ 	debugfs_create_file("kite_events", 0400, dir, dev, &mt7915_kite_events_fops);
+--- a/mt7915/npu-r59-observe.inc
++++ b/mt7915/npu-r59-observe.inc
+@@ -1,4 +1,78 @@
+ /* SPDX-License-Identifier: ISC */
++/* Caller holds mt76.mutex; WTBL bank access remains in native sta_poll. */
++static void mt7915_kite_aggregation_sta(struct seq_file *m, struct mt7915_dev *dev,
++                                      struct mt7915_sta *msta, unsigned int i)
++{
++ struct mt76_wcid *wcid = &msta->wcid;
++ unsigned int j;
++ seq_printf(m, "r73_peer%u band=%u generation=%u key_generation=%u\n", i,
++  wcid->phy_idx, dev->kite.generation[i], dev->kite.key_generation[i]);
++  for (j = 0; j < 8; j++) {
++   struct mt7915_kite_ba_wait b;
++   spin_lock_bh(&dev->kite.dp_done_lock); b = msta->npu_ba_wait[j];
++   spin_unlock_bh(&dev->kite.dp_done_lock);
++   if (b.starts || b.stops || b.operational)
++    seq_printf(m,"r69_ba%u_%u starts=%u operational=%u stops=%u failures=%u action=%u result=%d started_ns=%llu last_ns=%llu elapsed_ns=%llu max_ns=%llu\n",
++     i,j,b.starts,b.operational,b.stops,b.failures,b.action,b.result,b.started_ns,b.last_ns,b.elapsed_ns,b.max_ns);
++  }
++  seq_printf(m, "r59_agg%u peer_max_bytes=%u native_enabled=%u native_max_subframes=8 tids=%u",
++             i, msta->npu_amsdu_len, wcid->amsdu, msta->npu_amsdu_tids);
++  for (j = 0; j < 8; j++) seq_printf(m, " ba%u=%u", j, msta->npu_ba_window[j]);
++  seq_putc(m, '\n');
++  seq_printf(m,"r66_agg%u mcu_acked=%u enable=%u max_subframes=%u mpdu_code=%u\n",
++   i,msta->npu_amsdu_mcu_acked,msta->npu_amsdu_mcu&0xff,
++   (msta->npu_amsdu_mcu>>8)&0xff,(msta->npu_amsdu_mcu>>16)&0xff);
++  seq_printf(m,"r60_wtbl%u valid=%u age_jiffies=%lu",i,
++   READ_ONCE(msta->npu_wtbl_valid),jiffies-READ_ONCE(msta->npu_wtbl_at));
++  for (j=0;j<10;j++) seq_printf(m," dw%u=%08x",j,READ_ONCE(msta->npu_wtbl[j]));
++  seq_putc(m,'\n');
++  /* Native station polling owns the bank selector. Ask it for a bounded
++   * snapshot; diagnostics must not race NAPI by selecting a WTBL bank. */
++  WRITE_ONCE(msta->npu_wtbl_pending,true);
++}
++static int mt7915_kite_aggregation_show(struct seq_file *m, void *unused)
++{
++ struct mt7915_dev *dev = m->private;
++ unsigned int i, b, j;
++ seq_puts(m, "aggregation_abi=1 wtbl=cached_nonatomic wa_dynamic_limit=unavailable mcu_ack_is_configuration_only\n");
++ mutex_lock(&dev->mt76.mutex);
++ for (i = 1; i < KDP_WCIDS; i++) {
++  struct mt76_wcid *wcid;
++  if (!dev->kite.live[i]) continue;
++  wcid = rcu_dereference_protected(dev->mt76.wcid[i], lockdep_is_held(&dev->mt76.mutex));
++  if (wcid && wcid->sta)
++   mt7915_kite_aggregation_sta(m, dev, container_of(wcid, struct mt7915_sta, wcid), i);
++ }
++ mutex_unlock(&dev->mt76.mutex);
++ for (b = 0; b < 3; b++) {
++  u64 counts[4];
++  spin_lock_bh(&dev->kite.dp_done_lock);
++  memcpy(counts, dev->kite.failed_class[b], sizeof(counts));
++  spin_unlock_bh(&dev->kite.dp_done_lock);
++  seq_printf(m, "r73_fail_band%u unknown=%llu native=%llu kdp=%llu mixed=%llu\n",
++   b, counts[0], counts[1], counts[2], counts[3]);
++ }
++ for (i = 0; i < MT7916_WTBL_SIZE; i++) {
++  struct mt7915_kite_failed_wcid v;
++  spin_lock_bh(&dev->kite.dp_done_lock); v = dev->kite.failed_wcid[i];
++  spin_unlock_bh(&dev->kite.dp_done_lock);
++  if (v.count[0] || v.count[1] || v.count[2] || v.count[3])
++   seq_printf(m, "r73_fail_wcid%u generation=%u unknown=%u native=%u kdp=%u mixed=%u\n",
++    i, v.generation, v.count[0], v.count[1], v.count[2], v.count[3]);
++ }
++ for (j = 0; j < ARRAY_SIZE(dev->kite.failed_events); j++) {
++  struct mt7915_kite_failed_event e;
++  spin_lock_bh(&dev->kite.dp_done_lock); e = dev->kite.failed_events[j];
++  spin_unlock_bh(&dev->kite.dp_done_lock);
++  if (e.ns)
++   seq_printf(m, "r73_failed serial=%u ns=%llu session=%u wcid=%u generation=%u band=%u peer=%u source=%u incomplete=%u info=%08x txd=%08x\n",
++    e.serial, e.ns, e.session, e.wcid, e.generation, e.band, e.peer, e.source, e.incomplete, e.info, e.txd);
++ }
++ seq_puts(m, "failure_scope=MPDU_final_status source=0_unknown_1_native_2_KDP_3_mixed ring=last32 wcid=last_seen_generation not_TCP_packet_loss\n");
++ return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mt7915_kite_aggregation);
++
+ /* Reader only. No diagnostic MMIO writes, no read-to-clear MIB registers. */
+ static void mt7915_kite_r59_show(struct seq_file *m, struct mt7915_dev *dev,
+                                struct kdp_shared *s, bool detail)
+@@ -126,28 +200,7 @@
+   wcid = rcu_dereference_protected(dev->mt76.wcid[i], lockdep_is_held(&dev->mt76.mutex));
+   if (!wcid || !wcid->sta) continue;
+   msta = container_of(wcid, struct mt7915_sta, wcid);
+-  for (j = 0; j < 8; j++) {
+-   struct mt7915_kite_ba_wait b;
+-   spin_lock_bh(&dev->kite.dp_done_lock); b = msta->npu_ba_wait[j];
+-   spin_unlock_bh(&dev->kite.dp_done_lock);
+-   if (b.starts || b.stops || b.operational)
+-    seq_printf(m,"r69_ba%u_%u starts=%u operational=%u stops=%u failures=%u action=%u result=%d started_ns=%llu last_ns=%llu elapsed_ns=%llu max_ns=%llu\n",
+-     i,j,b.starts,b.operational,b.stops,b.failures,b.action,b.result,b.started_ns,b.last_ns,b.elapsed_ns,b.max_ns);
+-  }
+-  seq_printf(m, "r59_agg%u peer_max_bytes=%u native_enabled=%u native_max_subframes=8 tids=%u",
+-             i, msta->npu_amsdu_len, wcid->amsdu, msta->npu_amsdu_tids);
+-  for (j = 0; j < 8; j++) seq_printf(m, " ba%u=%u", j, msta->npu_ba_window[j]);
+-  seq_putc(m, '\n');
+-  seq_printf(m,"r66_agg%u mcu_acked=%u enable=%u max_subframes=%u mpdu_code=%u\n",
+-   i,msta->npu_amsdu_mcu_acked,msta->npu_amsdu_mcu&0xff,
+-   (msta->npu_amsdu_mcu>>8)&0xff,(msta->npu_amsdu_mcu>>16)&0xff);
+-  seq_printf(m,"r60_wtbl%u valid=%u age_jiffies=%lu",i,
+-   READ_ONCE(msta->npu_wtbl_valid),jiffies-READ_ONCE(msta->npu_wtbl_at));
+-  for (j=0;j<10;j++) seq_printf(m," dw%u=%08x",j,READ_ONCE(msta->npu_wtbl[j]));
+-  seq_putc(m,'\n');
+-  /* Native station polling owns the bank selector. Ask it for a bounded
+-   * snapshot; diagnostics must not race NAPI by selecting a WTBL bank. */
+-  WRITE_ONCE(msta->npu_wtbl_pending,true);
++  mt7915_kite_aggregation_sta(m, dev, msta, i);
+ 
+  }
+  if (detail) for (i=0;i<MT7915_KITE_PS_EVENTS;i++) {
+--- a/mt7915/npu-wa.inc
++++ b/mt7915/npu-wa.inc
+@@ -60,6 +60,50 @@
+  /* Compatibility callers have already published at their batch boundary. */
+  if (READ_ONCE(dev->kite.dp_bound)) mt7915_npu_wa_flush(dev, NULL, 0);
+ }
++
++/* Only failed MPDUs take this path. PAIR/header/end boundaries close the
++ * previous MPDU; following MSDU IDs describe source, not successful ACKs.
++ * Missing pair/token evidence remains explicit unknown. */
++void mt7915_npu_wa_failure_end(struct mt7915_dev *dev, struct mt7915_kite_wa_batch *b)
++{
++ unsigned long flags;
++ struct mt7915_kite_failed_event *e = &b->failed;
++ u32 band, source;
++ if (!b->failed_active) return;
++ band = e->band < 2 ? e->band : 2;
++ source = e->source & 3;
++ spin_lock_irqsave(&dev->kite.dp_done_lock, flags);
++ e->serial = ++dev->kite.failed_serial;
++ dev->kite.failed_class[band][source]++;
++ if (e->wcid < MT7916_WTBL_SIZE) {
++  struct mt7915_kite_failed_wcid *w = &dev->kite.failed_wcid[e->wcid];
++  if (w->generation != e->generation) {
++   memset(w, 0, sizeof(*w)); w->generation = e->generation;
++  }
++  w->count[source]++;
++ }
++ dev->kite.failed_events[(e->serial - 1) & 31] = *e;
++ spin_unlock_irqrestore(&dev->kite.dp_done_lock, flags);
++ b->failed_active = false;
++}
++void mt7915_npu_wa_failure_start(struct mt7915_dev *dev, struct mt7915_kite_wa_batch *b,
++                               struct mt76_wcid *wcid, u16 idx, u32 info, u32 txd)
++{
++ struct mt7915_kite_failed_event *e = &b->failed;
++ memset(e, 0, sizeof(*e));
++ e->ns = ktime_get_mono_fast_ns(); e->session = READ_ONCE(dev->kite.session);
++ e->wcid = idx; e->band = wcid ? wcid->phy_idx : 0xff;
++ e->peer = wcid && wcid->sta; e->info = info; e->txd = txd;
++ if (idx < MT7916_WTBL_SIZE) e->generation = READ_ONCE(dev->kite.generation[idx]);
++ b->failed_active = true;
++}
++void mt7915_npu_wa_failure_token(struct mt7915_dev *dev, struct mt7915_kite_wa_batch *b, u16 token)
++{
++ if (!b->failed_active) return;
++ b->failed.source |= dev->kite.dp_tokens_reserved &&
++  token >= KDP_TOKEN_BASE && token < KDP_TOKEN_LIMIT ? 2 : 1;
++}
++
+ void mt7915_npu_wa_begin(struct mt7915_kite_wa_batch *b)
+ {
+  memset(b, 0, sizeof(*b)); b->start_ns = ktime_get_mono_fast_ns();
+@@ -79,6 +123,7 @@
+  unsigned long flags;
+  u64 elapsed;
+  u32 i = 0;
++ mt7915_npu_wa_failure_end(dev, b);
+  if (b->count) mt7915_npu_wa_flush(dev, b->token, b->count);
+  elapsed = ktime_get_mono_fast_ns() - b->start_ns;
+  while (i < 7 && elapsed > ns[i]) i++;

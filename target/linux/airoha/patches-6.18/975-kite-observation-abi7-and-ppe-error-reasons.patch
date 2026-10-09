@@ -1,0 +1,138 @@
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -739,6 +739,7 @@
+ 	atomic64_t replace_fail;
+ 	atomic64_t destroy_ok;
+ 	atomic64_t destroy_fail;
++	atomic64_t replace_errors[7], destroy_errors[7];
+ 	atomic64_t learn_requests;
+ 	atomic64_t bind_ok;
+ 	atomic64_t bridge_policy_fallback;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1859,6 +1859,20 @@
+ 	return err;
+ }
+ 
++/* Diagnostic classes never alter return codes or revocation semantics. */
++static unsigned int airoha_ppe_error_class(int err)
++{
++ switch (err) {
++ case -EOPNOTSUPP: return 0;
++ case -ENOENT: return 1;
++ case -ENOSPC: return 2;
++ case -ENOMEM: return 3;
++ case -EBUSY: case -EAGAIN: return 4;
++ case -EIO: case -ETIMEDOUT: return 5;
++ default: return 6;
++ }
++}
++
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data)
+ {
+ 	struct airoha_ppe *ppe = dev->priv;
+@@ -1889,14 +1903,16 @@
+ 	if (f->command == FLOW_CLS_REPLACE) {
+ 		if (err) {
+ 			atomic64_inc(&ppe->replace_fail);
++			atomic64_inc(&ppe->replace_errors[airoha_ppe_error_class(err)]);
+ 			WRITE_ONCE(ppe->replace_errno, err);
+ 		} else {
+ 			atomic64_inc(&ppe->replace_ok);
+ 		}
+ 	} else if (f->command == FLOW_CLS_DESTROY) {
+-		if (err)
++		if (err) {
+ 			atomic64_inc(&ppe->destroy_fail);
+-		else
++			atomic64_inc(&ppe->destroy_errors[airoha_ppe_error_class(err)]);
++		} else
+ 			atomic64_inc(&ppe->destroy_ok);
+ 	}
+ 
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -259,6 +259,13 @@
+ 	seq_printf(m, "replace_fail=%lld\n", atomic64_read(&ppe->replace_fail));
+ 	seq_printf(m, "destroy_ok=%lld\n", atomic64_read(&ppe->destroy_ok));
+ 	seq_printf(m, "destroy_fail=%lld\n", atomic64_read(&ppe->destroy_fail));
++	{
++	 static const char * const reason[] = { "unsupported", "absent", "capacity", "memory", "busy", "io", "other" };
++	 unsigned int i;
++	 for (i = 0; i < ARRAY_SIZE(reason); i++)
++	  seq_printf(m, "replace_error_%s=%lld destroy_error_%s=%lld\n", reason[i],
++	             atomic64_read(&ppe->replace_errors[i]), reason[i], atomic64_read(&ppe->destroy_errors[i]));
++	}
+ 	seq_printf(m, "learn_requests=%lld\n", atomic64_read(&ppe->learn_requests));
+ 	seq_printf(m, "bridge_policy_fallback=%lld\n",
+ 		   atomic64_read(&ppe->bridge_policy_fallback));
+--- a/include/linux/soc/airoha/kite-datapath.h
++++ b/include/linux/soc/airoha/kite-datapath.h
+@@ -9,8 +9,8 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_ABI_VERSION 6u
+-#define KDP_MAGIC 0x4b440006u
++#define KDP_ABI_VERSION 7u
++#define KDP_MAGIC 0x4b440007u
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -206,7 +206,7 @@
+ struct kdp_perf_control {
+ 	unsigned int flags, free_count, pending_count, alloc_probe;
+ 	unsigned int alloc_empty, reap_probe, reap_ready, cache_flush;
+-	unsigned int reserved[8];
++	unsigned int sample_shift, reserved[7];
+ };
+ struct kdp_perf_band {
+ 	unsigned int parse_fast, parse_slow, parse_reuse, hint_hit;
+@@ -229,6 +229,33 @@
+ 	return tid < 8 && (contract & (1u << tid)) && len <= 1514 &&
+ 	       len + 64 <= (contract >> 16);
+ }
++
++/* ABI7 observation only. Single hart4 writer; seq protects the published
++ * snapshot. Time sums wrap modulo 2^32; latency sums use 256-cycle units.
++ * sample_shift=0 disables profiling, otherwise one batch/submission in 2^N.
++ * Completion ages are observations by hart4, not RF ACK timestamps. */
++#define KDP_OBS_STAGES 4u
++#define KDP_OBS_PARSE 0u
++#define KDP_OBS_POLICY 1u
++#define KDP_OBS_TXWI 2u
++#define KDP_OBS_REAP 3u
++struct kdp_observe_time {
++ unsigned int samples, cycles, units, max_cycles;
++};
++struct kdp_observe_band {
++ unsigned int polls, busy, tdma_empty, tdma_ready;
++ unsigned int ring_full, batches, packets, max_batch;
++ unsigned int hint_probe, hint_replace, sample_packets, sample_cancelled;
++ unsigned int dma_samples, dma_ticks, dma_max_ticks, wa_samples;
++ unsigned int wa_ticks, wa_max_ticks, free_samples, free_ticks;
++ unsigned int free_max_ticks, ready_samples, ready_ticks, ready_max_ticks;
++ unsigned int mmio_samples, mmio_cycles, mmio_max_cycles, reserved;
++ struct kdp_observe_time time[KDP_OBS_STAGES];
++};
++struct kdp_observe {
++ unsigned int seq, sample_shift, clock_mhz, publishes;
++ struct kdp_observe_band band[2];
++};
+ 
+ struct kdp_shared {
+ 	unsigned int magic, bytes, session, epoch;
+@@ -250,9 +277,10 @@
+ 	struct kdp_quality_stats quality[2];
+ 	struct kdp_perf_control perf;
+ 	struct kdp_perf_band performance[2];
+-};
+-
+-/* ABI6 extends the tail, never the header or DMA regions. Magic and bytes
++	struct kdp_observe observe;
++};
++
++/* ABI7 extends the tail, never the header or DMA regions. Magic and bytes
+  * are both checked so a mixed driver/firmware fails before DMA admission. */
+ _Static_assert(sizeof(struct kdp_perf_control) == 64, "Kite perf control");
+ _Static_assert(sizeof(struct kdp_perf_band) == 64, "Kite perf counters");

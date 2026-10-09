@@ -1,0 +1,164 @@
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1595,7 +1595,7 @@
+ 		mt76_txq_schedule_all(ext_phy);
+ 
+ 	/* disable all tx/rx napi */
+-	mt76_worker_disable(&dev->mt76.tx_worker);
++	mt7915_tx_worker_disable(dev);
+ 	mt7915_dma_napi_disable(dev);
+ 	if (!mdev->tx_napi_disabled) {
+ 		napi_disable(&mdev->tx_napi);
+@@ -1724,7 +1724,7 @@
+ 	napi_schedule(&dev->mt76.tx_napi);
+ 	local_bh_enable();
+ 
+-	mt76_worker_enable(&dev->mt76.tx_worker);
++	mt7915_tx_worker_enable(dev);
+ 
+ 	if (!ret)
+ 		dev_info(dev->mt76.dev, "Kite recovery restart complete: run_main=%u run_ext=%u\n",
+@@ -1914,7 +1914,7 @@
+ 
+ 	mutex_lock(&dev->mt76.mutex);
+ 
+-	mt76_worker_disable(&dev->mt76.tx_worker);
++	mt7915_tx_worker_disable(dev);
+ 	mt7915_dma_napi_disable(dev);
+ 	if (!dev->mt76.tx_napi_disabled) {
+ 		napi_disable(&dev->mt76.tx_napi);
+@@ -1955,7 +1955,7 @@
+ 
+ 	tasklet_schedule(&dev->mt76.irq_tasklet);
+ 
+-	mt76_worker_enable(&dev->mt76.tx_worker);
++	mt7915_tx_worker_enable(dev);
+ 
+ 	napi_enable(&dev->mt76.tx_napi);
+ 	dev->mt76.tx_napi_disabled = false;
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -1117,6 +1117,33 @@
+ 	mtxq = (struct mt76_txq *)txq->drv_priv;
+ 
+ 	mutex_lock(&dev->mt76.mutex);
++	/* A failed reset retains its parked worker and firmware ownership.
++	 * mac80211 can still tear BA sessions down here. Finish local state and
++	 * STOP_CONT callbacks without MCU commands or unpark; reset rebuilds BA.
++	 */
++	if (test_bit(MT76_RESET, &dev->mphy.state) ||
++	    dev->mt76.npu_quarantine || dev->recovery.failed ||
++	    dev->recovery.tx_worker_stopped) {
++		switch (action) {
++		case IEEE80211_AMPDU_RX_STOP:
++			mt76_rx_aggr_stop(&dev->mt76, &msta->wcid, tid);
++			break;
++		case IEEE80211_AMPDU_TX_STOP_FLUSH:
++		case IEEE80211_AMPDU_TX_STOP_FLUSH_CONT:
++		case IEEE80211_AMPDU_TX_STOP_CONT:
++			mtxq->aggr = false;
++			mtxq->send_bar = false;
++			clear_bit(tid, &msta->wcid.ampdu_state);
++			if (action == IEEE80211_AMPDU_TX_STOP_CONT)
++				ieee80211_stop_tx_ba_cb_irqsafe(vif, sta->addr, tid);
++			break;
++		default:
++			ret = -EBUSY;
++			break;
++		}
++		mutex_unlock(&dev->mt76.mutex);
++		return ret;
++	}
+ 	switch (action) {
+ 	case IEEE80211_AMPDU_RX_START:
+ 		mt76_rx_aggr_start(&dev->mt76, &msta->wcid, tid, ssn,
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -761,13 +761,13 @@
+ 	struct mt7915_vif *mvif = msta->vif;
+ 	int ret;
+ 
+-	mt76_worker_disable(&dev->mt76.tx_worker);
++	mt7915_tx_worker_disable(dev);
+ 	if (enable && !params->amsdu)
+ 		msta->wcid.amsdu = false;
+ 	ret = mt76_connac_mcu_sta_ba(&dev->mt76, &mvif->mt76, params,
+ 				     MCU_EXT_CMD(STA_REC_UPDATE),
+ 				     enable, true);
+-	mt76_worker_enable(&dev->mt76.tx_worker);
++	mt7915_tx_worker_enable(dev);
+ 
+ 	return ret;
+ }
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -360,6 +360,7 @@
+ 		u8 retry_count;
+ 		bool restart:1;
+ 		bool napi_stopped:1;
++		bool tx_worker_stopped:1;
+ 		bool failed:1;
+ 	} recovery;
+ 
+@@ -441,6 +442,23 @@
+ 	RDD_RESUME_BF,
+ 	RDD_IRQ_OFF,
+ };
++
++/* Serialized by mt76.mutex, including failed reset retries. */
++static inline void mt7915_tx_worker_disable(struct mt7915_dev *dev)
++{
++	if (dev->recovery.tx_worker_stopped)
++		return;
++	mt76_worker_disable(&dev->mt76.tx_worker);
++	dev->recovery.tx_worker_stopped = true;
++}
++
++static inline void mt7915_tx_worker_enable(struct mt7915_dev *dev)
++{
++	if (!dev->recovery.tx_worker_stopped)
++		return;
++	mt76_worker_enable(&dev->mt76.tx_worker);
++	dev->recovery.tx_worker_stopped = false;
++}
+ 
+ static inline int
+ mt7915_get_rdd_idx(struct mt7915_phy *phy, bool is_background)
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1348,17 +1348,31 @@
+ 		if (kite_tx_read(&s->fault) || (dp && kdp_failed(dp)) ||
+ 		    time_after(jiffies, q->kite_progress_at + 15 * HZ) ||
+ 		    (dp_pending && time_after(jiffies, dev->kite.dp_progress_at[b] + 15 * HZ))) {
++			bool global_fault = dp && kdp_failed(dp);
+ 			struct mt7915_dp_pending pending = mt7915_dp_pending(dev, b);
+-
++			int error = global_fault || kite_tx_read(&s->fault) ? -EIO : -ETIMEDOUT;
++			int diag_band;
++
++			/* A shared fault is observed on the first loop iteration; print
++			 * both bands so an idle band0 is not blamed for a band1 failure. */
++			if (global_fault)
++				for (diag_band = 0; diag_band < 2; diag_band++) {
++					struct mt7915_dp_pending p = mt7915_dp_pending(dev, diag_band);
++					dev_err(dev->mt76.dev,
++						"Kite global DP fault=%u band%d: sent=%u freed=%u pending=%u dma_wait=%u wa_wait=%u ready=%u\n",
++						READ_ONCE(dp->fault), diag_band,
++						READ_ONCE(dp->tx_sent[diag_band]), READ_ONCE(dp->tx_freed[diag_band]),
++						p.wifi, p.dma_wait, p.wa_wait, p.ready);
++				}
+ 			dev->kite.trace_stalls++;
+ 			dev->kite.trace_last_event = 5;
+-			dev->kite.trace_last_error = -ETIMEDOUT;
++			dev->kite.trace_last_error = error;
+ 			dev->kite.trace_last_state = b;
+ 			dev->kite.trace_last_at = jiffies;
+ 			mt7915_kite_trace_event(dev, 5, b, dp ? READ_ONCE(dp->fault) : 0,
+-					       -ETIMEDOUT);
++					       error);
+ 			dev_err(dev->mt76.dev,
+-				"Kite DP band%d stalled: pending=%u dma_wait=%u wa_wait=%u ready=%u quarantine=%u hw_submitted=%u hw_reaped=%u\n",
++				"Kite DP band%d recovery snapshot: pending=%u dma_wait=%u wa_wait=%u ready=%u quarantine=%u hw_submitted=%u hw_reaped=%u\n",
+ 				b, pending.wifi, pending.dma_wait, pending.wa_wait,
+ 				pending.ready, pending.quarantine,
+ 				kite_tx_read(&s->ppe_submitted), kite_tx_read(&s->ppe_reaped));

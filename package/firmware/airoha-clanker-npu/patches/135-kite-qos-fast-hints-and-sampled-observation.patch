@@ -1,0 +1,561 @@
+--- a/kite-datapath-fw.h
++++ b/kite-datapath-fw.h
+@@ -18,6 +18,10 @@
+ void kite_dp_tx_dma_done(unsigned short token);
+ void kite_dp_tx_reap(void);
+ void kite_dp_cache_invalidate(void);
++void kite_dp_observe_poll(void);
++void kite_dp_observe_batch(unsigned int band, unsigned int full,
++                           unsigned int packets, unsigned int mmio_start);
++unsigned int kite_dp_observe_mmio(unsigned int band);
+ void kite_dp_host_drain(void);
+ int kite_dp_host_idle(void);
+ int host_ring_submit(u32 buf_addr, u16 pkt_len, u32 band,
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -9,8 +9,8 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_ABI_VERSION 6u
+-#define KDP_MAGIC 0x4b440006u
++#define KDP_ABI_VERSION 7u
++#define KDP_MAGIC 0x4b440007u
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -206,7 +206,7 @@
+ struct kdp_perf_control {
+ 	unsigned int flags, free_count, pending_count, alloc_probe;
+ 	unsigned int alloc_empty, reap_probe, reap_ready, cache_flush;
+-	unsigned int reserved[8];
++	unsigned int sample_shift, reserved[7];
+ };
+ struct kdp_perf_band {
+ 	unsigned int parse_fast, parse_slow, parse_reuse, hint_hit;
+@@ -229,6 +229,33 @@
+ 	return tid < 8 && (contract & (1u << tid)) && len <= 1514 &&
+ 	       len + 64 <= (contract >> 16);
+ }
++
++/* ABI7 observation only. Single hart4 writer; seq protects the published
++ * snapshot. Time sums wrap modulo 2^32; latency sums use 256-cycle units.
++ * sample_shift=0 disables profiling, otherwise one batch/submission in 2^N.
++ * Completion ages are observations by hart4, not RF ACK timestamps. */
++#define KDP_OBS_STAGES 4u
++#define KDP_OBS_PARSE 0u
++#define KDP_OBS_POLICY 1u
++#define KDP_OBS_TXWI 2u
++#define KDP_OBS_REAP 3u
++struct kdp_observe_time {
++ unsigned int samples, cycles, units, max_cycles;
++};
++struct kdp_observe_band {
++ unsigned int polls, busy, tdma_empty, tdma_ready;
++ unsigned int ring_full, batches, packets, max_batch;
++ unsigned int hint_probe, hint_replace, sample_packets, sample_cancelled;
++ unsigned int dma_samples, dma_ticks, dma_max_ticks, wa_samples;
++ unsigned int wa_ticks, wa_max_ticks, free_samples, free_ticks;
++ unsigned int free_max_ticks, ready_samples, ready_ticks, ready_max_ticks;
++ unsigned int mmio_samples, mmio_cycles, mmio_max_cycles, reserved;
++ struct kdp_observe_time time[KDP_OBS_STAGES];
++};
++struct kdp_observe {
++ unsigned int seq, sample_shift, clock_mhz, publishes;
++ struct kdp_observe_band band[2];
++};
+ 
+ struct kdp_shared {
+ 	unsigned int magic, bytes, session, epoch;
+@@ -250,9 +277,10 @@
+ 	struct kdp_quality_stats quality[2];
+ 	struct kdp_perf_control perf;
+ 	struct kdp_perf_band performance[2];
+-};
+-
+-/* ABI6 extends the tail, never the header or DMA regions. Magic and bytes
++	struct kdp_observe observe;
++};
++
++/* ABI7 extends the tail, never the header or DMA regions. Magic and bytes
+  * are both checked so a mixed driver/firmware fails before DMA admission. */
+ _Static_assert(sizeof(struct kdp_perf_control) == 64, "Kite perf control");
+ _Static_assert(sizeof(struct kdp_perf_band) == 64, "Kite perf counters");
+--- /dev/null
++++ b/kite-observe.inc
+@@ -0,0 +1,154 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Included by npu_kite_datapath.c: all mutable state belongs to hart4.
++ * Bind initializes while workers are parked. The ARM only reads snapshots.
++ * Profiling never changes admission, tokens, ring budgets or completion. */
++static struct kdp_observe dp_obs;
++static u32 dp_observe_mask, dp_observe_loop, dp_observe_published;
++static u32 dp_observe_serial[2], dp_observe_sample[2];
++struct dp_observe_token {
++ u32 start, ready_at;
++ u8 active, dma_seen, wa_seen, ready_known;
++};
++/* Bulk samples live in already-reserved firmware DRAM, initialized at BIND.
++ * Only a 128-byte active bitmap occupies scarce global SRAM. Unsampled
++ * completions never fetch a sample record from DRAM. */
++static struct dp_observe_token dp_observe_tokens[KDP_TOKENS]
++ __attribute__((section(".kite_observe")));
++static u32 dp_observe_active[KDP_TOKENS / 32];
++static int dp_observe_active_test(u32 token)
++{
++ return !!(dp_observe_active[token >> 5] & (1u << (token & 31)));
++}
++
++static u32 dp_observe_tick(void)
++{
++ u32 hi, lo, hi2;
++ do {
++  hi = csr_read(mcycleh);
++  lo = csr_read(mcycle);
++  hi2 = csr_read(mcycleh);
++ } while (hi != hi2);
++ return (hi << 24) | (lo >> 8);
++}
++static void dp_observe_init(void)
++{
++ npu_memset(&dp_obs, 0, sizeof(dp_obs));
++ npu_memset(dp_observe_tokens, 0, sizeof(dp_observe_tokens));
++ npu_memset(dp_observe_active, 0, sizeof(dp_observe_active));
++ npu_memset(dp_observe_serial, 0, sizeof(dp_observe_serial));
++ dp_observe_sample[0] = dp_observe_sample[1] = 0;
++ dp_obs.sample_shift = dp->perf.sample_shift;
++ dp_obs.clock_mhz = cpu_clock_get();
++ dp_observe_mask = dp_obs.sample_shift ? (1u << dp_obs.sample_shift) - 1 : 0;
++ dp_observe_loop = 0;
++ dp_observe_published = csr_read(mcycle);
++ npu_memcpy((void *)&dp->observe, &dp_obs, sizeof(dp_obs));
++}
++static void dp_observe_time(u32 band, u32 stage, u32 start, u32 units)
++{
++ struct kdp_observe_time *t = &dp_obs.band[band].time[stage];
++ u32 elapsed;
++ if (!dp_observe_sample[band]) return;
++ elapsed = (u32)csr_read(mcycle) - start;
++ t->samples++; t->cycles += elapsed; t->units += units;
++ if (elapsed > t->max_cycles) t->max_cycles = elapsed;
++}
++/* Tick statistics are sampled independently of batch profiling. A token
++ * records each stage once. WA time is when hart4 first observes wa_done;
++ * ready delay is measured only for WA-before-DMA, where readiness is known
++ * at the DMA callback. No invented hardware/peer ACK timestamp. */
++static void dp_observe_submit(u32 band, u32 token)
++{
++ struct dp_observe_token *t = &dp_observe_tokens[token];
++ if (dp_observe_active_test(token)) {
++  dp_obs.band[band].sample_cancelled++; t->active = 0;
++ }
++ dp_observe_active[token >> 5] &= ~(1u << (token & 31));
++ if (!dp_observe_mask || (++dp_observe_serial[band] & dp_observe_mask)) return;
++ *t = (struct dp_observe_token){ .start = dp_observe_tick(), .active = 1 };
++ dp_observe_active[token >> 5] |= 1u << (token & 31);
++ dp_obs.band[band].sample_packets++;
++}
++static void dp_observe_age(u32 *count, u32 *sum, u32 *max, u32 age)
++{
++ (*count)++; *sum += age;
++ if (age > *max) *max = age;
++}
++static void dp_observe_dma(u32 token)
++{
++ if (!dp_observe_active_test(token)) return;
++ struct dp_observe_token *t = &dp_observe_tokens[token];
++ struct kdp_observe_band *b = &dp_obs.band[dp->token[token].band];
++ u32 now;
++ if (!t->active || t->dma_seen) return;
++ now = dp_observe_tick(); t->dma_seen = 1;
++ dp_observe_age(&b->dma_samples, &b->dma_ticks, &b->dma_max_ticks, now - t->start);
++ if (dp->token[token].wa_done == dp->token[token].submitted) {
++  if (!t->wa_seen) {
++   t->wa_seen = 1;
++   dp_observe_age(&b->wa_samples, &b->wa_ticks, &b->wa_max_ticks, now - t->start);
++  }
++  t->ready_known = 1; t->ready_at = now;
++ }
++}
++static void dp_observe_reap(u32 token, int reusable)
++{
++ if (!dp_observe_active_test(token)) return;
++ struct dp_observe_token *t = &dp_observe_tokens[token];
++ struct kdp_observe_band *b;
++ u32 now;
++ if (!t->active || dp->token[token].state != KDP_TOKEN_WIFI) return;
++ if (!reusable && (t->wa_seen || dp->token[token].wa_done != dp->token[token].submitted)) return;
++ b = &dp_obs.band[dp->token[token].band]; now = dp_observe_tick();
++ if (!t->wa_seen && dp->token[token].wa_done == dp->token[token].submitted) {
++  t->wa_seen = 1;
++  dp_observe_age(&b->wa_samples, &b->wa_ticks, &b->wa_max_ticks, now - t->start);
++ }
++ if (reusable) {
++  dp_observe_age(&b->free_samples, &b->free_ticks, &b->free_max_ticks, now - t->start);
++  if (t->ready_known)
++   dp_observe_age(&b->ready_samples, &b->ready_ticks, &b->ready_max_ticks, now - t->ready_at);
++  t->active = 0;
++  dp_observe_active[token >> 5] &= ~(1u << (token & 31));
++ }
++}
++void kite_dp_observe_poll(void)
++{
++ u32 now, seq;
++ if (!dp) return;
++ dp_observe_loop++;
++ dp_observe_sample[0] = dp_observe_sample[1] =
++  dp_observe_mask && !(dp_observe_loop & dp_observe_mask);
++ /* Check publication only every 64 worker passes; ~93ms at 720MHz.
++  * Counter values are always local until this bounded snapshot copy. */
++ if (dp_observe_loop & 63u) return;
++ now = csr_read(mcycle);
++ if ((u32)(now - dp_observe_published) < (1u << 26)) return;
++ dp_observe_published = now;
++ dp_obs.publishes++;
++ seq = dp->observe.seq + 1;
++ dp->observe.seq = seq;
++ KDP_BARRIER();
++ npu_memcpy((void *)&dp->observe.sample_shift, &dp_obs.sample_shift,
++            sizeof(dp_obs) - sizeof(dp_obs.seq));
++ KDP_BARRIER();
++ dp->observe.seq = seq + 1;
++}
++u32 kite_dp_observe_mmio(u32 band)
++{
++ /* Sample eligibility is separate from the stamp: cycle zero is valid. */
++ return dp_observe_sample[band] ? (u32)csr_read(mcycle) : 0;
++}
++void kite_dp_observe_batch(u32 band, u32 full, u32 packets, u32 start)
++{
++ struct kdp_observe_band *b = &dp_obs.band[band];
++ u32 elapsed;
++ if (!dp) return;
++ b->polls++; b->ring_full += full;
++ if (packets) { b->busy++; b->batches++; b->packets += packets; }
++ if (packets > b->max_batch) b->max_batch = packets;
++ if (!dp_observe_sample[band] || !packets) return;
++ elapsed = (u32)csr_read(mcycle) - start;
++ b->mmio_samples++; b->mmio_cycles += elapsed;
++ if (elapsed > b->mmio_max_cycles) b->mmio_max_cycles = elapsed;
++}
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -26,15 +26,48 @@
+ 	struct kdp_packet packet;
+ };
+ static struct dp_parse_cache dp_parse[2];
+-struct dp_policy_hint { u32 capture, exact, cap_version, exact_version; };
+-static struct dp_policy_hint dp_hint[2];
++#define DP_HINT_SETS 4u
++#define DP_HINT_WAYS 2u
++struct dp_policy_hint { u32 capture, exact, cap_version, exact_version, key; };
++static struct dp_policy_hint dp_hint[2][DP_HINT_SETS][DP_HINT_WAYS];
++static u8 dp_hint_next[2][DP_HINT_SETS];
++#include "kite-observe.inc"
++static u32 dp_hint_key(const struct kdp_packet *p, u32 wcid)
++{
++ u32 h = p->ports ^ p->src[0] ^ (p->dst[0] << 7) ^ wcid;
++ h ^= h >> 16;
++ h *= 0x7feb352du;
++ return h ^ (h >> 15);
++}
++static void dp_hint_save(volatile struct kdp_shared *s, const struct kdp_packet *p, u32 wcid, u32 band,
++                         u32 capture, u32 exact)
++{
++ u32 key = dp_hint_key(p, wcid), set = key & (DP_HINT_SETS - 1);
++ u32 way = dp_hint_next[band][set];
++ struct dp_policy_hint *h;
++ /* Refresh an existing positive hint rather than evicting its neighbour. */
++ for (u32 n = 0; n < DP_HINT_WAYS; n++)
++  if (dp_hint[band][set][n].cap_version &&
++      dp_hint[band][set][n].capture == capture &&
++      dp_hint[band][set][n].exact == exact) { way = n; break; }
++ h = &dp_hint[band][set][way];
++ if (h->cap_version && (h->capture != capture || h->exact != exact))
++  dp_obs.band[band].hint_replace++;
++ *h = (struct dp_policy_hint){ capture, exact, s->flow[capture].version,
++                              s->flow[exact].version, key };
++ dp_hint_next[band][set] = (way + 1) % DP_HINT_WAYS;
++}
+ 
+ void kite_dp_cache_invalidate(void)
+ {
+-	u32 used = dp_parse[0].valid | dp_parse[1].valid |
+-		dp_hint[0].cap_version | dp_hint[1].cap_version;
++	u32 used = dp_parse[0].valid | dp_parse[1].valid;
++	for (u32 b = 0; b < 2; b++)
++	 for (u32 set = 0; set < DP_HINT_SETS; set++)
++	  for (u32 way = 0; way < DP_HINT_WAYS; way++) {
++	   used |= dp_hint[b][set][way].cap_version;
++	   dp_hint[b][set][way].cap_version = 0;
++	  }
+ 	dp_parse[0].valid = dp_parse[1].valid = 0;
+-	dp_hint[0].cap_version = dp_hint[1].cap_version = 0;
+ 	if (dp && used)
+ 		dp->perf.cache_flush++;
+ }
+@@ -178,7 +211,8 @@
+ 	KDP_BARRIER();
+ 	if (s->magic != KDP_MAGIC || s->bytes != bytes || s->session != session ||
+ 	    s->epoch != epoch || s->enabled || !s->gate || s->fault ||
+-	    (s->perf.flags & ~(KDP_PERF_FAST | KDP_PERF_TOKENQ)))
++	    (s->perf.flags & ~(KDP_PERF_FAST | KDP_PERF_TOKENQ)) ||
++	    (s->perf.sample_shift && (s->perf.sample_shift < 6 || s->perf.sample_shift > 12)))
+ 		return 0;
+ 	for (i = 0; i < KDP_TOKENS; i++)
+ 		if (s->token[i].state || s->token[i].submitted ||
+@@ -192,6 +226,7 @@
+ 	dp_session = session;
+ 	dp_epoch = epoch;
+ 	dp_ring = ring;
++	dp_observe_init();
+ 	dp_alloc = dp_reap = 0;
+ 	dp_free_head = dp_free_tail = dp_wait_head = dp_wait_tail = dp_wait_count = 0;
+ 	dp_free_count = KDP_TOKENS;
+@@ -277,10 +312,7 @@
+ 			sta->generation, sta->key_generation, wcid, band, sta->bss) &&
+ 			(s->flow[i].type == KDP_FLOW_BRIDGE_IPV4 ||
+ 			 s->flow[i].type == KDP_FLOW_BRIDGE_IPV6)) {
+-			dp_hint[band].capture = capture;
+-			dp_hint[band].exact = i;
+-			dp_hint[band].cap_version = s->flow[capture].version;
+-			dp_hint[band].exact_version = s->flow[i].version;
++			dp_hint_save(s, packet, wcid, band, capture, i);
+ 			s->stats[band].reserved[KDP_STAT_BRIDGE_HIT]++;
+ 			return 1;
+ 		}
+@@ -294,11 +326,15 @@
+ static int dp_hint_matches(volatile struct kdp_shared *s,
+ 	volatile struct kdp_sta *sta, const struct kdp_packet *p, u32 wcid, u32 band)
+ {
+-	struct dp_policy_hint *h = &dp_hint[band];
++ u32 key = dp_hint_key(p, wcid), set = key & (DP_HINT_SETS - 1);
++ for (u32 way = 0; way < DP_HINT_WAYS; way++) {
++ struct dp_policy_hint *h = &dp_hint[band][set][way];
++ dp_obs.band[band].hint_probe++;
++ if (h->key != key) continue;
+ 	volatile struct kdp_flow *cap, *exact;
+ 	if (!h->cap_version || !h->exact_version ||
+ 	    h->capture >= KDP_FLOWS || h->exact >= KDP_FLOWS)
+-		return 0;
++		continue;
+ 	cap = &s->flow[h->capture];
+ 	exact = &s->flow[h->exact];
+ 	if (cap->version != h->cap_version || cap->type != KDP_FLOW_BRIDGE_CAPTURE ||
+@@ -308,9 +344,11 @@
+ 	    !kdp_flow_matches(exact, p, s->session, sta->generation,
+ 		sta->key_generation, wcid, band, sta->bss) ||
+ 	    cap->version != h->cap_version || exact->version != h->exact_version)
+-		return 0;
++		continue;
+ 	s->stats[band].reserved[KDP_STAT_BRIDGE_HIT]++;
+ 	return 1;
++ }
++ return 0;
+ }
+ 
+ static void dp_host_bridge_fallback(u32 band, u32 token, u32 addr, u32 len,
+@@ -379,10 +417,11 @@
+ 
+ void kite_dp_tx_reap(void)
+ {
+-	u32 i, count;
++	u32 i, count, stamp = 0;
+ 	if (!kite_dp_shared())
+ 		return;
+ 	KDP_BARRIER();
++	if (dp_observe_sample[0]) stamp = csr_read(mcycle);
+ 	count = (dp->perf.flags & KDP_PERF_TOKENQ) ? dp_wait_count : 32;
+ 	if (count > 32)
+ 		count = 32;
+@@ -402,6 +441,7 @@
+ 			dp_reap = (dp_reap + 1) % KDP_TOKENS;
+ 		}
+ 		t = &dp->token[id];
++		dp_observe_reap(id, kdp_token_reusable(t));
+ 		dp->perf.reap_probe++;
+ 		if (!kdp_token_reusable(t)) {
+ 			if (dp->perf.flags & KDP_PERF_TOKENQ) {
+@@ -416,6 +456,7 @@
+ 		dp_free_token(id);
+ 	}
+ 	dp->perf.pending_count = dp_wait_count;
++	dp_observe_time(0, KDP_OBS_REAP, stamp, count);
+ }
+ 
+ int kite_dp_tx_next(u32 band, struct kite_tx_desc *out, u16 *id)
+@@ -424,7 +465,7 @@
+ 	volatile struct kdp_token *t;
+ 	u32 desc, len, addr, token, info, wcid, bss, b, i, tag;
+ 	int replacement, parsed, fast, amsdu;
+-	u32 tid;
++	u32 tid, stamp = 0;
+ 	struct dp_parse_cache *cache;
+ 	struct kdp_packet packet;
+ 	if (band > 1 || !kite_dp_shared())
+@@ -450,8 +491,11 @@
+ 	}
+ 	desc = dp_ring + band * DP_TDMA_BYTES + dp_idx[band] * 32;
+ 	len = REG32(desc + 4);
+-	if (!(len & 0x80000000u))
+-		return 0;
++	if (!(len & 0x80000000u)) {
++		dp_obs.band[band].tdma_empty++;
++		return 0;
++	}
++	dp_obs.band[band].tdma_ready++;
+ 	KDP_BARRIER();
+ 	len &= 0xffff;
+ 	addr = REG32(desc + 8);
+@@ -523,6 +567,7 @@
+ 		dp->quality[band].control_drop++;
+ 		goto drop;
+ 	}
++	if (dp_observe_sample[band]) stamp = csr_read(mcycle);
+ 	cache = &dp_parse[band];
+ 	if ((dp->perf.flags & KDP_PERF_FAST) && cache->valid &&
+ 	    cache->token == token && cache->len == len && cache->tag == tag) {
+@@ -533,7 +578,7 @@
+ 	} else {
+ 		npu_memset(&packet, 0, sizeof(packet));
+ 		packet.vlan = KDP_SLOT_NONE;
+-		fast = (dp->perf.flags & KDP_PERF_FAST) && !sta->qos_valid &&
++		fast = (dp->perf.flags & KDP_PERF_FAST) &&
+ 			kdp_parse_ipv4_fast((const void *)dp->payload[token], len, &packet);
+ 		parsed = fast || kdp_parse_packet((const void *)dp->payload[token], len, &packet);
+ 		if (fast)
+@@ -541,6 +586,8 @@
+ 		else
+ 			dp->performance[band].parse_slow++;
+ 	}
++	dp_observe_time(band, KDP_OBS_PARSE, stamp, 1);
++	if (dp_observe_sample[band]) stamp = csr_read(mcycle);
+ 	{
+ 		int policy;
+ 		if (fast && dp_hint_matches(dp, sta, &packet, wcid, band)) {
+@@ -551,6 +598,7 @@
+ 				dp->performance[band].hint_miss++;
+ 			policy = dp_bridge_policy(dp, sta, &packet, parsed, wcid, band);
+ 		}
++		dp_observe_time(band, KDP_OBS_POLICY, stamp, 1);
+ 		if (policy == -2)
+ 			goto drop;
+ 		if (policy == 0) {
+@@ -584,6 +632,7 @@
+ 	 * Short parse-prefix padding belongs to this exclusive token buffer. */
+ 	for (i = len; i < 72; i++)
+ 		dp->payload[token][i] = 0;
++	if (dp_observe_sample[band]) stamp = csr_read(mcycle);
+ 	tid = kdp_sta_tid(sta, &packet);
+ 	amsdu = parsed && packet.vlan == KDP_SLOT_NONE && sta->wme &&
+ 		kdp_amsdu_allowed(sta->amsdu, tid, len);
+@@ -595,6 +644,7 @@
+ 		dp_free_token(replacement);
+ 		goto drop;
+ 	}
++	dp_observe_time(band, KDP_OBS_TXWI, stamp, 1);
+ 	if (amsdu)
+ 		dp->performance[band].tx_amsdu++;
+ 	else
+@@ -638,6 +688,7 @@
+ 		dp_wait_tail = (dp_wait_tail + 1) % KDP_TOKENS;
+ 		dp->perf.pending_count = ++dp_wait_count;
+ 	}
++	dp_observe_submit(band, token);
+ 	dp->tx_sent[band]++;
+ 	dp->stats[band].tx_bytes += kdp_get_le32((const void *)dp->txwi[token]) & 0xffff;
+ 	dp->stats[band].tx_bytes -= 32; /* exclude hardware TXD */
+@@ -654,6 +705,7 @@
+ 			dp->fault = 7;
+ 		return;
+ 	}
++	dp_observe_dma(token);
+ 	dp->token[token].dma_done = dp->token[token].submitted;
+ 	KDP_BARRIER();
+ }
+--- a/npu_kite_tx.c
++++ b/npu_kite_tx.c
+@@ -153,6 +153,7 @@
+ 	struct kite_tx_ring *t = &tx[b];
+ 	volatile struct kite_tx_shared *s = t->s;
+ 	u32 p, d, n, used, budget = KITE_TX_BUDGET;
++	u32 obs_packets = 0, obs_full = 0, obs_stamp;
+ 	if (!s || s->fault)
+ 		return;
+ 	s->polls++;
+@@ -225,24 +226,30 @@
+ 		for (n = 0; n < KITE_TX_BUDGET; n++) {
+ 			struct kite_tx_desc v;
+ 			u16 token;
+-			if (((t->hw_producer + 1) & KITE_TX_MASK) == t->hw_completed)
++			if (((t->hw_producer + 1) & KITE_TX_MASK) == t->hw_completed) {
++				obs_full = 1;
+ 				break;
++			}
+ 			if (!kite_dp_tx_next(b, &v, &token))
+ 				break;
+ 			/* Ring capacity was checked; hart4 is its only producer. */
+ 			kite_tx_push(t, &v, KITE_TX_COUNT + token);
+ 			kite_dp_tx_commit(b, token);
+ 			s->ppe_submitted++;
+-		}
+-	}
+-	tx_fence();
++			obs_packets++;
++		}
++	}
++	tx_fence();
++	obs_stamp = 0;
+ 	if (s->hw_producer != t->hw_producer) {
++		obs_stamp = kite_dp_observe_mmio(b);
+ 		REG32(t->reg + 8) = t->hw_producer;
+ 		tx_fence();
+ 		if (REG32(t->reg + 8) != t->hw_producer)
+ 			s->fault = KITE_TX_FAULT_MMIO;
+ 		s->hw_producer = t->hw_producer;
+ 	}
++	kite_dp_observe_batch(b, obs_full, obs_packets, obs_stamp);
+ 	s->published = t->producer;
+ 	tx_fence();
+ }
+@@ -262,6 +269,7 @@
+ 			kite_dp_cache_invalidate();
+ 			parked = 0;
+ 		}
++		kite_dp_observe_poll();
+ 		kite_dp_tx_reap();
+ 		kite_tx_step(0);
+ 		kite_tx_step(1);
+--- a/link.ld
++++ b/link.ld
+@@ -31,6 +31,13 @@
+     } > DRAM
+ 
+     __image_end = .;
++
++    /* Sample records are initialized at Kite BIND, never before that.
++     * NOLOAD leaves the flash image unchanged; the worker stacks follow.
++     * Uses the existing firmware DRAM reservation, not packet/token SRAM. */
++    .kite_observe (NOLOAD) : ALIGN(16) {
++        *(.kite_observe)
++    } > DRAM
+ 
+     .data : ALIGN(4) {
+         __data_start = .;
+@@ -73,3 +80,5 @@
+ __stack5 = __stack_base + 6 * __STACK_SIZE;
+ __stack6 = __stack_base + 7 * __STACK_SIZE;
+ __stack7 = __stack_base + 8 * __STACK_SIZE;
++
++ASSERT(__stack7 <= ORIGIN(DRAM) + LENGTH(DRAM), "firmware data/stacks exceed DRAM")
+--- a/Makefile
++++ b/Makefile
+@@ -76,7 +76,7 @@
+ 	$(CC) $(ASFLAGS) -c -o $@ $<
+ 
+ $(BUILD)/%.o: %.c npu_config.h npu_regs.h npu_types.h npu_internal.h \
+-		 npu_wifi.h kite_rxd.h kite-control.h kite-host.h kite-tx.h kite-datapath.h kite-datapath-fw.h kite-packet.h kite-reorder.h kite-secure-rxd.h $(FLAGS) | $(BUILD)
++		 npu_wifi.h kite_rxd.h kite-control.h kite-host.h kite-tx.h kite-datapath.h kite-datapath-fw.h kite-packet.h kite-reorder.h kite-secure-rxd.h kite-observe.inc $(FLAGS) | $(BUILD)
+ 	$(CC) $(CFLAGS) -c -o $@ $<
+ 
+ $(ELF): $(OBJS) link.ld

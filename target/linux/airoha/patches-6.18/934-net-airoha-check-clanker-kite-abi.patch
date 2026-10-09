@@ -1,0 +1,32 @@
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -843,11 +843,26 @@
+ 	regmap_write(npu->regmap, REG_CR_BOOT_TRIGGER, 0x1);
+ 	msleep(100);
+ 
+-	if (!of_property_read_bool(dev->of_node, "airoha,skip-npu-version-query") &&
+-	    !airoha_npu_wlan_msg_get(npu, 0, WLAN_FUNC_GET_WAIT_NPU_VERSION,
+-				       &val, sizeof(val), GFP_KERNEL))
++	if (of_property_read_bool(dev->of_node, "airoha,clanker-kite-abi")) {
++		u32 reply[3] = {};
++
++		err = airoha_npu_wlan_msg_get(npu, 0,
++			(enum airoha_npu_wlan_get_cmd)31,
++			reply, sizeof(reply), GFP_KERNEL);
++		if (err || reply[0] != 0x4b490001) {
++			dev_warn(dev, "Clanker Kite ABI handshake failed: %d, signature %#x\n",
++				err, reply[0]);
++			/* Keep mailbox memory alive even after a late reply. */
++		} else {
++			dev_info(dev, "Clanker Kite ABI 1 mailbox ready, ownership caps %#x, RX bands %#x\n",
++				 reply[1], reply[2]);
++		}
++	} else if (!of_property_read_bool(dev->of_node, "airoha,skip-npu-version-query") &&
++		   !airoha_npu_wlan_msg_get(npu, 0, WLAN_FUNC_GET_WAIT_NPU_VERSION,
++					  &val, sizeof(val), GFP_KERNEL)) {
+ 		dev_info(dev, "NPU fw version: %0d.%d\n",
+ 			 (val >> 16) & 0xffff, val & 0xffff);
++	}
+ 
+ 	platform_set_drvdata(pdev, npu);
+ 

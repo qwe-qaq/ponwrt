@@ -1,0 +1,116 @@
+--- a/include/linux/soc/airoha/kite-datapath.h
++++ b/include/linux/soc/airoha/kite-datapath.h
+@@ -9,8 +9,8 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_ABI_VERSION 5u
+-#define KDP_MAGIC 0x4b440005u
++#define KDP_ABI_VERSION 6u
++#define KDP_MAGIC 0x4b440006u
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -199,6 +199,37 @@
+ 	unsigned int txwi_drop, reserved[3];
+ };
+ 
++/* ABI6: boot-only optimization flags, and single hart4 performance counters.
++ * The old DMA regions do not move. The host writes flags only before BIND. */
++#define KDP_PERF_FAST 1u
++#define KDP_PERF_TOKENQ 2u
++struct kdp_perf_control {
++	unsigned int flags, free_count, pending_count, alloc_probe;
++	unsigned int alloc_empty, reap_probe, reap_ready, cache_flush;
++	unsigned int reserved[8];
++};
++struct kdp_perf_band {
++	unsigned int parse_fast, parse_slow, parse_reuse, hint_hit;
++	unsigned int hint_miss, tx_amsdu, tx_single, retry;
++	unsigned int reserved[8];
++};
++/* A-MSDU publication is one aligned word: peer max length and BA TID mask.
++ * No key/PN or authorization is granted by this optional TX capability. */
++static inline unsigned int kdp_amsdu_contract(unsigned int enabled,
++	unsigned int native, unsigned int wme, unsigned int max_len,
++	unsigned int tids)
++{
++	if (!enabled || !native || !wme || max_len < 3839 || max_len > 11454)
++		return 0;
++	return (max_len << 16) | (tids & 0xffu);
++}
++static inline int kdp_amsdu_allowed(unsigned int contract, unsigned int tid,
++	unsigned int len)
++{
++	return tid < 8 && (contract & (1u << tid)) && len <= 1514 &&
++	       len + 64 <= (contract >> 16);
++}
++
+ struct kdp_shared {
+ 	unsigned int magic, bytes, session, epoch;
+ 	unsigned int enabled, fault, gate, stopped;
+@@ -217,10 +248,14 @@
+ 	unsigned char payload[KDP_TOKENS][KDP_BUFFER_BYTES];
+ 	struct kdp_band_stats stats[2];
+ 	struct kdp_quality_stats quality[2];
+-};
+-
+-/* ABI5 extends the tail, never the header or DMA regions. Magic and bytes
++	struct kdp_perf_control perf;
++	struct kdp_perf_band performance[2];
++};
++
++/* ABI6 extends the tail, never the header or DMA regions. Magic and bytes
+  * are both checked so a mixed driver/firmware fails before DMA admission. */
++_Static_assert(sizeof(struct kdp_perf_control) == 64, "Kite perf control");
++_Static_assert(sizeof(struct kdp_perf_band) == 64, "Kite perf counters");
+ _Static_assert(sizeof(struct kdp_quality_stats) == 64, "Kite quality cache line");
+ _Static_assert(sizeof(struct kdp_band_stats) == 64, "Kite statistics cache line");
+ _Static_assert(__builtin_offsetof(struct kdp_shared, sta) == 128, "Kite header");
+--- a/include/linux/soc/airoha/kite-packet.h
++++ b/include/linux/soc/airoha/kite-packet.h
+@@ -85,6 +85,44 @@
+ 		return 0;
+ 	}
+ 	out->ports = kdp_be32(p + l4);
++	return 1;
++}
++
++/* Common downlink: Ethernet II, no VLAN, IPv4 with default QoS, no
++ * options/fragments, complete TCP/UDP and MTU <= 1500. A rejection only
++ * selects the original parser; it never grants an offload policy. */
++static inline int kdp_parse_ipv4_fast(const unsigned char *p, unsigned int len,
++	struct kdp_packet *out)
++{
++	unsigned int end, proto, i;
++	if (len < 42 || len > 1514 || (p[0] & 1) || (p[6] & 1) ||
++	    p[12] != 8 || p[13] || p[14] != 0x45 || p[15] ||
++	    (kdp_be16(p + 20) & 0xbfff))
++		return 0;
++	end = 14 + kdp_be16(p + 16);
++	proto = p[23];
++	if (end > len || end < 42)
++		return 0;
++	if (proto == 6) {
++		if (end < 54 || (p[47] & 7) || (p[46] >> 4) < 5 ||
++		    (unsigned int)(p[46] >> 4) * 4 > end - 34)
++			return 0;
++	} else if (proto != 17 || kdp_be16(p + 38) != end - 34) {
++		return 0;
++	}
++	out->src[0] = kdp_be32(p + 26);
++	out->dst[0] = kdp_be32(p + 30);
++	out->src[1] = out->src[2] = out->src[3] = 0;
++	out->dst[1] = out->dst[2] = out->dst[3] = 0;
++	out->ports = kdp_be32(p + 34);
++	out->protocol = proto;
++	out->type = KDP_FLOW_IPV4;
++	out->vlan = KDP_SLOT_NONE;
++	out->dsfield = 0;
++	for (i = 0; i < 6; i++) {
++		out->dmac[i] = p[i];
++		out->smac[i] = p[i + 6];
++	}
+ 	return 1;
+ }
+ 

@@ -1,0 +1,75 @@
+Subject: r68 opt-in hart4 D-cache TX header read (host side)
+
+Adds load-time npu_cached_hdr (default off; requires npu_perf). When set,
+the host requests KDP_PERF_CACHED_HDR in perf.flags before DP bind. Hart4
+self-tests the vendor 0xFC2 line op on its own core and reports OK/FAIL
+and SEEN (stale cached read observed, i.e. the cache is really in the load
+path) back in perf.flags, shown as the r68_cache debugfs line. Bound
+message stamped r68. Shared header gains flag defines only; ABI12 layout
+and size are unchanged.
+
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -213,6 +213,14 @@
+  * The old DMA regions do not move. The host writes flags only before BIND. */
+ #define KDP_PERF_FAST 1u
+ #define KDP_PERF_TOKENQ 2u
++/* r68 opt-in: hart4 reads the TX header line through the D-cache after a
++ * line invalidate. The host may set only CACHED_HDR; hart4 reports the
++ * result of its on-core self-test with OK or FAIL, and SEEN when a stale
++ * cached read proved the cache is really in the load path. Layout unchanged. */
++#define KDP_PERF_CACHED_HDR 4u
++#define KDP_PERF_CACHED_FAIL 8u
++#define KDP_PERF_CACHED_SEEN 16u
++#define KDP_PERF_CACHED_OK 32u
+ struct kdp_perf_control {
+ 	unsigned int flags, free_count, pending_count, alloc_probe;
+ 	unsigned int alloc_empty, reap_probe, reap_ready, cache_flush;
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -14,6 +14,9 @@
+ static bool npu_perf = true;
+ module_param(npu_perf, bool, 0400);
+ MODULE_PARM_DESC(npu_perf, "Kite IPv4/parse hints and bounded token queues (load time only)");
++static bool npu_cached_hdr;
++module_param(npu_cached_hdr, bool, 0400);
++MODULE_PARM_DESC(npu_cached_hdr, "Kite r68 opt-in: hart4 reads TX headers through its D-cache after a line invalidate; self-tested on hart4, requires npu_perf (load time only)");
+ static bool npu_amsdu = true;
+ module_param(npu_amsdu, bool, 0400);
+ MODULE_PARM_DESC(npu_amsdu, "Kite native HW A-MSDU for MCU/BA-approved peers (load time only)");
+@@ -1969,7 +1972,8 @@
+  dev->kite.dp_done_events = 0;
+  memset(&s->perf, 0, sizeof(s->perf));
+ 	memset(s->performance, 0, sizeof(s->performance));
+-	s->perf.flags = npu_perf ? KDP_PERF_FAST | KDP_PERF_TOKENQ : 0;
++	s->perf.flags = npu_perf ? KDP_PERF_FAST | KDP_PERF_TOKENQ |
++		(npu_cached_hdr ? KDP_PERF_CACHED_HDR : 0) : 0;
+ 	/* Invalid profiling input disables optional sampling, never the link. */
+ 	s->perf.sample_shift = npu_profile >= 6 && npu_profile <= 12 ? npu_profile : 0;
+ 	s->magic = KDP_MAGIC;
+@@ -1986,7 +1990,7 @@
+ 	ret = mt7915_kite_command(dev, KITE_CTL_DP_BIND, args, 3);
+ 	if (!ret)
+ 		dev_info(dev->mt76.dev,
+-			 "Kite datapath r67 ABI12 bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
++			 "Kite datapath r68 ABI12 bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
+ 			 s->session, s->epoch, sizeof(*s), s->perf.flags, npu_amsdu);
+ out:
+ 	if (ret)
+--- a/mt7915/npu-r59-observe.inc
++++ b/mt7915/npu-r59-observe.inc
+@@ -147,6 +147,14 @@
+  seq_printf(m,"r67_fix ba_native_unfenced=%u ba_native_owned=%u ps_ring_target=%u ps_foreign_head0=%u ps_foreign_head1=%u\n",
+   dev->kite.ba_native_unfenced,dev->kite.ba_native_owned,READ_ONCE(s->perf.reserved[6]),
+   READ_ONCE(s->observe.band[0].reserved),READ_ONCE(s->observe.band[1].reserved));
++ {
++  /* r68: requested by the host; ok/fail/seen are written by hart4 after its
++   * on-core self-test. requested=1 with ok=0 and fail=0 means not yet run. */
++  u32 f = READ_ONCE(s->perf.flags);
++  seq_printf(m,"r68_cache flags=%u requested=%u ok=%u fail=%u cache_seen=%u\n", f,
++   !!(f & KDP_PERF_CACHED_HDR), !!(f & KDP_PERF_CACHED_OK),
++   !!(f & KDP_PERF_CACHED_FAIL), !!(f & KDP_PERF_CACHED_SEEN));
++ }
+  for (b=0;b<2;b++) {
+   if (!b) seq_printf(m,"r64_host soft_park=%u\n",dev->kite.host_soft_park);
+   seq_printf(m,"r60_quality%u wait_polls=%u parse_drop=%u policy_drop=%u host_rejected=%u host_delivered=%u\n",b,s->r60.ps_wait_polls[b],s->r60.ps_parse_drop[b],s->r60.ps_policy_drop[b],s->r60.host_ps_rejected[b],s->r60.host_ps_delivered[b]);

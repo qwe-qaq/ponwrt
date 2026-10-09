@@ -61,7 +61,10 @@ wifi_detect_notice() {
 	exit 1
 }
 
-wifi_config() {
+wifi_config() (
+	# Boot reconciliation and the two wiphy hotplug events can overlap.
+	# Serialize board.json and UCI updates, including the existence check.
+	flock -x 9 || return 1
 	ucode /usr/share/hostap/wifi-detect.uc
 	[ ! -f /etc/config/wireless ] && touch /etc/config/wireless
 	ucode /lib/wifi/mac80211.uc | uci -q batch
@@ -73,7 +76,7 @@ wifi_config() {
 			echo "$driver: Hardware detection not supported" >&2
 		fi
 	); done
-}
+) 9>/var/lock/wifi-config.lock
 
 DEVICES=
 DRIVERS=

@@ -1,0 +1,181 @@
+From: ponwrt maintainers
+Subject: [PATCH] r71: Expose CPU port PAUSE and bounded read-only host/queue observations.
+
+Native patch on the r70 prepared baseline. Datapath ABI12 unchanged.
+
+--- a/drivers/net/dsa/mt7530.c
++++ b/drivers/net/dsa/mt7530.c
+@@ -32,6 +32,10 @@
+ 
+ /* String, offset, and register size in bytes if different from 4 bytes */
+ static const struct mt7530_mib_desc mt7530_mib[] = {
++	/* Private stats also reach the DSA conduit CPU port (s00_p06_*).
++	 * The standard eth-ctrl group only exposes individual user ports. */
++	MIB_DESC(1, MT7530_PORT_MIB_TX_PAUSE, "TxPause"),
++	MIB_DESC(1, MT7530_PORT_MIB_RX_PAUSE, "RxPause"),
+ 	MIB_DESC(1, MT7530_PORT_MIB_TX_DROP, "TxDrop"),
+ 	MIB_DESC(1, MT7530_PORT_MIB_TX_CRC_ERR, "TxCrcErr"),
+ 	MIB_DESC(1, MT7530_PORT_MIB_TX_COLLISION, "TxCollision"),
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -592,6 +592,10 @@
+ 	u32 data[CLANKER_DIAG_PAGES][CLANKER_DIAG_WORDS];
+ 	u32 rings[CLANKER_DIAG_WORDS];
+ 	int ring_error;
++	u32 host[CLANKER_DIAG_WORDS];
++	int host_error;
++	unsigned long host_updated;
++	bool host_valid;
+ 	u32 control[CLANKER_CTL_WORDS];
+ 	unsigned long control_updated;
+ 	int control_error;
+@@ -730,6 +734,46 @@
+ }
+ static DEVICE_ATTR_RO(clanker_status);
+ 
++/* Cached GET32 page3: a sysfs reader never issues mailbox commands. */
++static ssize_t clanker_host_status_show(struct device *dev,
++				      struct device_attribute *attr, char *buf)
++{
++	static const char * const names[] = {
++		"not_ready", "invalid", "ring_invalid", "guard_full",
++		"desc_invalid", "copy_or_fault_hold", "rx_reject", "rx_hold",
++		"tx_reject", "tx_hold", "chain_reject", "chain_hold",
++	};
++	struct airoha_npu *npu = dev_get_drvdata(dev);
++	struct airoha_clanker_diag *d = npu->clanker;
++	ssize_t n;
++	unsigned int b, i;
++
++	mutex_lock(&d->lock);
++	n = sysfs_emit(buf, "host_abi=1 available=%u last_error=%d age_ms=%u seq=%u tick=%u\n",
++		d->host_valid, d->host_error,
++		d->host_valid ? jiffies_to_msecs(jiffies - d->host_updated) : 0,
++		d->host[2], d->host[3]);
++	if (!d->host_valid)
++		goto out;
++	for (b = 0; b < 2; b++) {
++		u32 *v = d->host + 28 + b * 11;
++
++		n += sysfs_emit_at(buf, n, "host_band%u", b);
++		for (i = 0; i < ARRAY_SIZE(names); i++)
++			n += sysfs_emit_at(buf, n, " %s=%u", names[i], d->host[4 + i * 2 + b]);
++		n += sysfs_emit_at(buf, n, "\n");
++		n += sysfs_emit_at(buf, n,
++			"host_last%u valid=%u seq=%u tick=%u cause_slot=%u wcid=%u origin=%u hold=%u length_or_segments=%u idx=%u ctrl=%#x guard_ctrl=%#x ready=%u\n",
++			b, v[10], v[0], v[1], v[2], v[3], v[4] & 0xff,
++			!!(v[4] & 0x100), v[5], v[6], v[7], v[8], v[9]);
++	}
++	n += sysfs_emit_at(buf, n, "scope=nonzero_calls origin_0_rx_1_tx_fallback_2_chain hold_retains_ownership; counters_not_atomic\n");
++out:
++	mutex_unlock(&d->lock);
++	return n;
++}
++static DEVICE_ATTR_RO(clanker_host_status);
++
+ static ssize_t clanker_rx_status_show(struct device *dev,
+ 				      struct device_attribute *attr, char *buf)
+ {
+@@ -763,6 +807,7 @@
+ static struct attribute *airoha_clanker_attrs[] = {
+ 	&dev_attr_clanker_status.attr,
+ 	&dev_attr_clanker_rx_status.attr,
++	&dev_attr_clanker_host_status.attr,
+ 	NULL,
+ };
+ static const struct attribute_group airoha_clanker_group = {
+@@ -779,6 +824,8 @@
+ 	u32 moving = 0, traps = 0, quiet = 0;
+ 	u32 control[CLANKER_CTL_WORDS] = {};
+ 	u32 rings[CLANKER_DIAG_WORDS] = {};
++	u32 host[CLANKER_DIAG_WORDS] = {};
++	int host_error;
+ 	int ring_error;
+ 	int i, err = 0, previous_error, control_error;
+ 	bool report, control_changed;
+@@ -815,7 +862,24 @@
+ 		    rings[1] != 2 || rings[61] != 0x4b520001))
+ 			ring_error = -EPROTO;
+ 	}
++	/* Optional page independent of the health/control protocol. A missing
++	 * or stale cause snapshot is never interpreted as zero failures. */
++	host_error = err;
++	if (!err) {
++		host_error = airoha_npu_wlan_msg_get(npu, 3,
++			(enum airoha_npu_wlan_get_cmd)32,
++			host, sizeof(host), GFP_KERNEL);
++		if (!host_error && (host[0] != CLANKER_DIAG_MAGIC ||
++		    host[1] != 3 || host[61] != 0x4b480001))
++			host_error = -EPROTO;
++	}
+ 	mutex_lock(&d->lock);
++	d->host_error = host_error;
++	if (!host_error) {
++		memcpy(d->host, host, sizeof(host));
++		d->host_updated = jiffies;
++		d->host_valid = true;
++	}
+ 	d->ring_error = ring_error;
+ 	if (!ring_error)
+ 		memcpy(d->rings, rings, sizeof(rings));
+@@ -883,7 +947,7 @@
+ 			 d->samples, data[0][4], data[0][5], moving, quiet,
+ 			 traps, d->completed, d->requests, d->timeouts, data[0][6]);
+ 		dev_info(npu->dev,
+-			 "Clanker traffic: rx=%u/%u host=%u/%u chains=%u/%u drops=%u/%u ppe_mail=%u tunnel=%u init_fail=%u alloc_fail=%u\n",
++			 "Clanker traffic: rx=%u/%u host=%u/%u chains=%u/%u host_nonzero=%u/%u ppe_mail=%u tunnel=%u init_fail=%u alloc_fail=%u\n",
+ 			 data[1][4], data[1][5], data[1][8], data[1][9],
+ 			 data[1][12], data[1][13], data[1][10] + data[1][14],
+ 			 data[1][11] + data[1][15], data[0][8], data[0][9],
+@@ -956,6 +1020,7 @@
+ 	}
+ 	d->npu = npu;
+ 	d->control_error = -EAGAIN;
++	d->host_error = -EAGAIN;
+ 	mutex_init(&d->lock);
+ 	INIT_DELAYED_WORK(&d->work, airoha_clanker_poll);
+ 	npu->clanker = d;
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -404,9 +404,41 @@
+ }
+ DEFINE_SHOW_ATTRIBUTE(airoha_ppe_debugfs_frame);
+ 
++/* Fixed embedded queues only; no entry/descriptor dereference. Individual
++ * READ_ONCE values are observational, not a coherent ownership proof. No
++ * queue locks or MMIO scans are added to the packet/completion paths. */
++static int airoha_ppe_debugfs_queues_show(struct seq_file *m, void *private)
++{
++	struct airoha_ppe *ppe = m->private;
++	unsigned int d, i;
++
++	seq_puts(m, "queue_abi=1 atomic=0 scope=software_tx_queues\n");
++	for (d = 0; d < ARRAY_SIZE(ppe->eth->qdma); d++) {
++		struct airoha_qdma *qdma = &ppe->eth->qdma[d];
++
++		if (!qdma->regs)
++			continue;
++		for (i = 0; i < ARRAY_SIZE(qdma->q_tx); i++) {
++			struct airoha_queue *q = &qdma->q_tx[i];
++			int ndesc = READ_ONCE(q->ndesc);
++
++			if (!ndesc)
++				continue;
++			seq_printf(m, "qdma=%u txq=%u ndesc=%d queued=%d head=%u tail=%u stopped=%u flushing=%u\n",
++				d, i, ndesc, READ_ONCE(q->queued),
++				READ_ONCE(q->head), READ_ONCE(q->tail),
++				READ_ONCE(q->txq_stopped), READ_ONCE(q->flushing));
++		}
++	}
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(airoha_ppe_debugfs_queues);
++
+ int airoha_ppe_debugfs_init(struct airoha_ppe *ppe)
+ {
+ 	ppe->debugfs_dir = debugfs_create_dir("ppe", NULL);
++	debugfs_create_file("queue_status", 0444, ppe->debugfs_dir, ppe,
++			    &airoha_ppe_debugfs_queues_fops);
+  debugfs_create_file("frame_status", 0444, ppe->debugfs_dir, ppe,
+                      &airoha_ppe_debugfs_frame_fops);
+ 	debugfs_create_file("status", 0444, ppe->debugfs_dir, ppe,

@@ -1,0 +1,531 @@
+--- a/mt76.h
++++ b/mt76.h
+@@ -960,6 +960,9 @@
+ 	int (*init_wiphy)(struct mt76_dev *dev);
+ 	struct device *dev;
+ 	struct device *dma_dev;
++	/* Set when a Kite stop lost completion proof; NPU pages/descriptors
++	 * remain quarantined until device removal or a hardware reset. */
++	bool npu_quarantine;
+ 
+ 	struct mt76_mcu mcu;
+ 
+--- a/npu.c
++++ b/npu.c
+@@ -50,6 +50,8 @@
+ 
+ void mt76_npu_queue_cleanup(struct mt76_dev *dev, struct mt76_queue *q)
+ {
++	if (dev->npu_quarantine)
++		return;
+ 	spin_lock_bh(&q->lock);
+ 	while (q->queued > 0) {
+ 		struct mt76_queue_entry *e = &q->entry[q->tail];
+@@ -594,6 +596,8 @@
+ 
+ 	mutex_unlock(&dev->mutex);
+ 
++	if (dev->npu_quarantine)
++		return;
+ 	if (dev->q_rx[MT_RXQ_NPU0].ndesc)
+ 		mt76_npu_queue_cleanup(dev, &dev->q_rx[MT_RXQ_NPU0]);
+ 	if (dev->q_rx[MT_RXQ_NPU1].ndesc)
+--- a/mt7915/dma.c
++++ b/mt7915/dma.c
+@@ -169,7 +169,7 @@
+ 		__mt7915_dma_prefetch(dev, MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0));
+ }
+ 
+-static void mt7915_dma_disable(struct mt7915_dev *dev, bool rst)
++static int mt7915_dma_disable(struct mt7915_dev *dev, bool rst)
+ {
+ 	struct mt76_dev *mdev = &dev->mt76;
+ 	u32 hif1_ofs = 0;
+@@ -250,6 +250,16 @@
+ 				   MT_WFDMA1_GLO_CFG_OMIT_RX_INFO |
+ 				   MT_WFDMA1_GLO_CFG_OMIT_RX_INFO_PFET2);
+ 	}
++
++	if (!mt76_poll(dev, MT_WFDMA_EXT_CSR_HIF_MISC,
++			       MT_WFDMA_EXT_CSR_HIF_MISC_BUSY, 0, 1000))
++		return -ETIMEDOUT;
++	if (dev->hif2 && !mt76_poll(dev,
++				MT_WFDMA_EXT_CSR_HIF_MISC + hif1_ofs,
++				MT_WFDMA_EXT_CSR_HIF_MISC_BUSY, 0, 1000))
++		return -ETIMEDOUT;
++
++	return 0;
+ }
+ 
+ int mt7915_dma_start(struct mt7915_dev *dev, bool reset, bool wed_reset)
+@@ -402,8 +412,13 @@
+ 				 MT_WFDMA1_PCIE1_BUSY_ENA_RX_FIFO);
+ 	}
+ 
+-	mt76_poll(dev, MT_WFDMA_EXT_CSR_HIF_MISC,
+-		  MT_WFDMA_EXT_CSR_HIF_MISC_BUSY, 0, 1000);
++	if (!mt76_poll(dev, MT_WFDMA_EXT_CSR_HIF_MISC,
++		      MT_WFDMA_EXT_CSR_HIF_MISC_BUSY, 0, 1000))
++		return -ETIMEDOUT;
++	if (dev->hif2 && !mt76_poll(dev,
++				MT_WFDMA_EXT_CSR_HIF_MISC + hif1_ofs,
++				MT_WFDMA_EXT_CSR_HIF_MISC_BUSY, 0, 1000))
++		return -ETIMEDOUT;
+ 
+ 	return mt7915_dma_start(dev, reset, true);
+ }
+@@ -590,18 +605,30 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	mt7915_dma_enable(dev, false);
+-
+-	return 0;
++	return mt7915_dma_enable(dev, false);
+ }
+ 
+ int mt7915_dma_reset(struct mt7915_dev *dev, bool force)
+ {
+ 	struct mt76_phy *mphy_ext = dev->mt76.phys[MT_BAND1];
+ 	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
+-	int i;
+-
+-	/* clean up hw queues */
++	int i, ret;
++
++	/* Quiesce the two HIFs before touching any page-pool or descriptor owned
++	 * by Clanker. A busy timeout is a hard quarantine in data mode. */
++	mt76_npu_disable_irqs(&dev->mt76);
++	ret = mt7915_dma_disable(dev, false);
++	if (ret && mt76_npu_device_active(&dev->mt76)) {
++		dev->mt76.npu_quarantine = true;
++		return ret;
++	}
++	ret = mt7915_npu_data_stop(dev);
++	if (ret) {
++		dev->mt76.npu_quarantine = true;
++		return ret;
++	}
++
++	/* clean up hw queues only after DATA_STOP + HOST_UNBIND. */
+ 	for (i = 0; i < ARRAY_SIZE(dev->mt76.phy.q_tx); i++) {
+ 		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], true);
+ 		if (mphy_ext)
+@@ -621,7 +648,9 @@
+ 	if (mtk_wed_device_active(wed))
+ 		mtk_wed_device_dma_reset(wed);
+ 
+-	mt7915_dma_disable(dev, force);
++	ret = mt7915_dma_disable(dev, force);
++	if (ret)
++		return ret;
+ 	mt76_wed_dma_reset(&dev->mt76);
+ 
+ 	/* reset hw queues */
+@@ -646,18 +675,38 @@
+ 	mt76_for_each_q_rx(&dev->mt76, i)
+ 		mt76_queue_rx_reset(dev, i);
+ 
++	ret = mt7915_npu_data_recover(dev);
++	if (ret) {
++		dev->mt76.npu_quarantine = true;
++		dev->kite.npu_quarantine = true;
++		return ret;
++	}
++
+ 	if (mtk_wed_device_active(wed) && is_mt7915(&dev->mt76))
+ 		mt76_rmw(dev, MT_WFDMA0_EXT0_CFG, MT_WFDMA0_EXT0_RXWB_KEEP,
+ 			 MT_WFDMA0_EXT0_RXWB_KEEP);
+ 
+-	mt7915_dma_enable(dev, !force);
+-
+-	return 0;
++	return mt7915_dma_enable(dev, !force);
+ }
+ 
+ void mt7915_dma_cleanup(struct mt7915_dev *dev)
+ {
+-	mt7915_dma_disable(dev, true);
++	int ret;
++
++	mt76_npu_disable_irqs(&dev->mt76);
++	ret = mt7915_dma_disable(dev, false);
++	if (ret && mt76_npu_device_active(&dev->mt76)) {
++		dev->mt76.npu_quarantine = true;
++		return;
++	}
++	ret = mt7915_npu_data_stop(dev);
++	if (ret) {
++		dev->mt76.npu_quarantine = true;
++		return;
++	}
++	ret = mt7915_dma_disable(dev, true);
++	if (ret)
++		return;
+ 
+ 	mt76_dma_cleanup(&dev->mt76);
+ }
+--- a/mt7915/kite-control.h
++++ b/mt7915/kite-control.h
+@@ -24,6 +24,7 @@
+ #define KITE_CTL_CAP_ARM_PA 32u
+ #define KITE_CTL_CAPS 63u
+ #define KITE_CTL_CAP_HOST_RING 64u /* optional explicit bind/unbind, not DMA ownership */
++#define KITE_CTL_CAP_DATA_LIFECYCLE 128u
+ #define KITE_CTL_MODE_DATA 0u
+ #define KITE_CTL_MODE_CONTROL_ONLY 1u
+ 
+@@ -58,6 +59,8 @@
+ 	KITE_CTL_CLOSE,
+ 	KITE_CTL_HOST_BIND, /* ring0 ARM PA, ring1 ARM PA or 0, bands (1 or 3), count512 */
+ 	KITE_CTL_HOST_UNBIND, /* expected bind serial; host writer only, not full DMA stop */
++	KITE_CTL_DATA_STOP,
++	KITE_CTL_DATA_RECOVER,
+ };
+ enum kite_ctl_result {
+ 	KITE_CTL_OK,
+@@ -73,6 +76,9 @@
+ 	KITE_CTL_PARKING,
+ 	KITE_CTL_PARKED,
+ 	KITE_CTL_FAULTED, /* DMA completion unknown; no reclaim or automatic resume */
++	KITE_CTL_STOPPING,
++	KITE_CTL_STOPPED,
++	KITE_CTL_FAULTED_DRAIN,
+ };
+ /* Reply: magic, words, capabilities, session, last serial, result, state,
+  * ack mask, WCID count, required DRAM bytes, accepted commands, rejected
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -268,7 +268,7 @@
+ 		u32 session, serial, host_epoch;
+ 		u32 generation[MT7916_WTBL_SIZE];
+ 		u32 key_generation[MT7916_WTBL_SIZE];
+-		bool active, failed, control_only, host_bound;
++		bool active, failed, control_only, host_bound, npu_quarantine;
+ 		bool live[MT7916_WTBL_SIZE];
+ 	} kite;
+ #endif
+@@ -488,6 +488,9 @@
+ int mt7915_npu_control_resume(struct mt7915_dev *dev);
+ int mt7915_npu_host_bind(struct mt7915_dev *dev, u64 pa0, u64 pa1, u32 bands);
+ int mt7915_npu_host_unbind(struct mt7915_dev *dev);
++int mt7915_npu_data_stop(struct mt7915_dev *dev);
++int mt7915_npu_data_recover(struct mt7915_dev *dev);
++int mt7915_npu_control_data_recover(struct mt7915_dev *dev);
+ int mt7915_npu_sta_add(struct mt7915_dev *dev, struct mt7915_sta *msta);
+ int mt7915_npu_port(struct mt7915_dev *dev, struct mt7915_sta *msta, bool authorized);
+ void mt7915_npu_key_commit(struct mt7915_dev *dev, struct mt76_wcid *wcid,
+@@ -500,6 +503,9 @@
+ #else
+ static inline void mt7915_npu_control_reset(struct mt7915_dev *dev) {}
+ static inline void mt7915_npu_control_detach(struct mt7915_dev *dev) {}
++static inline int mt7915_npu_data_stop(struct mt7915_dev *dev) { return 0; }
++static inline int mt7915_npu_data_recover(struct mt7915_dev *dev) { return 0; }
++static inline int mt7915_npu_control_data_recover(struct mt7915_dev *dev) { return -1; }
+ static inline int mt7915_npu_sta_add(struct mt7915_dev *dev,
+ 				     struct mt7915_sta *msta) { return 0; }
+ static inline int mt7915_npu_port(struct mt7915_dev *dev,
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -110,6 +110,28 @@
+ 	return -ETIMEDOUT;
+ }
+ 
++static int mt7915_kite_wait_stopped(struct mt7915_dev *dev)
++{
++	unsigned long deadline = jiffies + msecs_to_jiffies(1000);
++	u32 s[KITE_CTL_WORDS];
++	int ret;
++
++	do {
++		ret = mt7915_kite_status(dev, s);
++		if (ret)
++			return ret;
++		if (s[3] != dev->kite.session || s[4] != dev->kite.serial)
++			return -EPROTO;
++		if (s[6] == KITE_CTL_STOPPED && s[7] == KITE_CTL_WORKERS)
++			return 0;
++		if (s[6] == KITE_CTL_FAULTED ||
++		    s[6] == KITE_CTL_FAULTED_DRAIN)
++			return -EIO;
++		usleep_range(1000, 2000);
++	} while (time_before(jiffies, deadline));
++	return -ETIMEDOUT;
++}
++
+ static int mt7915_kite_fault(struct mt7915_dev *dev, int ret)
+ {
+ 	dev->kite.failed = true;
+@@ -151,6 +173,8 @@
+ 	if (ret)
+ 		goto out;
+ 	if ((s[2] & KITE_CTL_CAPS) != KITE_CTL_CAPS ||
++	    (!dev->kite.control_only &&
++	     !(s[2] & KITE_CTL_CAP_DATA_LIFECYCLE)) ||
+ 	    s[6] != KITE_CTL_CLOSED || s[3] == U32_MAX) {
+ 		ret = -EOPNOTSUPP;
+ 		goto out;
+@@ -227,11 +251,12 @@
+ 	int ret;
+ 
+ 	if (!dev->kite.active || dev->kite.control_only ||
++	    pa0 > U32_MAX || pa1 > U32_MAX ||
+ 	    (bands != 1 && bands != 3) || !kite_host_ring_valid(pa0) ||
+ 	    (bands == 3 ? !kite_host_ring_valid(pa1) : pa1 != 0))
+ 		return -EINVAL;
+-	args[0] = pa0;
+-	args[1] = pa1;
++	args[0] = lower_32_bits(pa0);
++	args[1] = lower_32_bits(pa1);
+ 	args[2] = bands;
+ 	args[3] = KITE_HOST_RING_COUNT;
+ 	mutex_lock(&dev->kite.lock);
+@@ -269,9 +294,6 @@
+ 		ret = -EIO;
+ 		goto out;
+ 	}
+-	ret = mt7915_kite_command(dev, KITE_CTL_PARK, NULL, 0);
+-	if (!ret)
+-		ret = mt7915_kite_wait_parked(dev);
+ 	if (!ret)
+ 		ret = mt7915_kite_command(dev, KITE_CTL_HOST_UNBIND,
+ 					 &dev->kite.host_epoch, 1);
+@@ -280,6 +302,52 @@
+ 	else
+ 		mt7915_kite_fault(dev, ret);
+ 	/* Deliberately leave workers parked, with all packet state intact. */
++out:
++	mutex_unlock(&dev->kite.lock);
++	return ret;
++}
++
++int mt7915_npu_data_stop(struct mt7915_dev *dev)
++{
++	int ret;
++
++	if (!dev->kite.active || dev->kite.control_only ||
++	    !dev->kite.host_bound)
++		return 0;
++	mutex_lock(&dev->kite.lock);
++	if (dev->kite.failed) {
++		ret = -EIO;
++		goto out;
++	}
++	ret = mt7915_kite_command(dev, KITE_CTL_DATA_STOP, NULL, 0);
++	if (!ret)
++		ret = mt7915_kite_wait_stopped(dev);
++	if (!ret)
++		ret = mt7915_kite_command(dev, KITE_CTL_HOST_UNBIND,
++					 &dev->kite.host_epoch, 1);
++	if (!ret)
++		dev->kite.host_bound = false;
++	else
++		mt7915_kite_fault(dev, ret);
++out:
++	mutex_unlock(&dev->kite.lock);
++	return ret;
++}
++
++int mt7915_npu_control_data_recover(struct mt7915_dev *dev)
++{
++	int ret;
++
++	if (!dev->kite.active || dev->kite.control_only)
++		return -ENODEV;
++	mutex_lock(&dev->kite.lock);
++	if (dev->kite.failed) {
++		ret = -EIO;
++		goto out;
++	}
++	ret = mt7915_kite_command(dev, KITE_CTL_DATA_RECOVER, NULL, 0);
++	if (ret)
++		mt7915_kite_fault(dev, ret);
+ out:
+ 	mutex_unlock(&dev->kite.lock);
+ 	return ret;
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -25,7 +25,7 @@
+ module_param(npu_control, bool, 0400);
+ MODULE_PARM_DESC(npu_control, "Mirror STA/key/port/BA state to Clanker (WiFi data stays on host)");
+ module_param(npu_enable, bool, 0400);
+-MODULE_PARM_DESC(npu_enable, "Kite RX request (ownership protocol currently unavailable)");
++MODULE_PARM_DESC(npu_enable, "Enable experimental Kite RX data mode with stop/drain recovery ABI");
+ 
+ static struct airoha_npu *mt7915_npu(struct mt7915_dev *dev)
+ {
+@@ -96,16 +96,46 @@
+ int mt7915_npu_init(struct mt7915_dev *dev)
+ {
+ 	mutex_init(&dev->kite.lock);
+-	if (npu_control)
++	if (npu_control && !npu_enable)
+ 		mt7915_npu_control_attach(dev);
+ 	if (!mt7915_npu_present(dev))
+ 		return 0;
+ 
+-	/* The legacy SET27 is a no-op and there is no key/PN handover or PPE
+-	 * return contract. Never transfer DMA ownership on a user parameter
+-	 * alone. Keep normal mt7915 usable while these contracts are pending. */
+-	dev_warn(dev->mt76.dev,
+-		 "Kite RX request rejected: stop, replay and PPE contracts incomplete; using host RX\n");
++	#if IS_ENABLED(CONFIG_NET_MEDIATEK_SOC_WED)
++	if (mtk_wed_device_active(&dev->mt76.mmio.wed)) {
++		dev_warn(dev->mt76.dev,
++			 "Kite data mode disabled because WED owns the MT7916 RX rings\n");
++		return 0;
++	}
++	#endif
++	{
++		struct device_node *np = dev->mt76.dev->of_node;
++		u32 port_type = 2;
++		int ret;
++
++		if (of_property_read_u32(np, "airoha,npu-pcie-port-type", &port_type))
++			dev_info(dev->mt76.dev,
++				 "Kite PCIe port type not specified, using %u\n", port_type);
++		if (port_type > 3)
++			return -EINVAL;
++		ret = mt76_npu_init(&dev->mt76, dev->pcie_bar0,
++					MT76_NPU_TYPE_KITE);
++		if (ret)
++			return ret;
++		ret = mt7915_npu_set(dev, 0, WLAN_FUNC_SET_WAIT_DRIVER_MODEL, 2);
++		if (!ret)
++			ret = mt7915_npu_set(dev, 0, WLAN_FUNC_SET_WAIT_PCIE_PORT_TYPE,
++					     port_type);
++		if (!ret)
++			ret = mt7915_npu_set(dev, 0, WLAN_FUNC_SET_WAIT_FAST_FLAG, 1);
++		if (ret) {
++			mt76_npu_deinit(&dev->mt76);
++			return ret;
++		}
++		dev_info(dev->mt76.dev,
++			 "Kite data-development mode enabled (port type %u); stop/drain ABI active\n",
++			 port_type);
++	}
+ 	return 0;
+ }
+ 
+@@ -114,6 +144,7 @@
+ 	struct mt76_dev *mdev = &dev->mt76;
+ 	u32 hif1_ofs = dev->hif2 ? MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0) : 0;
+ 	int ret;
++	bool bound = false;
+ 
+ 	if (!mt76_npu_device_active(mdev))
+ 		return 0;
+@@ -136,14 +167,18 @@
+ 	ret = mt7915_npu_host_bind(dev, mdev->q_rx[MT_RXQ_NPU0].desc_dma,
+ 		dev->dbdc_support ? mdev->q_rx[MT_RXQ_NPU1].desc_dma : 0,
+ 		dev->dbdc_support ? 3 : 1);
+-	if (ret)
+-		return ret;
++	if (ret) {
++		if (dev->kite.failed)
++			dev->mt76.npu_quarantine = true;
++		goto fail;
++	}
++	bound = true;
+ 
+ 	ret = mt7915_npu_program_band(dev, 0, &mdev->q_rx[MT_RXQ_MAIN],
+ 				      MT_RXQ_RING_BASE(MT_RXQ_MAIN) +
+ 				      MT_RXQ_ID(MT_RXQ_MAIN) * MT7915_KITE_RING_REG_SIZE);
+ 	if (ret)
+-		return ret;
++		goto fail;
+ 
+ 	if (dev->dbdc_support) {
+ 		ret = mt7915_npu_program_band(dev, 1,
+@@ -152,7 +187,7 @@
+ 					      MT_RXQ_ID(MT_RXQ_BAND1) * MT7915_KITE_RING_REG_SIZE +
+ 					      hif1_ofs);
+ 		if (ret)
+-			return ret;
++			goto fail;
+ 	}
+ 
+ 	/* Enable each band after its ring is populated.  SET 3 is deliberately
+@@ -160,11 +195,11 @@
+ 	 * frame to the host and would disable the Kite forwarding path. */
+ 	ret = mt7915_npu_set(dev, 0, WLAN_FUNC_SET_WAIT_PCIE_STATE, 1);
+ 	if (ret)
+-		return ret;
++		goto fail;
+ 	if (dev->dbdc_support) {
+ 		ret = mt7915_npu_set(dev, 1, WLAN_FUNC_SET_WAIT_PCIE_STATE, 1);
+ 		if (ret)
+-			return ret;
++			goto fail;
+ 	}
+ 
+ 
+@@ -177,7 +212,7 @@
+ 
+ 	ret = mt7915_npu_control_resume(dev);
+ 	if (ret)
+-		return ret;
++		goto fail;
+ 
+ 	airoha_npu_wlan_enable_irq(mt7915_npu(dev), 0);
+ 	if (dev->dbdc_support)
+@@ -185,6 +220,59 @@
+ 
+ 	dev_info(dev->mt76.dev, "Kite host-adaptor RX queues ready\n");
+ 	return 0;
++
++fail:
++	/* A failed post-bind step leaves the firmware writer parked.  Attempt
++	 * the matching unbind while its ownership proof is still available;
++	 * any unknown result keeps the queue/page resources quarantined. */
++	if (bound && mt7915_npu_host_unbind(dev))
++		dev->mt76.npu_quarantine = true;
++	return ret;
++}
++
++int mt7915_npu_data_recover(struct mt7915_dev *dev)
++{
++	struct mt76_dev *mdev = &dev->mt76;
++	u32 hif1_ofs = dev->hif2 ? MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0) : 0;
++	int ret;
++
++	if (!mt76_npu_device_active(mdev) || dev->kite.control_only ||
++	    !dev->kite.active)
++		return 0;
++	ret = mt7915_npu_control_data_recover(dev);
++	if (ret)
++		return ret;
++	ret = mt7915_npu_host_bind(dev, mdev->q_rx[MT_RXQ_NPU0].desc_dma,
++		dev->dbdc_support ? mdev->q_rx[MT_RXQ_NPU1].desc_dma : 0,
++		dev->dbdc_support ? 3 : 1);
++	if (ret)
++		return ret;
++	ret = mt7915_npu_program_band(dev, 0, &mdev->q_rx[MT_RXQ_MAIN],
++				      MT_RXQ_RING_BASE(MT_RXQ_MAIN) +
++				      MT_RXQ_ID(MT_RXQ_MAIN) * MT7915_KITE_RING_REG_SIZE);
++	if (ret)
++		return ret;
++	if (dev->dbdc_support) {
++		ret = mt7915_npu_program_band(dev, 1,
++					      &mdev->q_rx[MT_RXQ_BAND1],
++					      MT_RXQ_RING_BASE(MT_RXQ_BAND1) +
++					      MT_RXQ_ID(MT_RXQ_BAND1) * MT7915_KITE_RING_REG_SIZE +
++					      hif1_ofs);
++		if (ret)
++			return ret;
++	}
++	ret = mt7915_npu_set(dev, 0, WLAN_FUNC_SET_WAIT_PCIE_STATE, 1);
++	if (!ret && dev->dbdc_support)
++		ret = mt7915_npu_set(dev, 1, WLAN_FUNC_SET_WAIT_PCIE_STATE, 1);
++	if (!ret)
++		ret = mt7915_npu_control_resume(dev);
++	if (!ret) {
++		dev->mt76.npu_quarantine = false;
++		airoha_npu_wlan_enable_irq(mt7915_npu(dev), 0);
++		if (dev->dbdc_support)
++			airoha_npu_wlan_enable_irq(mt7915_npu(dev), 1);
++	}
++	return ret;
+ }
+ 
+ 

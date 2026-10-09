@@ -536,6 +536,13 @@
 			mediatek,eeprom-merge-otp;
 			airoha,npu = <&npu>;
 			airoha,eth = <&eth>;
+			/* Clanker Kite mapping for the HM2004-DU MT7916D wiring.
+			 * Same topology as HG5585F: pcie0 (1fc00000) carries the
+			 * 790a HIF1 endpoint, pcie1 (1fc20000) carries the 7906
+			 * HIF0 endpoint with both bands. Without this property
+			 * mt7915_npu_init() returns -EINVAL and the whole WiFi
+			 * device fails to probe (no wiphy at all). */
+			airoha,npu-pcie-port-type = <3>;
 			band@0 {
 				reg = <0>;
 				nvmem-cells = <&mac_24g>;

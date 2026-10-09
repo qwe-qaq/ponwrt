@@ -1,0 +1,26 @@
+Subject: mt7915: report NPU RX policy and TDMA admission counters
+
+Expose the firmware distinction between an authorized policy hit, a policy
+miss that intentionally falls back to host delivery, and a TDMA ring full
+condition. These are diagnostic counters only and do not change fallback.
+
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1210,6 +1210,7 @@
+ 	spin_unlock_bh(&dev->mt76.rx_lock);
+ 	for (b = 0; b < 2; b++)
+-		seq_printf(m, "band%u rx_ppe=%u rx_bytes=%u rx_host=%u rx_return=%u rx_free_only=%u rx_replay=%u rx_stale=%u rx_unsupported=%u tx_sent=%u tx_bytes=%u tx_freed=%u tx_drop=%u tx_stale=%u tx_full=%u tx_aborted=%u\n",
++		seq_printf(m, "band%u rx_ppe=%u rx_bytes=%u rx_host=%u rx_return=%u rx_free_only=%u rx_replay=%u rx_stale=%u rx_unsupported=%u rx_policy_hit=%u rx_policy_miss=%u rx_tdma_full=%u tx_sent=%u tx_bytes=%u tx_freed=%u tx_drop=%u tx_stale=%u tx_full=%u tx_aborted=%u\n",
+ 			b, s->rx_ppe[b], s->stats[b].rx_bytes, s->rx_host[b], s->rx_miss[b],
+ 			s->rx_free[b], s->rx_replay[b], s->rx_stale[b], s->rx_unsupported[b],
++			s->rx_policy_hit[b], s->rx_policy_miss[b], s->rx_tdma_full[b],
+ 			s->tx_sent[b], s->stats[b].tx_bytes, s->tx_freed[b], s->tx_drop[b],
+
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -155,6 +155,7 @@
+ 	unsigned int tx_sent[2], tx_freed[2], tx_drop[2], tx_bad_done;
+ 	unsigned int rx_ppe[2], rx_host[2], rx_replay[2], rx_stale[2];
+ 	unsigned int rx_miss[2], rx_free[2], rx_unsupported[2], tx_aborted[2], reserved[1];
++	unsigned int rx_policy_hit[2], rx_policy_miss[2], rx_tdma_full[2];
+ 	struct kdp_sta sta[KDP_WCIDS];

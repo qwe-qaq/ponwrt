@@ -1,0 +1,155 @@
+Subject: net: airoha: publish bridge capture authorization separately from L4 policy
+
+--- a/include/linux/soc/airoha/kite-datapath.h	2026-10-03 16:56:03.331913905 +0800
++++ b/include/linux/soc/airoha/kite-datapath.h	2026-10-03 16:57:10.504865504 +0800
+@@ -108,6 +108,7 @@
+ #define KDP_FLOW_BRIDGE 3u
+ #define KDP_FLOW_BRIDGE_IPV4 4u
+ #define KDP_FLOW_BRIDGE_IPV6 5u
++#define KDP_FLOW_BRIDGE_CAPTURE 6u
+ #define KDP_SLOT_NONE 0xffffffffu
+ 
+ struct kdp_sta {
+--- a/include/linux/soc/airoha/kite-packet.h	2026-10-03 16:56:03.333960421 +0800
++++ b/include/linux/soc/airoha/kite-packet.h	2026-10-03 16:57:10.505025593 +0800
+@@ -132,7 +132,12 @@
+ 	const unsigned int *src, const unsigned int *dst, unsigned int ports,
+ 	unsigned int protocol, unsigned int type)
+ {
+-	unsigned int i, h = bucket ^ ports ^ (protocol << 24) ^ type;
++	unsigned int i, h;
++	if (type == KDP_FLOW_BRIDGE_IPV4)
++		type = KDP_FLOW_IPV4;
++	else if (type == KDP_FLOW_BRIDGE_IPV6)
++		type = KDP_FLOW_IPV6;
++	h = bucket ^ ports ^ (protocol << 24) ^ type;
+ 	for (i = 0; i < 4; i++) {
+ 		h = (h * 33u) ^ src[i];
+ 		h = (h * 33u) ^ dst[i];
+@@ -161,7 +166,8 @@
+ 	for (i = 0; i < 6; i++)
+ 		if (f->smac[i] != p->smac[i] || f->dmac[i] != p->dmac[i])
+ 			return 0;
+-	if (f->type != KDP_FLOW_BRIDGE) {
++	if (f->type != KDP_FLOW_BRIDGE &&
++		f->type != KDP_FLOW_BRIDGE_CAPTURE) {
+ 		if (f->type != p->type || f->ports != p->ports ||
+ 		    f->protocol != p->protocol)
+ 			return 0;
+--- a/drivers/net/ethernet/airoha/airoha_eth.h	2026-10-03 16:56:03.335987515 +0800
++++ b/drivers/net/ethernet/airoha/airoha_eth.h	2026-10-03 16:57:10.505182283 +0800
+@@ -573,7 +573,7 @@
+ 	struct airoha_gdm_dev *egress_dev;
+ 	struct list_head gc_node;
+ 	struct list_head kite_node;
+-	u32 kite_in_wcid, kite_out_wcid, kite_policy;
++	u32 kite_in_wcid, kite_out_wcid, kite_policy, kite_capture_policy;
+ 	u32 kite_session, kite_in_gen, kite_in_key, kite_out_gen, kite_out_key;
+ 	bool kite_retired;
+ 	struct kdp_flow kite_key;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c	2026-10-03 16:56:03.340048273 +0800
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c	2026-10-03 16:57:10.505553334 +0800
+@@ -1585,7 +1585,7 @@
+ 
+ 	INIT_LIST_HEAD(&e->gc_node);
+ 	INIT_LIST_HEAD(&e->kite_node);
+-	e->kite_policy = KDP_SLOT_NONE;
++	e->kite_policy = e->kite_capture_policy = KDP_SLOT_NONE;
+ 	e->cookie = f->cookie;
+ 	e->egress_dev = egress_dev;
+ 	memcpy(&e->data, &hwe, sizeof(e->data));
+--- a/drivers/net/ethernet/airoha/airoha_kite.c	2026-10-03 16:56:03.338108087 +0800
++++ b/drivers/net/ethernet/airoha/airoha_kite.c	2026-10-03 16:58:22.555286991 +0800
+@@ -618,6 +618,22 @@
+ 		ret = -ENOSPC;
+ 		goto put;
+ 	}
++	e->kite_capture_policy = KDP_SLOT_NONE;
++	if (bridge_l4) {
++		u32 capture_bucket = kdp_flow_bucket(k->smac, k->dmac,
++				k->vlan, k->wcid);
++		u32 capture;
++
++		for (capture = capture_bucket; capture < capture_bucket + KDP_FLOW_WAYS;
++		     capture++)
++			if (capture != i && !READ_ONCE(s->flow[capture].version))
++				break;
++		if (capture == capture_bucket + KDP_FLOW_WAYS) {
++			ret = -ENOSPC;
++			goto put;
++		}
++		e->kite_capture_policy = capture;
++	}
+ 	e->kite_in_wcid = k->wcid;
+ 	e->kite_session = k->session;
+ 	e->kite_in_gen = k->generation;
+@@ -636,6 +652,16 @@
+ 	return ret;
+ }
+ 
++static void airoha_kite_policy_retire(struct airoha_ppe *ppe,
++				      struct airoha_flow_table_entry *e)
++{
++	if (!e->kite_in_wcid)
++		return;
++	WRITE_ONCE(ppe->kite_dp->flow[e->kite_policy].version, 0);
++	if (e->kite_capture_policy != KDP_SLOT_NONE)
++		WRITE_ONCE(ppe->kite_dp->flow[e->kite_capture_policy].version, 0);
++}
++
+ static void airoha_kite_flow_publish(struct airoha_ppe *ppe,
+ 				    struct airoha_flow_table_entry *e)
+ {
+@@ -647,8 +673,21 @@
+ 	if (e->kite_out_wcid)
+ 		atomic64_inc(&ppe->kite_downlink_published);
+ 	if (e->kite_in_wcid) {
+-		struct kdp_flow *dst = &ppe->kite_dp->flow[e->kite_policy];
++		struct kdp_flow *dst;
+ 
++		/* Publish the broad capture authorization first. A reader that sees
++		 * capture without the exact policy safely falls back to the host. */
++		if (e->kite_capture_policy != KDP_SLOT_NONE) {
++			dst = &ppe->kite_dp->flow[e->kite_capture_policy];
++			memcpy(dst, &e->kite_key, sizeof(*dst));
++			dst->type = KDP_FLOW_BRIDGE_CAPTURE;
++			dst->src[0] = dst->src[1] = dst->src[2] = dst->src[3] = 0;
++			dst->dst[0] = dst->dst[1] = dst->dst[2] = dst->dst[3] = 0;
++			dst->ports = dst->protocol = dst->dsfield = dst->dsmask = 0;
++			dma_wmb();
++			WRITE_ONCE(dst->version, ++ppe->kite_version);
++		}
++		dst = &ppe->kite_dp->flow[e->kite_policy];
+ 		memcpy(dst, &e->kite_key, sizeof(*dst));
+ 		dma_wmb();
+ 		WRITE_ONCE(dst->version, ++ppe->kite_version);
+@@ -668,8 +707,7 @@
+ 	ret = ppe->kite_ops->pause(ppe->kite_priv);
+ 	if (ret)
+ 		return ret;
+-	if (e->kite_in_wcid)
+-		WRITE_ONCE(ppe->kite_dp->flow[e->kite_policy].version, 0);
++	airoha_kite_policy_retire(ppe, e);
+ 	/* Retire the actual FOE while all NPU flow readers are parked. */
+ 	ret = airoha_kite_invalidate(ppe, e);
+ 	if (ret)
+@@ -853,8 +891,7 @@
+ 	list_for_each_entry_safe(e, tmp, &ppe->kite_flows, kite_node) {
+ 		if (wcid && e->kite_in_wcid != wcid && e->kite_out_wcid != wcid)
+ 			continue;
+-		if (e->kite_in_wcid)
+-			WRITE_ONCE(ppe->kite_dp->flow[e->kite_policy].version, 0);
++		airoha_kite_policy_retire(ppe, e);
+ 		ret = airoha_kite_invalidate(ppe, e);
+ 		if (ret)
+ 			goto out;
+@@ -891,8 +928,7 @@
+ 	list_for_each_entry_safe(e, tmp, &ppe->kite_flows, kite_node) {
+ 		if (e->kite_out_wcid != wcid)
+ 			continue;
+-		if (e->kite_in_wcid)
+-			WRITE_ONCE(ppe->kite_dp->flow[e->kite_policy].version, 0);
++		airoha_kite_policy_retire(ppe, e);
+ 		ret = airoha_kite_invalidate(ppe, e);
+ 		if (ret)
+ 			goto out;

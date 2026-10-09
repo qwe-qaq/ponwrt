@@ -1,0 +1,134 @@
+From: ponwrt development <noreply@local>
+Subject: [PATCH] airoha: revoke egress and publish QoS as one parked transaction
+
+Shared datapath ABI 2 rejects mismatched host/firmware layouts.
+Retain PN, A-MSDU, ownership, bridge fallback and recovery protections.
+
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -538,7 +538,8 @@
+ 
+ /* PS/TWT retains the shared RX PN/reorder authority. Retire only egress
+  * rules; subsequent frames reach mac80211's power-save buffering path. */
+-int airoha_kite_revoke_tx(struct airoha_ppe_dev *dev, unsigned int wcid)
++static int airoha_kite_tx_update(struct airoha_ppe_dev *dev, unsigned int wcid,
++				 const u8 *map, bool custom)
+ {
+ 	struct airoha_ppe *ppe = dev->priv;
+ 	struct airoha_flow_table_entry *e, *tmp;
+@@ -565,13 +566,35 @@
+ 		kfree(e);
+ 		atomic64_inc(&ppe->kite_revoked);
+ 	}
++	if (map) {
++		memcpy(ppe->kite_dp->sta[wcid].qos_map, map, 64);
++		WRITE_ONCE(ppe->kite_dp->sta[wcid].qos_valid, custom);
++	}
+ 	dma_wmb();
+ 	ret = ppe->kite_ops->resume(ppe->kite_priv);
+ out:
+ 	mutex_unlock(&flow_offload_mutex);
+ 	return ret;
+ }
++int airoha_kite_revoke_tx(struct airoha_ppe_dev *dev, unsigned int wcid)
++{
++	return airoha_kite_tx_update(dev, wcid, NULL, false);
++}
+ EXPORT_SYMBOL_GPL(airoha_kite_revoke_tx);
++
++int airoha_kite_update_qos(struct airoha_ppe_dev *dev, unsigned int wcid,
++			 const u8 *map, bool custom)
++{
++	unsigned int i;
++
++	if (!map)
++		return -EINVAL;
++	for (i = 0; i < 64; i++)
++		if (map[i] > 7)
++			return -EINVAL;
++	return airoha_kite_tx_update(dev, wcid, map, custom);
++}
++EXPORT_SYMBOL_GPL(airoha_kite_update_qos);
+ 
+ int airoha_kite_detach(struct airoha_ppe_dev *dev)
+ {
+--- a/include/linux/soc/airoha/airoha_kite.h
++++ b/include/linux/soc/airoha/airoha_kite.h
+@@ -14,6 +14,8 @@
+ 	const struct airoha_kite_ops *ops, void *priv);
+ int airoha_kite_revoke(struct airoha_ppe_dev *dev, unsigned int wcid);
+ int airoha_kite_revoke_tx(struct airoha_ppe_dev *dev, unsigned int wcid);
++int airoha_kite_update_qos(struct airoha_ppe_dev *dev, unsigned int wcid,
++			 const u8 *map, bool custom);
+ int airoha_kite_detach(struct airoha_ppe_dev *dev);
+ void airoha_kite_learn_hint(struct airoha_ppe_dev *dev);
+ #endif
+--- a/include/linux/soc/airoha/kite-datapath.h
++++ b/include/linux/soc/airoha/kite-datapath.h
+@@ -9,7 +9,7 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_MAGIC 0x4b440001u
++#define KDP_MAGIC 0x4b440002u
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -111,7 +111,8 @@
+ 	unsigned int host_tids, reserved_sta;
+ 	unsigned int tx_tag;
+ 	unsigned char addr[6];
+-	unsigned char tx_blocked, reserved;
++	unsigned char tx_blocked, qos_valid;
++	unsigned char qos_map[64];
+ 	struct kdp_pn pn[KDP_TIDS];
+ };
+ 
+--- a/include/linux/soc/airoha/kite-packet.h
++++ b/include/linux/soc/airoha/kite-packet.h
+@@ -102,6 +102,20 @@
+ 	}
+ }
+ 
++/* The configured map is flattened by cfg80211 itself. The outer VLAN
++ * priority has the same precedence as cfg80211_classify8021d(). */
++static inline unsigned int kdp_sta_tid(const volatile struct kdp_sta *sta,
++	const struct kdp_packet *p)
++{
++	if (!sta->wme)
++		return 0;
++	if (p->vlan != KDP_SLOT_NONE && (p->vlan >> 13))
++		return p->vlan >> 13;
++	if (sta->qos_valid && (p->type == KDP_FLOW_IPV4 || p->type == KDP_FLOW_IPV6))
++		return sta->qos_map[p->dsfield >> 2];
++	return kdp_packet_tid(p);
++}
++
+ static inline unsigned int kdp_flow_bucket(const unsigned char *smac,
+ 	const unsigned char *dmac, unsigned int vlan, unsigned int wcid)
+ {
+--- a/include/linux/soc/airoha/kite-reorder.h
++++ b/include/linux/soc/airoha/kite-reorder.h
+@@ -64,6 +64,22 @@
+ 	}
+ 	b->head = ssn & 4095;
+ 	b->window = window <= KDP_BA_SLOTS ? window : 0;
++}
++
++/* Advance only within the forward half of the 12-bit sequence space.
++ * Release complete MPDUs in order; incomplete chains are dropped by the
++ * release callback. BAR never resets or bypasses replay state. */
++static inline void kdp_ba_bar(struct kdp_ba *b, unsigned int ssn,
++	const struct kdp_reorder_ops *ops, void *ctx)
++{
++	unsigned int delta = (ssn - b->head) & 4095;
++	if (!b->window || b->window > KDP_BA_SLOTS || delta >= 2048)
++		return;
++	while (delta--)
++		kdp_ba_release(b, ops, ctx);
++	while (b->slot[b->head & (KDP_BA_SLOTS - 1)].count &&
++	       b->slot[b->head & (KDP_BA_SLOTS - 1)].complete)
++		kdp_ba_release(b, ops, ctx);
+ }
+ 
+ /* MT7916 payload-format: 0 single, 3 first, 2 middle, 1 last.

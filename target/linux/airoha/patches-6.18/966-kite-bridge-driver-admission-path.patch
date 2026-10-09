@@ -1,0 +1,28 @@
+Subject: netfilter: send bridge rules to the Kite driver for safe admission
+
+The path walker cannot inspect the complete flow rule. Do not pre-disable
+all bridge flows with an NPU endpoint: the PPE driver admits the exact
+MAC-only L2B subset and rejects L4/domain rules with EOPNOTSUPP.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1460,3 +1460,6 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 		case FLOW_ACTION_CSUM:
+ 			break;
++		case FLOW_ACTION_BRIDGE:
++			/* The bridge marker is admitted only by the exact L2 check. */
++			break;
+ 		case FLOW_ACTION_VLAN_PUSH:
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -108,7 +108,6 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+ 		path = &stack->path[i];
+ 		info->sw_only |= !!(path->flags & NET_DEVICE_PATH_F_SW_ONLY);
+-		/* Kite cannot express nft bridge L4+isolation-domain matches.
+-		 * This restriction is bridge-only: routed NPU paths stay eligible. */
+-		if (flowtable->type->family == NFPROTO_BRIDGE)
+-			info->bridge_sw_only |= path->type == DEV_PATH_AIROHA_NPU;
++		/* The PPE driver sees the rule and admits only its exact L2B
++		 * subset. Unsupported bridge L4/domain policy returns EOPNOTSUPP
++		 * and remains on the software path. */
+ 		switch (path->type) {

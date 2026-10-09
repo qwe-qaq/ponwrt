@@ -1,0 +1,650 @@
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -575,8 +575,10 @@
+ 	struct list_head kite_node;
+ 	u32 kite_in_wcid, kite_out_wcid, kite_policy, kite_capture_policy;
+ 	u32 kite_session, kite_in_gen, kite_in_key, kite_out_gen, kite_out_key;
+-	bool kite_retired;
++	bool kite_retired, kite_published;
+ 	struct kdp_flow kite_key;
++	u16 kite_rule_len;
++	u8 kite_rule_bytes[1024];
+ 
+ 	/* Must be last --ends in a flexible-array member. */
+ 	struct airoha_foe_entry data;
+@@ -761,6 +763,10 @@
+ 	atomic64_t kite_replace_reuse, kite_replace_gc;
+ 	atomic64_t kite_ingress_published, kite_downlink_published;
+ 	atomic64_t kite_routed_ingress, kite_routed_mac_rewrite;
++	u32 kite_capture_refs[KDP_FLOWS];
++	atomic64_t kite_capture_shared, kite_capture_new, kite_capture_guarded;
++	atomic64_t kite_policy_full, kite_capture_full, kite_l2_promoted;
++	u32 kite_full_bucket;
+ 	int kite_prepare_errno;
+ };
+ 
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -44,7 +44,7 @@
+ 
+ 	if (!in && !out)
+ 		return true;
+-	if (!s || s->session != e->kite_session || !s->enabled || s->gate || kdp_failed(s))
++	if (!READ_ONCE(e->kite_published) || !s || s->session != e->kite_session || !s->enabled || s->gate || kdp_failed(s))
+ 		return false;
+ 	if (in && (!s->sta[in].enabled || !s->sta[in].authorized ||
+ 		   s->sta[in].generation != e->kite_in_gen ||
+@@ -396,7 +396,7 @@
+ 	struct flow_match_eth_addrs mac;
+ 	struct net_device *idev;
+ 	struct kdp_flow *k = &e->kite_key;
+-	u32 i, bucket;
++	u32 i;
+ 	bool bridge_l4 = airoha_kite_bridge_l4_rule(rule);
+ 	int ret = 0;
+ 
+@@ -608,38 +608,10 @@
+ 			   be16_to_cpu(ports.key->dst);
+ 		k->protocol = basic.key->ip_proto;
+ 	}
+-	bucket = kdp_flow_bucket(k->smac, k->dmac, k->vlan, k->wcid);
+-	if (k->type != KDP_FLOW_BRIDGE)
+-		bucket = kdp_flow_l4_bucket(bucket, k->src, k->dst, k->ports,
+-					  k->protocol, k->type);
+-	for (i = bucket; i < bucket + KDP_FLOW_WAYS; i++)
+-		if (!READ_ONCE(s->flow[i].version))
+-			break;
+-	if (i == bucket + KDP_FLOW_WAYS || ppe->kite_version == U32_MAX) {
+-		ret = -ENOSPC;
+-		goto put;
+-	}
+-	e->kite_capture_policy = KDP_SLOT_NONE;
+-	if (bridge_l4) {
+-		u32 capture_bucket = kdp_flow_bucket(k->smac, k->dmac,
+-				k->vlan, k->wcid);
+-		u32 capture;
+-
+-		for (capture = capture_bucket; capture < capture_bucket + KDP_FLOW_WAYS;
+-		     capture++)
+-			if (capture != i && !READ_ONCE(s->flow[capture].version))
+-				break;
+-		if (capture == capture_bucket + KDP_FLOW_WAYS) {
+-			ret = -ENOSPC;
+-			goto put;
+-		}
+-		e->kite_capture_policy = capture;
+-	}
+ 	e->kite_in_wcid = k->wcid;
+ 	e->kite_session = k->session;
+ 	e->kite_in_gen = k->generation;
+ 	e->kite_in_key = k->key_generation;
+-	e->kite_policy = i;
+ put:
+ 	if (ret) {
+ 		atomic64_inc(&ppe->kite_policy_reject);
+@@ -653,14 +625,239 @@
+ 	return ret;
+ }
+ 
++
++/* A byte-for-byte rule snapshot avoids cookie/hash-only reuse. Padding may
++ * prevent an optimization, but can never grant broader authorization. */
++static bool airoha_kite_rule_snapshot(struct airoha_flow_table_entry *e,
++                                      const struct flow_rule *rule)
++{
++	u64 keys = rule->match.dissector->used_keys;
++	const struct flow_action_entry *act;
++	u32 len = 0;
++	int i;
++#define KITE_PUT(value) do { \
++	if (sizeof(value) > sizeof(e->kite_rule_bytes) - len) goto unsupported; \
++	memcpy(e->kite_rule_bytes + len, &(value), sizeof(value)); \
++	len += sizeof(value); \
++} while (0)
++#define KITE_MATCH(id, name) do { \
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_##id)) { \
++		struct flow_match_##name m; \
++		flow_rule_match_##name(rule, &m); \
++		KITE_PUT(*m.key); KITE_PUT(*m.mask); \
++	} \
++} while (0)
++	if (keys & ~(BIT_ULL(FLOW_DISSECTOR_KEY_META) |
++	    BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) | BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) |
++	    BIT_ULL(FLOW_DISSECTOR_KEY_ETH_ADDRS) | BIT_ULL(FLOW_DISSECTOR_KEY_VLAN) |
++	    BIT_ULL(FLOW_DISSECTOR_KEY_IPV4_ADDRS) | BIT_ULL(FLOW_DISSECTOR_KEY_IPV6_ADDRS) |
++	    BIT_ULL(FLOW_DISSECTOR_KEY_IP) | BIT_ULL(FLOW_DISSECTOR_KEY_PORTS) |
++	    BIT_ULL(FLOW_DISSECTOR_KEY_TCP)))
++		goto unsupported;
++	KITE_PUT(keys);
++	KITE_MATCH(META, meta); KITE_MATCH(CONTROL, control);
++	KITE_MATCH(BASIC, basic); KITE_MATCH(ETH_ADDRS, eth_addrs);
++	KITE_MATCH(VLAN, vlan); KITE_MATCH(IPV4_ADDRS, ipv4_addrs);
++	KITE_MATCH(IPV6_ADDRS, ipv6_addrs); KITE_MATCH(IP, ip);
++	KITE_MATCH(PORTS, ports); KITE_MATCH(TCP, tcp);
++	KITE_PUT(rule->action.num_entries);
++	flow_action_for_each(i, act, &rule->action) {
++		KITE_PUT(act->id);
++		switch (act->id) {
++		case FLOW_ACTION_REDIRECT: KITE_PUT(act->dev); break;
++		case FLOW_ACTION_MANGLE: KITE_PUT(act->mangle); break;
++		case FLOW_ACTION_CSUM: KITE_PUT(act->csum_flags); break;
++		case FLOW_ACTION_VLAN_PUSH:
++			KITE_PUT(act->vlan.vid); KITE_PUT(act->vlan.proto);
++			KITE_PUT(act->vlan.prio); break;
++		case FLOW_ACTION_PPPOE_PUSH: KITE_PUT(act->pppoe.sid); break;
++		case FLOW_ACTION_VLAN_POP: case FLOW_ACTION_BRIDGE: break;
++		default: goto unsupported;
++		}
++	}
++	e->kite_rule_len = len;
++	return true;
++unsupported:
++	e->kite_rule_len = 0;
++	return false;
++#undef KITE_MATCH
++#undef KITE_PUT
++}
++
++static bool airoha_kite_template_equal(const struct airoha_foe_entry *a,
++                                      const struct airoha_foe_entry *b)
++{
++	return !((a->ib1 ^ b->ib1) & ~AIROHA_FOE_IB1_BIND_TIMESTAMP) &&
++		!memcmp((const u8 *)a + sizeof(a->ib1),
++		        (const u8 *)b + sizeof(b->ib1), sizeof(*a) - sizeof(a->ib1));
++}
++
++static bool airoha_kite_flow_reusable(struct airoha_ppe *ppe,
++	struct airoha_flow_table_entry *old, struct airoha_flow_table_entry *new)
++{
++	struct kdp_shared *s = READ_ONCE(ppe->kite_dp);
++
++	/* Only optimize Kite. Ordinary Ethernet/PON retain their native path. */
++	if (!old || !s || (!new->kite_in_wcid && !new->kite_out_wcid) ||
++	    old->kite_retired || !airoha_kite_flow_live(ppe, old) ||
++	    !old->kite_rule_len || old->kite_rule_len != new->kite_rule_len ||
++	    memcmp(old->kite_rule_bytes, new->kite_rule_bytes, old->kite_rule_len) ||
++	    old->egress_dev != new->egress_dev ||
++	    old->kite_in_wcid != new->kite_in_wcid ||
++	    old->kite_out_wcid != new->kite_out_wcid ||
++	    old->kite_session != new->kite_session ||
++	    old->kite_in_gen != new->kite_in_gen || old->kite_in_key != new->kite_in_key ||
++	    old->kite_out_gen != new->kite_out_gen || old->kite_out_key != new->kite_out_key ||
++	    memcmp(&old->kite_key, &new->kite_key, sizeof(old->kite_key)) ||
++	    !airoha_kite_template_equal(&old->data, &new->data))
++		return false;
++	if (old->kite_in_wcid && (old->kite_policy >= KDP_FLOWS ||
++	    !READ_ONCE(s->flow[old->kite_policy].version)))
++		return false;
++	if (old->kite_capture_policy != KDP_SLOT_NONE &&
++	    (old->kite_capture_policy >= KDP_FLOWS ||
++	     !ppe->kite_capture_refs[old->kite_capture_policy] ||
++	     READ_ONCE(s->flow[old->kite_capture_policy].type) != KDP_FLOW_BRIDGE_CAPTURE ||
++	     !READ_ONCE(s->flow[old->kite_capture_policy].version)))
++		return false;
++	return true;
++}
++
++static void airoha_kite_capture_key(struct kdp_flow *dst, const struct kdp_flow *src)
++{
++	*dst = *src;
++	dst->version = 0;
++	dst->type = KDP_FLOW_BRIDGE_CAPTURE;
++	memset(dst->src, 0, sizeof(dst->src));
++	memset(dst->dst, 0, sizeof(dst->dst));
++	dst->ports = dst->protocol = dst->dsfield = dst->dsmask = 0;
++	dst->cookie_lo = dst->cookie_hi = 0;
++	dst->hw_slot = KDP_SLOT_NONE;
++}
++
++static int airoha_kite_flow_reserve(struct airoha_ppe *ppe,
++                                  struct airoha_flow_table_entry *e)
++{
++	struct kdp_shared *s = READ_ONCE(ppe->kite_dp);
++	struct kdp_flow *k = &e->kite_key, capture, observed;
++	u32 i, bucket, cap_bucket, slot = KDP_SLOT_NONE;
++	bool bridge = k->type == KDP_FLOW_BRIDGE_IPV4 || k->type == KDP_FLOW_BRIDGE_IPV6;
++
++	if (!e->kite_in_wcid)
++		return 0;
++	/* Publishing an exact policy and a new capture consumes at most two
++	 * versions. Never wrap a transactional publication sequence to zero. */
++	if (ppe->kite_version > U32_MAX - 2)
++		return -EOVERFLOW;
++	cap_bucket = kdp_flow_bucket(k->smac, k->dmac, k->vlan, k->wcid);
++	bucket = k->type == KDP_FLOW_BRIDGE ? cap_bucket :
++		kdp_flow_l4_bucket(cap_bucket, k->src, k->dst, k->ports, k->protocol, k->type);
++	if (bridge) {
++		airoha_kite_capture_key(&capture, k);
++		for (i = cap_bucket; i < cap_bucket + KDP_FLOW_WAYS; i++) {
++			if (!READ_ONCE(s->flow[i].version))
++				continue;
++			observed = s->flow[i];
++			if (observed.type != KDP_FLOW_BRIDGE_CAPTURE &&
++			    observed.type != KDP_FLOW_BRIDGE_GUARD)
++				continue;
++			observed.version = 0;
++			observed.type = KDP_FLOW_BRIDGE_CAPTURE;
++			if (!memcmp(&observed, &capture, sizeof(observed))) {
++				slot = i;
++				break;
++			}
++		}
++	}
++	for (i = bucket; i < bucket + KDP_FLOW_WAYS; i++)
++		if (!READ_ONCE(s->flow[i].version))
++			break;
++	if (i == bucket + KDP_FLOW_WAYS) {
++		atomic64_inc(&ppe->kite_policy_full);
++		WRITE_ONCE(ppe->kite_full_bucket, bucket);
++		return -ENOSPC;
++	}
++	e->kite_policy = i;
++	if (!bridge)
++		return 0;
++	if (slot == KDP_SLOT_NONE) {
++		for (slot = cap_bucket; slot < cap_bucket + KDP_FLOW_WAYS; slot++)
++			if (slot != i && !READ_ONCE(s->flow[slot].version))
++				break;
++		if (slot == cap_bucket + KDP_FLOW_WAYS) {
++			atomic64_inc(&ppe->kite_capture_full);
++			WRITE_ONCE(ppe->kite_full_bucket, cap_bucket);
++			return -ENOSPC;
++		}
++	}
++	e->kite_capture_policy = slot;
++	return 0; /* refs change only after successful commit + cookie insert */
++}
++
++/* A removed last owner leaves a deny guard until STA/session revocation.
++ * PARK alone does not prove TDMA/PPE empty. Keeping its MAC identity prevents
++ * already captured frames being mistaken for ordinary routed downlink. */
++static void airoha_kite_capture_clear(struct airoha_ppe *ppe, u32 wcid)
++{
++	u32 i;
++	for (i = 0; i < KDP_FLOWS; i++) {
++		struct kdp_flow *f = &ppe->kite_dp->flow[i];
++		if ((f->type != KDP_FLOW_BRIDGE_CAPTURE && f->type != KDP_FLOW_BRIDGE_GUARD) ||
++		    (wcid && f->wcid != wcid))
++			continue;
++		WRITE_ONCE(f->version, 0);
++		ppe->kite_capture_refs[i] = 0;
++	}
++}
++
++/* Multiple exact L4 rules use the native L2 index for the same MAC pair.
++ * When its current representative is removed, keep a surviving compatible
++ * rule discoverable for hardware re-learning. No FOE/subflow is retained. */
++static int airoha_kite_l2_promote(struct airoha_ppe *ppe,
++                                struct airoha_flow_table_entry *e)
++{
++	struct airoha_flow_table_entry *peer, *indexed;
++	int ret = 0;
++	if (e->type != FLOW_TYPE_L2 || e->kite_capture_policy == KDP_SLOT_NONE)
++		return 0;
++	spin_lock_bh(&ppe_lock);
++	indexed = rhashtable_lookup_fast(&ppe->l2_flows, &e->data.bridge,
++	                                airoha_l2_flow_table_params);
++	if (indexed != e)
++		goto out;
++	list_for_each_entry(peer, &ppe->kite_flows, kite_node) {
++		if (peer == e || peer->kite_retired || peer->type != FLOW_TYPE_L2 ||
++		    peer->kite_capture_policy != e->kite_capture_policy ||
++		    peer->kite_policy >= KDP_FLOWS ||
++		    !READ_ONCE(ppe->kite_dp->flow[peer->kite_policy].version) ||
++		    !airoha_kite_template_equal(&e->data, &peer->data))
++			continue;
++		ret = rhashtable_replace_fast(&ppe->l2_flows, &e->l2_node,
++		                             &peer->l2_node, airoha_l2_flow_table_params);
++		if (!ret)
++			atomic64_inc(&ppe->kite_l2_promoted);
++		break;
++	}
++out:
++	spin_unlock_bh(&ppe_lock);
++	return ret;
++}
++
+ static void airoha_kite_policy_retire(struct airoha_ppe *ppe,
+ 				      struct airoha_flow_table_entry *e)
+ {
+ 	if (!e->kite_in_wcid)
+ 		return;
+ 	WRITE_ONCE(ppe->kite_dp->flow[e->kite_policy].version, 0);
+-	if (e->kite_capture_policy != KDP_SLOT_NONE)
+-		WRITE_ONCE(ppe->kite_dp->flow[e->kite_capture_policy].version, 0);
++	if (e->kite_capture_policy != KDP_SLOT_NONE) {
++		u32 slot = e->kite_capture_policy;
++		if (ppe->kite_capture_refs[slot] && !--ppe->kite_capture_refs[slot]) {
++			/* Workers are parked, so the guard transition is atomic to them. */
++			WRITE_ONCE(ppe->kite_dp->flow[slot].type, KDP_FLOW_BRIDGE_GUARD);
++			atomic64_inc(&ppe->kite_capture_guarded);
++		}
++		e->kite_capture_policy = KDP_SLOT_NONE; /* retry-safe retirement */
++	}
+ }
+ 
+ static void airoha_kite_flow_publish(struct airoha_ppe *ppe,
+@@ -679,18 +876,22 @@
+ 		/* Publish the broad capture authorization first. A reader that sees
+ 		 * capture without the exact policy safely falls back to the host. */
+ 		if (e->kite_capture_policy != KDP_SLOT_NONE) {
+-			dst = &ppe->kite_dp->flow[e->kite_capture_policy];
+-			/* Invalidate before changing any field. Readers must never
+-			 * observe a partially replaced capture record. */
+-			WRITE_ONCE(dst->version, 0);
+-			dma_wmb();
+-			memcpy(dst, &e->kite_key, sizeof(*dst));
+-			dst->type = KDP_FLOW_BRIDGE_CAPTURE;
+-			dst->src[0] = dst->src[1] = dst->src[2] = dst->src[3] = 0;
+-			dst->dst[0] = dst->dst[1] = dst->dst[2] = dst->dst[3] = 0;
+-			dst->ports = dst->protocol = dst->dsfield = dst->dsmask = 0;
+-			dma_wmb();
+-			WRITE_ONCE(dst->version, ++ppe->kite_version);
++			u32 slot = e->kite_capture_policy;
++			if (ppe->kite_capture_refs[slot]++) {
++				atomic64_inc(&ppe->kite_capture_shared);
++			} else {
++				dst = &ppe->kite_dp->flow[slot];
++				if (READ_ONCE(dst->version)) {
++					/* Reuse a same-key guard without any absent-record window.
++					 * A concurrent reader can only drop or fall back. */
++					WRITE_ONCE(dst->type, KDP_FLOW_BRIDGE_CAPTURE);
++				} else {
++					airoha_kite_capture_key(dst, &e->kite_key);
++				}
++				dma_wmb();
++				WRITE_ONCE(dst->version, ++ppe->kite_version);
++				atomic64_inc(&ppe->kite_capture_new);
++			}
+ 		}
+ 		dst = &ppe->kite_dp->flow[e->kite_policy];
+ 		/* Apply the same transactional publication to the exact Lpolicy. */
+@@ -700,6 +901,8 @@
+ 		dma_wmb();
+ 		WRITE_ONCE(dst->version, ++ppe->kite_version);
+ 	}
++	dma_wmb();
++	WRITE_ONCE(e->kite_published, true);
+ 	airoha_kite_learn_hint(&ppe->dev);
+ }
+ 
+@@ -715,11 +918,16 @@
+ 	ret = ppe->kite_ops->pause(ppe->kite_priv);
+ 	if (ret)
+ 		return ret;
+-	airoha_kite_policy_retire(ppe, e);
+ 	/* Retire the actual FOE while all NPU flow readers are parked. */
+ 	ret = airoha_kite_invalidate(ppe, e);
+ 	if (ret)
+ 		return ret;
++	ret = airoha_kite_l2_promote(ppe, e);
++	if (ret) {
++		WRITE_ONCE(ppe->kite_dp->fault, 10);
++		return ret;
++	}
++	airoha_kite_policy_retire(ppe, e);
+ 	airoha_ppe_foe_flow_remove_entry(ppe, e);
+ 	list_del_init(&e->kite_node);
+ 	e->kite_in_wcid = e->kite_out_wcid = 0;
+@@ -910,6 +1118,7 @@
+ 		kfree(e);
+ 		atomic64_inc(&ppe->kite_revoked);
+ 	}
++	airoha_kite_capture_clear(ppe, wcid);
+ 	dma_wmb();
+ 	ret = ppe->kite_ops->resume(ppe->kite_priv);
+ out:
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1354,7 +1354,7 @@
+ }
+ 
+ /* A cookie identifies a connection, not immutable actions or authorization.
+- * Revoke the previous policy before revalidating even a now-unsupported rule.
++ * Revoke after revalidation unless the complete live rule is unchanged.
+  * Failed fences keep the object reachable for destroy/recovery and retry. */
+ static int airoha_ppe_flow_replace_remove(struct airoha_eth *eth,
+                                          unsigned long cookie)
+@@ -1379,8 +1379,9 @@
+ 	return 0;
+ }
+ 
+-static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+-					   struct flow_cls_offload *f)
++static int airoha_ppe_flow_build(struct airoha_eth *eth,
++					   struct flow_cls_offload *f,
++				   struct airoha_flow_table_entry **candidate)
+ {
+ 	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+ 	struct airoha_flow_table_entry *e;
+@@ -1394,10 +1395,6 @@
+ 	u16 addr_type = 0;
+ 	bool bridge_l4 = airoha_kite_bridge_l4_rule(rule);
+ 
+-	err = airoha_ppe_flow_replace_remove(eth, f->cookie);
+-	if (err)
+-		return err;
+-
+ 	err = airoha_ppe_flow_check_bridge(rule, f->common.extack);
+ 	if (err) {
+ 		atomic64_inc(&eth->ppe->bridge_policy_fallback);
+@@ -1612,23 +1609,52 @@
+ 	if (err)
+ 		goto free_entry;
+ 
++	airoha_kite_rule_snapshot(e, rule);
++	*candidate = e;
++	return 0;
++free_entry:
++	kfree(e);
++	return err;
++}
++
++/* Revalidation always runs, even on an unchanged cookie. A failed build must
++ * revoke the old rule too; a failed stop retains it for recovery/retry. */
++static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
++                                          struct flow_cls_offload *f)
++{
++	struct airoha_flow_table_entry *e = NULL, *old;
++	int err, revoke;
++
++	err = airoha_ppe_flow_build(eth, f, &e);
++	old = rhashtable_lookup(&eth->flow_table, &f->cookie, airoha_flow_table_params);
++	if (!err && airoha_kite_flow_reusable(eth->ppe, old, e)) {
++		atomic64_inc(&eth->ppe->kite_replace_reuse);
++		airoha_kite_learn_hint(&eth->ppe->dev);
++		kfree(e);
++		return 0;
++	}
++	revoke = airoha_ppe_flow_replace_remove(eth, f->cookie);
++	if (revoke || err) {
++		kfree(e);
++		return revoke ? revoke : err;
++	}
++	err = airoha_kite_flow_reserve(eth->ppe, e);
++	if (err) {
++		WRITE_ONCE(eth->ppe->kite_prepare_errno, err);
++		goto free_entry;
++	}
+ 	err = airoha_ppe_foe_flow_commit_entry(eth->ppe, e);
+ 	if (err)
+ 		goto free_entry;
+-
+-	err = rhashtable_insert_fast(&eth->flow_table, &e->node,
+-				     airoha_flow_table_params);
++	err = rhashtable_insert_fast(&eth->flow_table, &e->node, airoha_flow_table_params);
+ 	if (err < 0)
+ 		goto remove_foe_entry;
+-
+ 	airoha_kite_flow_publish(eth->ppe, e);
+ 	return 0;
+-
+ remove_foe_entry:
+ 	airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
+ free_entry:
+ 	kfree(e);
+-
+ 	return err;
+ }
+ 
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -230,6 +230,11 @@
+ 		atomic64_read(&ppe->kite_path_out_npu),
+ 		atomic64_read(&ppe->kite_path_in_npu),
+ 		atomic64_read(&ppe->kite_egress_blocked));
++	seq_printf(m, "kite_capture_shared=%lld kite_capture_new=%lld kite_capture_guarded=%lld kite_policy_full=%lld kite_capture_full=%lld kite_full_bucket=%u kite_l2_promoted=%lld\n",
++		atomic64_read(&ppe->kite_capture_shared), atomic64_read(&ppe->kite_capture_new),
++		atomic64_read(&ppe->kite_capture_guarded), atomic64_read(&ppe->kite_policy_full),
++		atomic64_read(&ppe->kite_capture_full), READ_ONCE(ppe->kite_full_bucket),
++		atomic64_read(&ppe->kite_l2_promoted));
+ 	seq_printf(m, "kite_replace_reuse=%lld kite_replace_gc=%lld ingress_published=%lld downlink_published=%lld\n",
+ 		atomic64_read(&ppe->kite_replace_reuse),
+ 		atomic64_read(&ppe->kite_replace_gc),
+--- a/include/linux/soc/airoha/kite-datapath.h
++++ b/include/linux/soc/airoha/kite-datapath.h
+@@ -9,8 +9,8 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_ABI_VERSION 4u
+-#define KDP_MAGIC 0x4b440004u
++#define KDP_ABI_VERSION 5u
++#define KDP_MAGIC 0x4b440005u
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -106,11 +106,25 @@
+ #define KDP_FLOW_IPV4 1u
+ #define KDP_FLOW_IPV6 2u
+ #define KDP_FLOW_BRIDGE 3u
++/* Bridge capture keeps the PPE MAC admission broad; the NPU applies the
++ * complete L3/L4 tuple before choosing the MT7916 fast path. */
+ #define KDP_FLOW_BRIDGE_IPV4 4u
+ #define KDP_FLOW_BRIDGE_IPV6 5u
+ #define KDP_FLOW_BRIDGE_CAPTURE 6u
++/* Last capture owner retired: queued bridge packets must not become routed. */
++#define KDP_FLOW_BRIDGE_GUARD 7u
+ #define KDP_SLOT_NONE 0xffffffffu
+ 
++/* Host-adaptor record for a PPE bridge-policy miss. The Ethernet frame is
++ * copied into Linux and re-entered through the selected AP netdev. */
++#define KDP_HOST_FWD_WIFI_TX 1u
++#define KDP_HOST_FALLBACK_MAGIC 0xd74b0000u
++#define KDP_HOST_FALLBACK_PACK(band, wcid) \
++	(KDP_HOST_FALLBACK_MAGIC | (((band) & 1u) << 10) | ((wcid) & 0x3ffu))
++#define KDP_HOST_FALLBACK_VALID(v) (((v) & 0xffff0000u) == KDP_HOST_FALLBACK_MAGIC)
++#define KDP_HOST_FALLBACK_BAND(v) (((v) >> 10) & 1u)
++#define KDP_HOST_FALLBACK_WCID(v) ((v) & 0x3ffu)
++
+ struct kdp_sta {
+ 	unsigned int generation, key_generation, enabled, band;
+ 	unsigned int bss, cipher, keyid, authorized;
+@@ -154,6 +168,37 @@
+ 	unsigned int rx_policy_hit, rx_policy_miss, rx_tdma_full;
+ 	unsigned int reserved[9];
+ };
++#define KDP_STAT_BRIDGE_HIT       0u
++#define KDP_STAT_BRIDGE_MISS      1u
++#define KDP_STAT_HOST_FALLBACK    2u
++#define KDP_STAT_HOST_FALLBACK_DROP 3u
++/* Optional telemetry v2: reuse previously unwritten reserved words.
++ * No shared layout, DMA address or ownership/packet ABI changes. */
++#define KDP_STAT_TX_ADMISSION_DROP 4u
++#define KDP_STAT_RX_ENTER         5u
++#define KDP_STAT_RX_EARLY         6u
++#define KDP_STAT_RX_LAST          7u /* wcid:16, tid:8, reason:8 */
++#define KDP_STAT_RX_WORD2         8u
++#define KDP_RX_EARLY_DISABLED     1u
++#define KDP_RX_EARLY_STA          2u
++#define KDP_RX_EARLY_BAND         3u
++#define KDP_RX_EARLY_BSS          4u
++#define KDP_RX_EARLY_BAR          5u
++#define KDP_RX_EARLY_TID          6u
++#define KDP_RX_EARLY_NON_QOS      7u
++#define KDP_RX_EARLY_UNSUPPORTED  8u
++#define KDP_RX_EARLY_NO_BA        9u
++
++/* ABI5 appends diagnostics only. All existing DMA offsets stay unchanged.
++ * TX/bridge fields have hart4 as their sole writer; host_hold has hart3. */
++struct kdp_quality_stats {
++	unsigned int gate_drop, disabled_drop, sta_disabled_drop;
++	unsigned int unauthorized_drop, blocked_drop, identity_drop;
++	unsigned int format_drop, control_drop, bridge_parse_fallback;
++	unsigned int bridge_policy_fallback, bridge_retired_drop, host_hold;
++	unsigned int txwi_drop, reserved[3];
++};
++
+ struct kdp_shared {
+ 	unsigned int magic, bytes, session, epoch;
+ 	unsigned int enabled, fault, gate, stopped;
+@@ -171,10 +216,12 @@
+ 	unsigned char txwi[KDP_TOKENS][KDP_TXWI_BYTES];
+ 	unsigned char payload[KDP_TOKENS][KDP_BUFFER_BYTES];
+ 	struct kdp_band_stats stats[2];
++	struct kdp_quality_stats quality[2];
+ };
+ 
+-/* Counter extensions must never move hardware DMA regions. ABI4 rejects
+- * the incompatible ABI3 diagnostic layout, even when mixed by accident. */
++/* ABI5 extends the tail, never the header or DMA regions. Magic and bytes
++ * are both checked so a mixed driver/firmware fails before DMA admission. */
++_Static_assert(sizeof(struct kdp_quality_stats) == 64, "Kite quality cache line");
+ _Static_assert(sizeof(struct kdp_band_stats) == 64, "Kite statistics cache line");
+ _Static_assert(__builtin_offsetof(struct kdp_shared, sta) == 128, "Kite header");
+ _Static_assert(__builtin_offsetof(struct kdp_shared, tdma) % 64 == 0, "Kite TDMA alignment");
+--- a/include/linux/soc/airoha/kite-packet.h
++++ b/include/linux/soc/airoha/kite-packet.h
+@@ -34,7 +34,10 @@
+ 	if (type == 0x8100) {
+ 		if (len < 18)
+ 			return 0;
+-		out->vlan = kdp_be16(p + 14); /* PCP/DEI are policy too */
++		/* Bridge policy currently keys VLAN ID.  PCP/DEI remain available to
++		 * the QoS classifier, but are deliberately not part of the L2
++		 * capture hash because nft bridge rules normally match VID only. */
++		out->vlan = kdp_be16(p + 14);
+ 		type = kdp_be16(p + 16);
+ 		off = 18;
+ 	}
+@@ -120,6 +123,8 @@
+ 	const unsigned char *dmac, unsigned int vlan, unsigned int wcid)
+ {
+ 	unsigned int i, h = wcid ^ vlan;
++	if (vlan != KDP_SLOT_NONE)
++		h = wcid ^ (vlan & 0x0fffu);
+ 	for (i = 0; i < 6; i++)
+ 		h = (h * 33u) ^ smac[i] ^ ((unsigned int)dmac[i] << 8);
+ 	h ^= h >> 16;
+@@ -160,14 +165,28 @@
+ 	KDP_BARRIER();
+ 	if (f->session != session || f->generation != generation ||
+ 	    f->key_generation != key_generation || f->wcid != wcid ||
+-	    f->band != band || f->bss != bss || f->vlan != p->vlan ||
++	    f->band != band || f->bss != bss ||
++	    ((f->vlan == KDP_SLOT_NONE) != (p->vlan == KDP_SLOT_NONE)) ||
++	    (f->vlan != KDP_SLOT_NONE &&
++	     (f->vlan & 0x0fffu) != (p->vlan & 0x0fffu)) ||
+ 	    ((p->dsfield ^ f->dsfield) & f->dsmask))
+ 		return 0;
+ 	for (i = 0; i < 6; i++)
+ 		if (f->smac[i] != p->smac[i] || f->dmac[i] != p->dmac[i])
+ 			return 0;
+-	if (f->type != KDP_FLOW_BRIDGE &&
+-		f->type != KDP_FLOW_BRIDGE_CAPTURE) {
++	if (f->type == KDP_FLOW_BRIDGE_IPV4 ||
++	    f->type == KDP_FLOW_BRIDGE_IPV6) {
++		if ((f->type == KDP_FLOW_BRIDGE_IPV4 && p->type != KDP_FLOW_IPV4) ||
++		    (f->type == KDP_FLOW_BRIDGE_IPV6 && p->type != KDP_FLOW_IPV6))
++			return 0;
++		if (f->ports != p->ports || f->protocol != p->protocol)
++			return 0;
++		for (i = 0; i < 4; i++)
++			if (f->src[i] != p->src[i] || f->dst[i] != p->dst[i])
++				return 0;
++	} else if (f->type != KDP_FLOW_BRIDGE &&
++		   f->type != KDP_FLOW_BRIDGE_CAPTURE &&
++		   f->type != KDP_FLOW_BRIDGE_GUARD) {
+ 		if (f->type != p->type || f->ports != p->ports ||
+ 		    f->protocol != p->protocol)
+ 			return 0;

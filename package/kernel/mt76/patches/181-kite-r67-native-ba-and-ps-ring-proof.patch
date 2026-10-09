@@ -1,0 +1,80 @@
+Subject: r67 native-only TX BA without NPU fence; expose r67 fix counters
+
+A STA that KDP does not enable (GCMP/GCMP-256/CCMP-256 by the CCMP-only
+contract, or a not-yet-authorized open peer) is a legitimate native peer.
+mt7915_npu_ba_pause() returned -EBUSY for !enabled, so the native MCU BA
+request was never sent while mac80211 still advanced its local BA state.
+Skip the NPU fence only when NPU ownership is provably absent for this STA
+(no WIFI/HOST token for the WCID, no quarantined token, no unacked NPU BA
+request). Any ownership keeps the full fenced path. Adds r67_fix debugfs
+counters and stamps the bound message r67. ABI12 layout unchanged.
+
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -364,6 +364,7 @@
+ 		unsigned long dp_progress_at[2];
+ 		bool dp_attached, dp_changing, dp_rx_held;
+   u32 ba_local_requests, ba_local_failed;
++  u32 ba_native_unfenced, ba_native_owned; /* r67: native-only BA path */
+   u64 ba_local_started_ns, ba_local_total_ns, ba_local_max_ns;
+ 		u32 dp_rx_cfg[2], dp_rx_mac[2], dp_key_pending;
+ 		u32 dp_rx_stage, dp_rx_pse_empty, dp_rx_pse_query, dp_rx_pse_count;
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1986,7 +1986,7 @@
+ 	ret = mt7915_kite_command(dev, KITE_CTL_DP_BIND, args, 3);
+ 	if (!ret)
+ 		dev_info(dev->mt76.dev,
+-			 "Kite datapath r66 ABI12 bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
++			 "Kite datapath r67 ABI12 bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
+ 			 s->session, s->epoch, sizeof(*s), s->perf.flags, npu_amsdu);
+ out:
+ 	if (ret)
+--- a/mt7915/npu-datapath.inc
++++ b/mt7915/npu-datapath.inc
+@@ -358,6 +358,30 @@
+   return 0;
+  if (tid >= 8) return -EINVAL;
+  mutex_lock(&dev->kite.lock);
++ /* A STA that is not KDP-enabled may still be a legitimate native peer
++  * (GCMP/GCMP-256/CCMP-256 are native-only by the CCMP-only KDP contract).
++  * Its native MCU BA transaction needs no NPU fence -- but only when NPU
++  * ownership is provably absent for this STA. Any in-flight/quarantined
++  * token or a pending NPU BA request keeps the full fenced path below. */
++ if (!dev->kite.dp_changing && !kdp_failed(s) && !dev->kite.tx_reset_requested &&
++     !READ_ONCE(s->sta[msta->wcid.idx].enabled)) {
++  u32 wi = msta->wcid.idx, owned = 0;
++  if (READ_ONCE(s->tuning.ba.request) != READ_ONCE(s->tuning.ba.ack))
++   owned = 1;
++  for (i = 0; !owned && i < KDP_TOKENS; i++) {
++   u32 state = READ_ONCE(s->token[i].state);
++   if (state == KDP_TOKEN_FREE || state == KDP_TOKEN_TDMA) continue;
++   dma_rmb();
++   if (state == KDP_TOKEN_QUARANTINE || READ_ONCE(s->token[i].wcid) == wi)
++    owned = 1;
++  }
++  if (!owned) {
++   dev->kite.ba_native_unfenced++;
++   mutex_unlock(&dev->kite.lock);
++   return 0; /* native-only: no NPU fence, caller runs the MCU BA itself */
++  }
++  dev->kite.ba_native_owned++;
++ }
+  if (dev->kite.dp_changing || kdp_failed(s) || dev->kite.tx_reset_requested ||
+      READ_ONCE(s->gate) || !READ_ONCE(s->sta[msta->wcid.idx].enabled)) {
+   mutex_unlock(&dev->kite.lock);
+--- a/mt7915/npu-r59-observe.inc
++++ b/mt7915/npu-r59-observe.inc
+@@ -141,6 +141,12 @@
+  seq_printf(m,"r60_bind state=%u glb_before=%08x glb_after=%08x unbind=%08x p7=%08x\n",
+   s->r60.bind_state,s->r60.bind_glb_before,s->r60.bind_glb_after,s->r60.unbind_glb,s->r60.ingress_p7);
+  seq_printf(m,"r60_soft full=%u unsupported=%u\n",s->r60.soft_full,s->r60.soft_unsupported);
++ /* r67: native-only BA path and per-target PS ring proof. foreign_head is
++  * a proof the old whole-band head rule would have refused; ring_target is
++  * a probe deferred because a ready descriptor may still be the target's. */
++ seq_printf(m,"r67_fix ba_native_unfenced=%u ba_native_owned=%u ps_ring_target=%u ps_foreign_head0=%u ps_foreign_head1=%u\n",
++  dev->kite.ba_native_unfenced,dev->kite.ba_native_owned,READ_ONCE(s->perf.reserved[6]),
++  READ_ONCE(s->observe.band[0].reserved),READ_ONCE(s->observe.band[1].reserved));
+  for (b=0;b<2;b++) {
+   if (!b) seq_printf(m,"r64_host soft_park=%u\n",dev->kite.host_soft_park);
+   seq_printf(m,"r60_quality%u wait_polls=%u parse_drop=%u policy_drop=%u host_rejected=%u host_delivered=%u\n",b,s->r60.ps_wait_polls[b],s->r60.ps_parse_drop[b],s->r60.ps_policy_drop[b],s->r60.host_ps_rejected[b],s->r60.host_ps_delivered[b]);

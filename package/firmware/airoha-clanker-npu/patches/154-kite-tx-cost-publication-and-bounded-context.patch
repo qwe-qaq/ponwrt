@@ -1,0 +1,361 @@
+From: ponwrt maintainers
+Subject: [PATCH] r74: Eliminate idle profiling calls and reuse fenced TX context; publish uncached diagnostics.
+
+Native incremental patch on release73. Datapath ABI12 and DMA ownership unchanged.
+
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -17,8 +17,16 @@
+ /* Cold failure evidence only. NOLOAD DRAM is inaccessible to readers until
+  * the SRAM sequence is nonzero/even; BIND clears sequence while parked. */
+ static volatile u32 dp_path_seq;
+-static volatile u32 dp_path_event[55]
+- __attribute__((section(".kite_observe"), aligned(16)));
++#ifndef KDP_DIAG_UNCACHED
++#ifdef __riscv
++#define KDP_DIAG_UNCACHED(p) ((volatile u32 *)(((u32)(p) & 0x3fffffffu) | 0x40000000u))
++#else
++#define KDP_DIAG_UNCACHED(p) ((volatile u32 *)(p))
++#endif
++#endif
++static u32 dp_path_storage[64]
++ __attribute__((section(".kite_observe"), aligned(64)));
++#define dp_path_event KDP_DIAG_UNCACHED(dp_path_storage)
+ void kite_dp_path_snapshot(u32 *out)
+ {
+  u32 seq = dp_path_seq;
+@@ -142,6 +150,7 @@
+  if (dp_batch_valid && dp_observe_needs_init) dp_observe_init();
+  if (dp_private_needs_init) kite_dp_cache_invalidate();
+  dp_private.context_valid = dp_batch_valid;
++ dp_private.sta_checked[0] = dp_private.sta_checked[1] = 0;
+  dp_private.context_session = dp_session; dp_private.context_epoch = dp_epoch;
+  dp_freed_defer = 1;
+ }
+@@ -149,6 +158,7 @@
+ {
+  dp_publish_freed(); dp_freed_defer = 0;
+  dp_private.context_valid = 0; dp_batch_valid = 0;
++ dp_private.sta_checked[0] = dp_private.sta_checked[1] = 0;
+ }
+ static volatile struct kdp_shared *dp_tx_shared(void)
+ {
+@@ -271,6 +281,7 @@
+ 	dp_session = session;
+ 	dp_epoch = epoch;
+ 	dp_path_seq = 0;
++ dp_cost_seq[0]=dp_cost_seq[1]=0;
+ 	dp_ring = ring;
+ 	dp_observe_needs_init = 1; /* sample DRAM belongs exclusively to hart4 */
+ 	dp_alloc = dp_reap = 0;
+@@ -1040,18 +1051,24 @@
+ 
+  cost = kite_dp_cost_step(band, 4, cost, 1);
+  {
+-  int policy;
+-  int wan = compact_valid ? dp_wan_ipv4(dp, &sc->value, compact, wcid, band) :
+-     ((dp_perf_flags & KDP_PERF_FAST) && dp_wan_matches(dp, &sc->value, packet, wcid, band));
++  int policy, hinted = 0;
++  /* This flag chooses lookup order, never authorizes. Mixed WAN/bridge
++   * packets still fall through to the original live policy checks. */
++  if (compact_valid && dp_private.bridge_first[band])
++   hinted = dp_hint_ipv4(dp, &sc->value, compact, wcid, band);
++  int wan = !hinted && (compact_valid ? dp_wan_ipv4(dp, &sc->value, compact, wcid, band) :
++     ((dp_perf_flags & KDP_PERF_FAST) && dp_wan_matches(dp, &sc->value, packet, wcid, band)));
+   if (wan) policy = -1;
+-  else if (fast && (compact_valid ? dp_hint_ipv4(dp, &sc->value, compact, wcid, band) :
+-                    dp_hint_matches(dp, &sc->value, packet, wcid, band))) {
++  else if (hinted || (fast && !(compact_valid && dp_private.bridge_first[band]) &&
++           (compact_valid ? dp_hint_ipv4(dp, &sc->value, compact, wcid, band) :
++                            dp_hint_matches(dp, &sc->value, packet, wcid, band)))) {
+    dp_performance[band].hint_hit++; policy = 1;
+   } else {
+    if (fast) dp_performance[band].hint_miss++;
+    if (!packet_valid) { dp_key_expand(packet, compact); packet_valid = 1; }
+    policy = dp_bridge_policy(dp, &sc->value, packet, parsed, wcid, band);
+   }
++  if (policy == 1 || policy == -1) dp_private.bridge_first[band] = policy == 1;
+   if (dp_observe_sample[0]) dp_hot(KDP_HOT_POLICY, hot, 1); if (dp_observe_sample[0]) hot = csr_read(mcycle);
+ 		if (dp_observe_sample[band]) dp_observe_time(band, KDP_OBS_POLICY, stamp, 1);
+ 		if (policy == -2)
+@@ -1228,6 +1245,17 @@
+  dp_ps_probe_at=now;
+  b=dp->sta[wi].band;
+  if (b>1) return;
++ /* Fast rejection only: even an empty/corrupt bitmap cannot grant ACK.
++  * The original exhaustive ownership and ring proofs remain below. */
++ if (p->issued-p->failed!=p->consumed) return;
++ for (u32 word=0;word<KDP_TOKENS/32;word++) {
++  u32 bits=dp_pending[word];
++  while (bits) {
++   u32 bit=__builtin_ctz(bits), id=word*32+bit;
++   bits &= bits-1;
++   if (dp->token[id].wcid==wi) return;
++  }
++ }
+  head=REG32(dp_ring+b*DP_TDMA_BYTES+dp_idx[b]*32+4)&0x80000000u;
+  /* Only target-owned (or unattributable) ready descriptors block the
+   * proof. A ready head holding only other STAs' packets no longer does. */
+--- a/kite-observe.inc
++++ b/kite-observe.inc
+@@ -9,59 +9,63 @@
+ static struct kdp_perf_band dp_performance[2];
+ static struct { u32 alloc_probe, alloc_empty, reap_probe, reap_ready; } dp_account;
+ static struct kdp_tune_stats dp_tune;
+-static u32 dp_observe_sample[2];
++u32 dp_observe_sample[2];
+ 
+-/* r73: sampled per-band costs. No shared datapath ABI/layout change.
+- * Hart4 is the only writer; hart0 GET32 takes a bounded seqlock snapshot.
+- * Bulk diagnostics stay in reserved DRAM, only sequence words use SRAM. */
++/* r74: hart4 private cached accumulation; cross-hart publication uses ONLY
++ * uncached aliases of whole, isolated cache lines. NOLOAD, never memset via
++ * the cached symbol. SRAM sequence protects the bounded hart0 copy. */
+ #define DP_COST_STAGES 12
+ static struct {
+  u32 session, epoch, mhz, shift;
+  struct kdp_observe_time stage[DP_COST_STAGES];
+ } dp_cost[2] __attribute__((section(".kite_observe")));
++_Static_assert(sizeof(dp_cost[0]) == 208, "KC1 private word layout");
++static u32 dp_cost_publication[2][64]
++ __attribute__((section(".kite_observe"), aligned(64)));
+ static volatile u32 dp_cost_seq[2];
+-u32 kite_dp_cost_stamp(u32 band)
+-{
+- return band < 2 && dp_observe_sample[band] ? csr_read(mcycle) : 0;
+-}
+-u32 kite_dp_cost_step(u32 band, u32 stage, u32 start, u32 units)
+-{
+- struct kdp_observe_time *t;
+- u32 seq, elapsed;
+- if (band > 1 || stage >= DP_COST_STAGES || !dp_observe_sample[band]) return 0;
+- elapsed = (u32)csr_read(mcycle) - start;
+- seq = dp_cost_seq[band];
+- dp_cost_seq[band] = seq + 1; KDP_BARRIER();
+- t = &dp_cost[band].stage[stage];
++static u32 dp_observe_tick(void);
++u32 kite_dp_cost_stamp_sampled(u32 band)
++{
++ return csr_read(mcycle);
++}
++u32 kite_dp_cost_step_sampled(u32 band, u32 stage, u32 start, u32 units)
++{
++ struct kdp_observe_time *t = &dp_cost[band].stage[stage];
++ u32 elapsed = (u32)csr_read(mcycle) - start;
+  t->samples++; t->cycles += elapsed; t->units += units;
+  if (elapsed > t->max_cycles) t->max_cycles = elapsed;
+- KDP_BARRIER(); dp_cost_seq[band] = seq + 2 ? seq + 2 : 2;
+- /* Do not charge the observer's DRAM writes to the following stage. */
++ /* No cross-hart fences/stores per sampled stage. */
+  return csr_read(mcycle);
++}
++static void dp_cost_publish(u32 band)
++{
++ volatile u32 *v = KDP_DIAG_UNCACHED(dp_cost_publication[band]);
++ const u32 *s = (const void *)&dp_cost[band];
++ u32 seq = (dp_cost_seq[band] & ~1u) + 2;
++ if (!seq) seq = 2;
++ dp_cost_seq[band] = seq - 1; KDP_BARRIER();
++ v[0]=1; v[1]=seq;
++ for (u32 i=0;i<4;i++) v[2+i]=s[i];
++ v[6]=band; v[7]=74;
++ for (u32 i=0;i<DP_COST_STAGES*4;i++) v[8+i]=s[4+i];
++ v[56]=dp_observe_tick();
++ KDP_BARRIER(); dp_cost_seq[band]=seq;
+ }
+ void kite_dp_cost_snapshot(u32 band, u32 *out)
+ {
+  u32 i, seq, retry;
+  if (band > 1) goto unavailable;
++ const volatile u32 *v = KDP_DIAG_UNCACHED(dp_cost_publication[band]);
+  for (retry = 0; retry < 3; retry++) {
+   seq = dp_cost_seq[band];
+   if (!seq || (seq & 1)) continue;
+   KDP_BARRIER();
+-  out[1]=seq; out[2]=dp_cost[band].session; out[3]=dp_cost[band].epoch;
+-  out[4]=dp_cost[band].mhz; out[5]=dp_cost[band].shift;
+-  out[6]=band; out[7]=73;
+-  for (i=0;i<DP_COST_STAGES;i++) {
+-   out[8+i*4]=dp_cost[band].stage[i].samples;
+-   out[9+i*4]=dp_cost[band].stage[i].cycles;
+-   out[10+i*4]=dp_cost[band].stage[i].units;
+-   out[11+i*4]=dp_cost[band].stage[i].max_cycles;
+-  }
++  for (i=0;i<57;i++) out[i]=v[i];
+   KDP_BARRIER();
+-  if (seq == dp_cost_seq[band]) { out[0]=1; return; }
++  if (seq == dp_cost_seq[band] && out[1] == seq) return;
+  }
+ unavailable:
+- /* No stale or NOLOAD fields escape when a sample is unavailable. */
+- for (i=0;i<56;i++) out[i]=0;
++ for (i=0;i<57;i++) out[i]=0;
+ }
+ 
+ /* Polled on every TDMA descriptor: keep these small transition fields in
+@@ -192,14 +196,14 @@
+ }
+ static void dp_observe_init(void)
+ {
+- dp_cost_seq[0]++; dp_cost_seq[1]++; KDP_BARRIER();
++ /* Only hart4 initializes its cached accumulators. Publish reset identity
++  * before normal sampling; readers never see previous-session statistics. */
+  npu_memset(dp_cost,0,sizeof(dp_cost));
+  for (u32 b=0;b<2;b++) {
+   dp_cost[b].session=dp_session; dp_cost[b].epoch=dp_epoch;
+   dp_cost[b].mhz=cpu_clock_get(); dp_cost[b].shift=dp->perf.sample_shift;
+- }
+- KDP_BARRIER();
+- for (u32 b=0;b<2;b++) dp_cost_seq[b] = dp_cost_seq[b]+1 ? dp_cost_seq[b]+1 : 2;
++  dp_cost_publish(b);
++ }
+  npu_memset(dp_gap_armed,0,sizeof(dp_gap_armed));
+  npu_memset(&dp_obs, 0, sizeof(dp_obs));
+  npu_memset(&dp_r63,0,sizeof(dp_r63));
+@@ -362,6 +366,7 @@
+  start = csr_read(mcycle);
+  dp_observe_published = start;
+  dp_obs.publishes++;
++ dp_cost_publish(0); dp_cost_publish(1);
+  seq=dp->r63.seq+1; dp->r63.seq=seq; KDP_BARRIER();
+  dp->r63.tick=dp_observe_tick(); dp->r63.pressure_tick=dp_r63.pressure_tick;
+  dp_snapshot_words((void *)dp->r63.band,dp_r63.band,sizeof(dp_r63.band));
+@@ -427,7 +432,7 @@
+  if ((u32)(now - dp_observe_published) < (1u << 26)) return;
+  kite_dp_observe_snapshot();
+ }
+-u32 kite_dp_observe_mmio(u32 band)
++u32 kite_dp_observe_mmio_sampled(u32 band)
+ {
+  /* Sample eligibility is separate from the stamp: cycle zero is valid. */
+  return dp_observe_sample[band] ? (u32)csr_read(mcycle) : 0;
+@@ -448,11 +453,11 @@
+ 
+ /* Disjoint sampled loop segments; SUBMIT excludes PUBLISH. Residual includes
+  * identity and other loop overhead (PARK/debug preamble excluded); never add parse twice. */
+-u32 kite_dp_service_stamp(void)
++u32 kite_dp_service_stamp_sampled(void)
+ {
+  return dp && dp_observe_sample[0] ? (u32)csr_read(mcycle) : 0;
+ }
+-void kite_dp_service_time(u32 stage, u32 start, u32 units)
++void kite_dp_service_time_sampled(u32 stage, u32 start, u32 units)
+ {
+  struct kdp_observe_time *t;
+  u32 elapsed;
+--- a/kite-fast.inc
++++ b/kite-fast.inc
+@@ -65,6 +65,7 @@
+  struct dp_l2_hash l2[2][4];
+  struct dp_wan_cache wan[2][4];
+  u32 context_valid, context_session, context_epoch;
++ u32 sta_checked[2], bridge_first[2];
+  u32 last_hint[2]; /* tail keeps all r64 cache offsets; index + 1, not authority */
+ } dp_private __attribute__((section(".kite_private"), aligned(64)));
+ _Static_assert(sizeof(dp_private) <= 8192, "private cache budget");
+@@ -166,11 +167,21 @@
+                                            u32 wcid, u32 band)
+ {
+  struct dp_sta_cache *c = &dp_private.sta[band][wcid & 3];
+- /* Only immutable fields: admission, PS and AMSDU remain live reads. */
+- if (c->valid && c->wcid == wcid && c->value.generation == s->generation &&
+-     c->value.key_generation == s->key_generation && c->value.tx_tag == s->tx_tag)
++ /* A transaction cannot reach PARK ACK until TX end. Once checked in
++  * this begin/end, immutable identity cannot change. Live admission/PS/
++  * AMSDU and policy versions are still checked by every packet. */
++ u32 bit = 1u << (wcid & 3);
++ if (c->valid && c->wcid == wcid &&
++     ((dp_private.context_valid && (dp_private.sta_checked[band] & bit)) ||
++      (c->value.generation == s->generation &&
++       c->value.key_generation == s->key_generation && c->value.tx_tag == s->tx_tag))) {
++  if (dp_private.context_valid) dp_private.sta_checked[band] |= bit;
+   return c;
+- return dp_sta_fill(s, c, wcid, band);
++ }
++ dp_private.sta_checked[band] &= ~bit;
++ c = dp_sta_fill(s, c, wcid, band);
++ if (c && dp_private.context_valid) dp_private.sta_checked[band] |= bit;
++ return c;
+ }
+ /* Fixed aligned private packet copy. Volatile word stores prevent the
+  * freestanding compiler from lowering a struct assignment to libc memcpy. */
+@@ -444,7 +455,6 @@
+      s->flow[h->exact].version!=h->exact_version) goto next;
+  dp_private.last_hint[band] = index + 1;
+  dp_bridge_delta[band]++; return 1;
+- return 0;
+ }
+ static int dp_wan_ipv4(volatile struct kdp_shared *s, const struct dp_sta_tx *sta,
+                       const struct dp_ipv4_key *p, u32 wi, u32 band)
+--- a/npu_kite_tx.c
++++ b/npu_kite_tx.c
+@@ -262,6 +262,8 @@
+ 	/* Bounded service for both producers. Host control traffic always gets
+ 	 * the first batch; PPE packets use remaining hardware capacity. */
+ 	if (!s->fault) {
++  /* Immutable for this bounded begin/end; no per-packet accessor call. */
++  u32 publish_limit = kite_dp_publish_limit();
+ 		for (n = 0; n < KITE_TX_BUDGET; n++) {
+ 			struct kite_tx_desc v;
+ 			u16 token;
+@@ -284,7 +286,7 @@
+ 			obs_packets++;
+    t->batch_ppe++;
+    kite_dp_service_time(KDP_SERVICE_SUBMIT, service_stamp, 1);
+-   if (t->batch_ppe == kite_dp_publish_limit()) kite_tx_publish(t, b);
++   if (t->batch_ppe == publish_limit) kite_tx_publish(t, b);
+    if (s->fault) break;
+ 		}
+ 	}
+--- a/kite-datapath-fw.h
++++ b/kite-datapath-fw.h
+@@ -21,8 +21,8 @@
+ void kite_dp_tx_end(void);
+ void kite_dp_ba_poll(void);
+ unsigned int kite_dp_publish_limit(void);
+-unsigned int kite_dp_service_stamp(void);
+-void kite_dp_service_time(unsigned int stage, unsigned int start, unsigned int units);
++
++
+ void kite_dp_tx_flush(unsigned int band);
+ void kite_dp_tx_published(unsigned int band);
+ void kite_dp_observe_transport(unsigned int band, unsigned int event);
+@@ -34,7 +34,7 @@
+ void kite_dp_observe_snapshot(void);
+ void kite_dp_observe_batch(unsigned int band, unsigned int full,
+                            unsigned int packets, unsigned int mmio_start);
+-unsigned int kite_dp_observe_mmio(unsigned int band);
++
+ void kite_dp_host_drain(void);
+ int kite_dp_host_idle(void);
+ int host_ring_submit(u32 buf_addr, u16 pkt_len, u32 band,
+@@ -59,7 +59,27 @@
+ void kite_wifi_pipeline_discard(void);
+ 
+ /* GET32 KC1: per-band sampled costs, no ownership meaning. */
+-u32 kite_dp_cost_stamp(u32 band);
+-u32 kite_dp_cost_step(u32 band, u32 stage, u32 start, u32 units);
++
++
+ void kite_dp_cost_snapshot(u32 band, u32 *out);
++
++/* Hart4-only sampling eligibility, no function call on an unsampled loop. */
++extern u32 dp_observe_sample[2];
++u32 kite_dp_cost_stamp_sampled(u32 band);
++u32 kite_dp_cost_step_sampled(u32 band, u32 stage, u32 start, u32 units);
++u32 kite_dp_service_stamp_sampled(void);
++void kite_dp_service_time_sampled(u32 stage, u32 start, u32 units);
++u32 kite_dp_observe_mmio_sampled(u32 band);
++static inline __attribute__((always_inline)) u32 kite_dp_cost_stamp(u32 band)
++{ return band < 2 && dp_observe_sample[band] ? kite_dp_cost_stamp_sampled(band) : 0; }
++static inline __attribute__((always_inline)) u32 kite_dp_cost_step(u32 band,u32 stage,u32 start,u32 units)
++{ return band < 2 && stage < 12 && dp_observe_sample[band] ?
++ kite_dp_cost_step_sampled(band,stage,start,units) : 0; }
++static inline __attribute__((always_inline)) u32 kite_dp_service_stamp(void)
++{ return dp_observe_sample[0] ? kite_dp_service_stamp_sampled() : 0; }
++static inline __attribute__((always_inline)) void kite_dp_service_time(u32 stage,u32 start,u32 units)
++{ if (dp_observe_sample[0]) kite_dp_service_time_sampled(stage,start,units); }
++static inline __attribute__((always_inline)) u32 kite_dp_observe_mmio(u32 band)
++{ return band < 2 && dp_observe_sample[band] ? kite_dp_observe_mmio_sampled(band) : 0; }
++
+ #endif

@@ -1,0 +1,54 @@
+Subject: [PATCH] reject stale Kite bridge host fallback frames
+
+--- a/mt7915/kite-host.h
++++ b/mt7915/kite-host.h
+@@ -27,6 +27,9 @@
+ #define KDP_STAT_BRIDGE_MISS 1u
+ #define KDP_STAT_HOST_FALLBACK 2u
+ #define KDP_STAT_HOST_FALLBACK_DROP 3u
++#define KDP_HOST_FALLBACK_SESSION(v) (v)
++#define KDP_HOST_FALLBACK_GENERATION(v) ((v) & 0xffffu)
++#define KDP_HOST_FALLBACK_KEY_GENERATION(v) ((v) >> 16)
+ #define KITE_HOST_META_VALID(v) (((v) >> 24) == KITE_HOST_META_MAGIC)
+ #define KITE_HOST_META_GENERATION(v) (((v) >> 8) & 0xffffu)
+ #define KITE_HOST_META_FLAGS(v) (((v) >> 4) & 0xfu)
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1242,7 +1242,7 @@
+ }
+ 
+ static bool mt7915_kite_host_tx(struct mt7915_dev *dev, struct sk_buff *skb,
+-				 u32 meta)
++				 u32 meta, u32 session, u32 generation_key)
+ {
+ 	struct mt7915_kite_host_tx ctx = {
+ 		.skb = skb,
+@@ -1251,9 +1251,18 @@
+ 	};
+ 	struct mt76_wcid *wcid;
+ 	struct mt7915_sta *msta;
++	u32 generation = KDP_HOST_FALLBACK_GENERATION(generation_key);
++	u32 key_generation = KDP_HOST_FALLBACK_KEY_GENERATION(generation_key);
+ 
+ 	if (!KDP_HOST_FALLBACK_VALID(meta) || skb->len < ETH_HLEN ||
+-		ctx.band > 1 || ctx.wcid >= MT7916_WTBL_SIZE)
++		ctx.band > 1 || ctx.wcid >= MT7916_WTBL_SIZE || !session ||
++		!generation || !key_generation || !READ_ONCE(dev->kite.active) ||
++		READ_ONCE(dev->kite.session) != session ||
++		!READ_ONCE(dev->kite.live[ctx.wcid]) ||
++		READ_ONCE(dev->kite.generation[ctx.wcid]) > 0xffffu ||
++		(READ_ONCE(dev->kite.generation[ctx.wcid]) & 0xffffu) != generation ||
++		READ_ONCE(dev->kite.key_generation[ctx.wcid]) > 0xffffu ||
++		(READ_ONCE(dev->kite.key_generation[ctx.wcid]) & 0xffffu) != key_generation)
+ 		return false;
+ 	wcid = mt76_wcid_ptr(dev, ctx.wcid);
+ 	if (!wcid || !wcid->sta)
+@@ -1279,7 +1288,7 @@
+ 	 * the selected AP interface so mac80211 performs normal station lookup,
+ 	 * encryption and software TX. It must never be parsed as an MT7916 RXD. */
+ 	if (info && KDP_HOST_FALLBACK_VALID(info[0])) {
+-		if (!mt7915_kite_host_tx(dev, skb, info[0]))
++		if (!mt7915_kite_host_tx(dev, skb, info[0], info[1], info[2]))
+ 			dev_kfree_skb(skb);
+ 		return;
+ 	}

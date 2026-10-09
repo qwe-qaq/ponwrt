@@ -1,0 +1,271 @@
+From: ponwrt development <noreply@local>
+Subject: [PATCH] mt7915: reserve native PPE tokens and recover host fence failures
+
+boot.log showed unreturned PPE TX tokens followed by a host fence error
+that poisoned the firmware stop identity. Preserve physical-stop proofs
+and keep token producers disjoint inside the native MT7916 range.
+
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -9,7 +9,8 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_MAGIC 0x4b440002u
++#define KDP_ABI_VERSION 3u
++#define KDP_MAGIC 0x4b440003u
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -19,7 +20,10 @@
+ #define KDP_FLOW_BUCKETS (KDP_FLOWS / KDP_FLOW_WAYS)
+ #define KDP_RX_COUNT 256u
+ #define KDP_TOKENS 1024u
+-#define KDP_TOKEN_BASE 0x7000u
++/* Keep both producers inside the native MT7916 8192-token contract.
++ * The host reserves the upper 1024 before enabling any TX queue. */
++#define KDP_TOKEN_LIMIT 8192u
++#define KDP_TOKEN_BASE (KDP_TOKEN_LIMIT - KDP_TOKENS)
+ #define KDP_BUFFER_BYTES 2048u
+ #define KDP_TXWI_BYTES 128u
+ #define KDP_PN_SPINS 4096u
+@@ -215,7 +219,9 @@
+ 			(tid << 20) | wcid);
+ 	kdp_put_le32(p + 8, 0x20u | (wme ? 8u : 0u));
+ 	kdp_put_le32(p + 12, (15u << 11) | (encrypted ? 2u : 0u));
+-	/* PID 0: payload completion is WA TX-free, not an skb TX-status request. */
++	/* Native unicast without an skb TX-status request uses NO_SKB (1).
++	 * NO_ACK (0) is reserved for frames that do not require peer ACK. */
++	kdp_put_le32(p + 20, 1u);
+ 	kdp_put_le32(p + 28, (2u << 20) | (wme ? 8u << 16 : 0u) |
+ 			 (amsdu ? 1u << 10 : 0u));
+ 	kdp_put_le16(p + 32, 0x81u | (encrypted ? 0u : 8u));
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -274,6 +274,10 @@
+ 		bool reorder, datapath, dp_bound;
+ 		dma_addr_t dp_dma;
+ 		u32 dp_epoch;
++		bool dp_tokens_reserved;
++		int dp_change_error;
++		u32 dp_last_freed[2];
++		unsigned long dp_progress_at[2];
+ 		bool dp_attached, dp_changing, dp_rx_held;
+ 		u32 dp_rx_cfg[2], dp_rx_mac[2], dp_key_pending;
+ 		u32 dp_rx_stage, dp_rx_pse_empty, dp_rx_pse_query, dp_rx_pse_count;
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -907,6 +907,41 @@
+ 	mutex_unlock(&dev->kite.lock);
+ 	return ret;
+ }
++struct mt7915_dp_pending {
++	u32 wifi, quarantine, dma_wait, wa_wait, ready;
++};
++
++/* Concurrent snapshot, not a drain proof. The fence independently observes
++ * ownership; individual tokens may advance while these counts are read. */
++static struct mt7915_dp_pending
++mt7915_dp_pending(struct mt7915_dev *dev, int band)
++{
++	struct mt7915_dp_pending p = {};
++	struct kdp_shared *s = READ_ONCE(dev->mt76.kite_dp);
++	unsigned int i;
++
++	if (!s || !dev->kite.dp_bound)
++		return p;
++	dma_rmb();
++	for (i = 0; i < KDP_TOKENS; i++) {
++		struct kdp_token *t = &s->token[i];
++		u32 state = READ_ONCE(t->state), seq;
++
++		if (band >= 0 && READ_ONCE(t->band) != band)
++			continue;
++		p.quarantine += state == KDP_TOKEN_QUARANTINE;
++		if (state != KDP_TOKEN_WIFI)
++			continue;
++		p.wifi++;
++		seq = READ_ONCE(t->submitted);
++		p.dma_wait += !seq || READ_ONCE(t->dma_done) != seq;
++		p.wa_wait += !seq || READ_ONCE(t->wa_done) != seq;
++		p.ready += seq && READ_ONCE(t->dma_done) == seq &&
++			   READ_ONCE(t->wa_done) == seq;
++	}
++	return p;
++}
++
+ /* Drain before replacing keys/revoking a port/reusing a WCID. This waits
+  * for WA token completion, not just descriptor consumption. Keep NAPI/WA
+  * running. Frames arriving after the admission gate fail back to mac80211
+@@ -917,6 +952,7 @@
+ 	unsigned long until = jiffies + msecs_to_jiffies(3000);
+ 	int b;
+ 	unsigned int i;
++	struct mt7915_dp_pending pending;
+ 	if (!dev->kite.tx_bound)
+ 		return 0;
+ 	if (dev->kite.dp_bound) {
+@@ -951,9 +987,11 @@
+ 		usleep_range(1000, 2000);
+ 	} while (time_before(jiffies, until));
+ fault:
++	pending = mt7915_dp_pending(dev, -1);
+ 	dev_err(dev->mt76.dev,
+-		"Kite TX security fence failed: outstanding=%u; queues held for full recovery\n",
+-		READ_ONCE(dev->mt76.token_count));
++		"Kite TX security fence failed: host=%u DP=%u dma_wait=%u wa_wait=%u ready=%u quarantine=%u; queues held for full recovery\n",
++		READ_ONCE(dev->mt76.token_count), pending.wifi, pending.dma_wait,
++		pending.wa_wait, pending.ready, pending.quarantine);
+ 	dev->kite.tx_reset_requested = true;
+ 	dev->recovery.state |= MT_MCU_CMD_WDT_MASK;
+ 	mt7915_reset(dev);
+@@ -993,7 +1031,15 @@
+ 		reaped = kite_tx_read(&s->reaped);
+ 		progress = reaped + READ_ONCE(q->kite_wa_freed);
+ 		if (dp) {
+-			progress += READ_ONCE(dp->tx_freed[b]);
++			u32 freed = READ_ONCE(dp->tx_freed[b]);
++
++			/* Host beacons/control completions must not hide stuck PPE
++			 * payloads (boot.log: host advanced, 11 DP tokens did not). */
++			if (freed != dev->kite.dp_last_freed[b] ||
++			    READ_ONCE(dp->tx_sent[b]) == freed) {
++				dev->kite.dp_progress_at[b] = jiffies;
++				dev->kite.dp_last_freed[b] = freed;
++			}
+ 			dp_pending = READ_ONCE(dp->tx_sent[b]) - READ_ONCE(dp->tx_freed[b]);
+ 			if (report)
+ 				dev_info(dev->mt76.dev,
+@@ -1003,7 +1049,7 @@
+ 					 dp->tx_sent[b], dp->tx_freed[b], dp->tx_drop[b], dp_pending, dp->tx_bad_done);
+ 		}
+ 		if (progress != q->kite_last_progress ||
+-		    (!READ_ONCE(q->queued) && !READ_ONCE(q->kite_pending) && !dp_pending)) {
++		    (!READ_ONCE(q->queued) && !READ_ONCE(q->kite_pending))) {
+ 			q->kite_progress_at = jiffies;
+ 			q->kite_last_progress = progress;
+ 		}
+@@ -1022,7 +1068,15 @@
+ 				kite_tx_read(&s->fault),
+ 				READ_ONCE(dev->mt76.token_count));
+ 		if (kite_tx_read(&s->fault) || (dp && kdp_failed(dp)) ||
+-		    time_after(jiffies, q->kite_progress_at + 15 * HZ)) {
++		    time_after(jiffies, q->kite_progress_at + 15 * HZ) ||
++		    (dp_pending && time_after(jiffies, dev->kite.dp_progress_at[b] + 15 * HZ))) {
++			struct mt7915_dp_pending pending = mt7915_dp_pending(dev, b);
++
++			dev_err(dev->mt76.dev,
++				"Kite DP band%d stalled: pending=%u dma_wait=%u wa_wait=%u ready=%u quarantine=%u hw_submitted=%u hw_reaped=%u\n",
++				b, pending.wifi, pending.dma_wait, pending.wa_wait,
++				pending.ready, pending.quarantine,
++				kite_tx_read(&s->ppe_submitted), kite_tx_read(&s->ppe_reaped));
+ 			mt7915_kite_tx_gate(dev, true);
+ 			dev->kite.tx_reset_requested = true;
+ 			dev_err(dev->mt76.dev,
+@@ -1113,7 +1167,8 @@
+ 	struct kdp_shared *s = READ_ONCE(dev->mt76.kite_dp);
+ 	unsigned int b, i, sta = 0, flows = 0, wifi = 0, tdma = 0, quarantine = 0;
+ 
+-	seq_printf(m, "abi=2 negotiated=%u bound=%u attached=%u changing=%u\n",
++	seq_printf(m, "abi=%u negotiated=%u bound=%u attached=%u changing=%u\n",
++		KDP_ABI_VERSION,
+ 		dev->kite.datapath, dev->kite.dp_bound, dev->kite.dp_attached,
+ 		dev->kite.dp_changing);
+ 	seq_printf(m, "rx_fence_stage=%u pauses=%u resumes=%u failures=%u held=%u key_pending=%u pse_empty=%08x query=%08x count=%u\n",
+@@ -1160,6 +1215,19 @@
+ 			s->rx_free[b], s->rx_replay[b], s->rx_stale[b], s->rx_unsupported[b],
+ 			s->tx_sent[b], s->stats[b].tx_bytes, s->tx_freed[b], s->tx_drop[b],
+ 			s->stats[b].tx_stale, s->stats[b].tx_full, s->tx_aborted[b]);
++	seq_printf(m, "host_token_limit=%u dp_token_first=%u dp_token_limit=%u reserved=%u change_error=%d\n",
++		dev->mt76.token_size, KDP_TOKEN_BASE, KDP_TOKEN_LIMIT,
++		dev->kite.dp_tokens_reserved, dev->kite.dp_change_error);
++	for (b = 0; b < 2; b++) {
++		struct mt7915_dp_pending pending = mt7915_dp_pending(dev, b);
++		struct mt76_queue *q = dev->kite.txq[b];
++		struct kite_tx_shared *tx = q ? q->kite_tx : NULL;
++
++		seq_printf(m, "completion_band%u pending=%u dma_wait=%u wa_wait=%u ready=%u quarantine=%u hw_submitted=%u hw_reaped=%u\n",
++			b, pending.wifi, pending.dma_wait, pending.wa_wait, pending.ready,
++			pending.quarantine, tx ? kite_tx_read(&tx->ppe_submitted) : 0,
++			tx ? kite_tx_read(&tx->ppe_reaped) : 0);
++	}
+ 	seq_puts(m, "rx_ppe=TDMA submission; rx_free_only=buffer return, not delivery proof; tx_freed=DMA+WA completion, not peer ACK; counters wrap at 32 bits\n");
+ 	return 0;
+ }
+@@ -1179,7 +1247,7 @@
+ {
+ 	struct kdp_shared *s;
+ 	u32 args[3];
+-	int ret = 0;
++	int ret = 0, i;
+ 
+ 	if (!dev->kite.datapath)
+ 		return 0;
+@@ -1218,6 +1286,11 @@
+ 	} else {
+ 		memset(s, 0, sizeof(*s));
+ 	}
++	dev->kite.dp_change_error = 0;
++	for (i = 0; i < 2; i++) {
++		dev->kite.dp_last_freed[i] = 0;
++		dev->kite.dp_progress_at[i] = jiffies;
++	}
+ 	s->magic = KDP_MAGIC;
+ 	s->bytes = sizeof(*s);
+ 	s->session = dev->kite.session;
+@@ -1257,8 +1330,10 @@
+ 	return ret;
+ }
+ 
+-/* MT7916 WA returns a 15-bit token. This reserved range is disjoint from
+- * mt76's 8192 skb tokens and 0x7fff sentinel. Consuming the message does not
++/* A 15-bit WA event field does not establish a 32768-entry token table.
++ * Native MT7916 supports 8192 tokens; reserve the upper 1024 for PPE and
++ * allocate host SKBs only from the lower 7168. Without that reservation,
++ * these IDs still belong to ordinary mt76 (including non-NPU devices). Consuming the message does not
+  * free the buffer: hart4 additionally requires the actual WFDMA completion.
+  * dp_done_lock serializes WA parsers across MCU queues. */
+ bool mt7915_npu_dp_tx_free(struct mt7915_dev *dev, u16 token)
+@@ -1268,7 +1343,8 @@
+ 	u32 seq;
+ 	unsigned long flags;
+ 
+-	if (token < KDP_TOKEN_BASE || token >= KDP_TOKEN_BASE + KDP_TOKENS)
++	if (!dev->kite.dp_tokens_reserved ||
++	    token < KDP_TOKEN_BASE || token >= KDP_TOKEN_LIMIT)
+ 		return false;
+ 	s = READ_ONCE(dev->mt76.kite_dp);
+ 	if (!s || !READ_ONCE(dev->kite.dp_bound)) {
+--- a/mt7915/npu-datapath.inc
++++ b/mt7915/npu-datapath.inc
+@@ -62,7 +62,13 @@
+ 	if (!ret)
+ 		ret = mt7915_npu_tx_fence(dev);
+ 	if (ret) {
+-		WRITE_ONCE(dev->mt76.kite_dp->fault, 11);
++		/* A host fence error is not an NPU identity/ownership fault.
++		 * Keep the original firmware fault and the closed admission;
++		 * full recovery must still prove PARK and physical DMA stop. */
++		dev->kite.dp_change_error = ret;
++		dev->kite.tx_reset_requested = true;
++		dev->recovery.state |= MT_MCU_CMD_WDT_MASK;
++		mt7915_reset(dev);
+ 		return ret;
+ 	}
+ 	return 0;
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -173,6 +173,13 @@
+ 			mt76_npu_deinit(&dev->mt76);
+ 			return ret;
+ 		}
++		/* Reserve before DMA/MCU initialization; changing this with live
++		 * host tokens would alias a WA completion to the wrong owner. */
++		BUILD_BUG_ON(KDP_TOKEN_LIMIT != MT7915_TOKEN_SIZE);
++		if (npu_tx) {
++			dev->mt76.token_size = KDP_TOKEN_BASE;
++			dev->kite.dp_tokens_reserved = true;
++		}
+ 		dev_info(dev->mt76.dev,
+ 			 "Kite data-development mode enabled (port type %u); stop/drain ABI active\n",
+ 			 port_type);

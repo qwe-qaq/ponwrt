@@ -1,0 +1,26 @@
+Subject: [PATCH] r65 mt76 bounded observation and downlink processing cost
+
+Revalidate native authority; preserve stopped unchanged soft rules, not old
+FOEs. Keep single hart, exact policy, PN and DMA/WA ownership contracts.
+
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1976,7 +1976,7 @@
+ 	ret = mt7915_kite_command(dev, KITE_CTL_DP_BIND, args, 3);
+ 	if (!ret)
+ 		dev_info(dev->mt76.dev,
+-			 "Kite datapath r64 ABI12 bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
++			 "Kite datapath r65 ABI12 bound: session=%u epoch=%u bytes=%zu perf=%u amsdu=%u; admission closed\n",
+ 			 s->session, s->epoch, sizeof(*s), s->perf.flags, npu_amsdu);
+ out:
+ 	if (ret)
+--- a/mt7915/npu-wa.inc
++++ b/mt7915/npu-wa.inc
+@@ -88,5 +88,6 @@
+  if (elapsed > dev->kite.wa.max_ns) dev->kite.wa.max_ns = elapsed;
+  spin_unlock_irqrestore(&dev->kite.dp_done_lock, flags);
+  b->count = 0;
+- mt7915_npu_ps_progress(&dev->mt76);
++ /* RX NAPI end (including a budget-limited poll) notifies PS once after
++  * all these reports. TX-worker progress and the bounded retry remain. */
+ }

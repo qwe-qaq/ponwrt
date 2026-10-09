@@ -1,0 +1,41 @@
+Subject: [PATCH] Notify AP datapath before custom QoS map publication
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -2014,6 +2014,8 @@
+  * @IEEE80211_OFFLOAD_DECAP_ENABLED: rx encapsulation offload is enabled
+  *	The driver supports passing received 802.11 frames as 802.3 frames to
+  *	mac80211.
++ * @IEEE80211_OFFLOAD_CUSTOM_QOS: a configured QoS map requires software
++ *	classification; notified through BSS_CHANGED_QOS before publication.
+  * @IEEE80211_OFFLOAD_ENCAP_MCAST: tx multicast encapsulation offload is enabled
+  *	The driver supports sending multicast frames passed as 802.3 frames
+  *	by mac80211.
+@@ -2024,6 +2026,7 @@
+ 	IEEE80211_OFFLOAD_ENCAP_4ADDR		= BIT(1),
+ 	IEEE80211_OFFLOAD_DECAP_ENABLED		= BIT(2),
+ 	IEEE80211_OFFLOAD_ENCAP_MCAST		= BIT(3),
++	IEEE80211_OFFLOAD_CUSTOM_QOS		= BIT(4),
+ };
+ 
+ #define IEEE80211_NAN_AVAIL_BLOB_MAX_LEN	54
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -5134,6 +5134,17 @@
+ 		/* A NULL qos_map was passed to disable QoS mapping */
+ 		new_qos_map = NULL;
+ 	}
++
++	/* Direct Ethernet-to-WiFi offload cannot bypass a configured QoS map.
++	 * Notify before publishing the map so existing egress rules are retired.
++	 * MT7916 supports a single link; MLO datapaths do not use this contract. */
++	if (qos_map)
++		sdata->vif.offload_flags |= IEEE80211_OFFLOAD_CUSTOM_QOS;
++	else
++		sdata->vif.offload_flags &= ~IEEE80211_OFFLOAD_CUSTOM_QOS;
++	if (sdata->vif.type == NL80211_IFTYPE_AP && ieee80211_sdata_running(sdata))
++		ieee80211_link_info_change_notify(sdata, &sdata->deflink,
++						 BSS_CHANGED_QOS);
+ 
+ 	old_qos_map = sdata_dereference(sdata->qos_map, sdata);
+ 	rcu_assign_pointer(sdata->qos_map, new_qos_map);

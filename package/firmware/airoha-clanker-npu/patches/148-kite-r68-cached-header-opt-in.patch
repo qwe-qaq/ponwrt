@@ -1,0 +1,148 @@
+Subject: r68 opt-in hart4 D-cache read of the TX header line
+
+The compact IPv4 parse loads eleven header words (bytes 0..47) through the
+uncached DRAM alias, about 73 cycles each. The NPU D-cache (8 KB, 64-byte
+lines, write-back, no DMA snoop) is reachable through the 0x8xxxxxxx alias,
+as Clanker already uses for AN7583 TX-done reports. With the opt-in flag
+and a passing on-core self-test, hart4 invalidates the buffer's first line
+with vendor op 0xFC2, reads the header through the cached alias (one line
+fill), then drops the clean line. The payload buffer is 64-byte aligned,
+exclusively owned by hart4 between TDMA DONE and rearm, and never written
+through the cached alias, so the invalidate cannot discard dirty data.
+Bind accepts only the request bit from the host; a failed self-test keeps
+the uncached path; activation also requires a stale cached read (SEEN),
+so an op skipped as illegal or an uncached alias never reaches the hot
+path. Host builds use coherent no-op hooks so regression
+fixtures still compile; the cache-model test overrides them.
+
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -213,6 +213,14 @@
+  * The old DMA regions do not move. The host writes flags only before BIND. */
+ #define KDP_PERF_FAST 1u
+ #define KDP_PERF_TOKENQ 2u
++/* r68 opt-in: hart4 reads the TX header line through the D-cache after a
++ * line invalidate. The host may set only CACHED_HDR; hart4 reports the
++ * result of its on-core self-test with OK or FAIL, and SEEN when a stale
++ * cached read proved the cache is really in the load path. Layout unchanged. */
++#define KDP_PERF_CACHED_HDR 4u
++#define KDP_PERF_CACHED_FAIL 8u
++#define KDP_PERF_CACHED_SEEN 16u
++#define KDP_PERF_CACHED_OK 32u
+ struct kdp_perf_control {
+ 	unsigned int flags, free_count, pending_count, alloc_probe;
+ 	unsigned int alloc_empty, reap_probe, reap_ready, cache_flush;
+--- a/kite-fast.inc
++++ b/kite-fast.inc
+@@ -40,9 +40,56 @@
+ #define dp_hint_next dp_private.next
+ static u32 dp_private_needs_init;
+ 
++/* r68 D-cache header read. Hooks are overridable so host fixtures can model
++ * a non-snooping write-back cache; on the NPU they are the vendor op 0xFC2. */
++#ifndef KDP_DCACHE_INV
++#ifdef __riscv
++#define KDP_DCACHE_INV(a) dcache_inv_line(a)
++#define KDP_DCACHE_FENCE() __asm__ __volatile__("fence iorw,iorw" ::: "memory")
++#else /* host regression builds: coherent memory, cache-modelling tests override */
++#define KDP_DCACHE_INV(a) ((void)(a))
++#define KDP_DCACHE_FENCE() ((void)0)
++#endif
++#define KDP_CACHED_WORDS(a) ((const volatile kdp_word *)(unsigned long)(a))
++#define KDP_UNCACHED_WORDS(a) ((volatile kdp_word *)(unsigned long)(((a) & 0x3fffffffu) | 0x40000000u))
++#endif
++static u32 dp_cached_hdr, dp_cached_pending;
++/* r68: one exclusive 64-byte DRAM line for the D-cache self-test. Only this
++ * test touches it, only through the uncached alias for stores. */
++static volatile kdp_word dp_cache_probe[16]
++ __attribute__((section(".kite_observe"), aligned(64)));
++_Static_assert(sizeof(dp_cache_probe) == 64, "one D-cache line");
++/* Runs on hart4 (the D-cache is per core) before the first header read.
++ * Proves on this core: the line op does not discard DRAM writes, a fill
++ * after the op sees DRAM, and a second op drops a stale line. Any failure
++ * leaves the uncached path in force and is reported to the host. */
++static void dp_cached_hdr_selftest(void)
++{
++ u32 c = (u32)(unsigned long)dp_cache_probe, ok, flags;
++ volatile kdp_word *u = KDP_UNCACHED_WORDS(c);
++ const volatile kdp_word *w = KDP_CACHED_WORDS(c);
++ dp_cached_pending = 0;
++ KDP_DCACHE_INV(c); KDP_DCACHE_FENCE(); /* discard any boot-time zeroing */
++ u[0] = 0xa5c30001u; u[15] = 0x5a3c0001u; KDP_BARRIER();
++ KDP_DCACHE_INV(c); KDP_DCACHE_FENCE();
++ ok = w[0] == 0xa5c30001u && w[15] == 0x5a3c0001u;
++ u[0] = 0xa5c30002u; KDP_BARRIER();
++ flags = w[0] == 0xa5c30001u ? KDP_PERF_CACHED_SEEN : 0; /* stale = real cache */
++ KDP_DCACHE_INV(c); KDP_DCACHE_FENCE();
++ ok = ok && w[0] == 0xa5c30002u && w[15] == 0x5a3c0001u;
++ KDP_DCACHE_INV(c);
++ /* Activate only when a stale cached read proved the cache is in the load
++  * path. Without SEEN there is no gain, and an op the core treats as illegal
++  * (trap_dispatch skips it) must never reach the per-packet path. */
++ ok = ok && flags;
++ dp_cached_hdr = ok;
++ dp->perf.flags = (dp->perf.flags & ~(KDP_PERF_CACHED_FAIL | KDP_PERF_CACHED_SEEN |
++  KDP_PERF_CACHED_OK)) | flags | (ok ? KDP_PERF_CACHED_OK : KDP_PERF_CACHED_FAIL);
++}
+ void kite_dp_cache_invalidate(void)
+ {
+  /* This function is called by hart4 on every PARK/resume transition. */
++ if (dp && dp_cached_pending) dp_cached_hdr_selftest();
+  npu_memset(&dp_private, 0, sizeof(dp_private));
+  npu_memset(dp_gate_active, 0, sizeof(dp_gate_active));
+  dp_private_needs_init = 0;
+@@ -201,6 +248,9 @@
+ /* TDMA DONE + acquire gives hart4 exclusive read ownership until rearm.
+  * Load each required payload word once; no 48-byte stack copy/byte reread.
+  * The same helper accepts aligned private words in differential tests. */
++/* r68: the compact parser reads words 0..11 (bytes 0..47) only; with a
++ * 64-byte aligned buffer that is exactly one D-cache line. */
++_Static_assert(12 * 4 <= 64 && KDP_BUFFER_BYTES % 64 == 0, "header in one D-cache line");
+ static int dp_parse_ipv4_key(const volatile kdp_word *h, u32 len, struct dp_ipv4_key *p)
+ {
+  u32 end, proto, frag, hdrlen, h0, h1, h4, h5, h6, h7, h8, h9;
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -228,7 +228,7 @@
+ 	KDP_BARRIER();
+ 	if (s->magic != KDP_MAGIC || s->bytes != bytes || s->session != session ||
+ 	    s->epoch != epoch || s->enabled || !s->gate || s->fault ||
+-	    (s->perf.flags & ~(KDP_PERF_FAST | KDP_PERF_TOKENQ)) ||
++	    (s->perf.flags & ~(KDP_PERF_FAST | KDP_PERF_TOKENQ | KDP_PERF_CACHED_HDR)) ||
+ 	    (s->tuning.publish_batch != 8 && s->tuning.publish_batch != 16) ||
+ 	    (s->perf.sample_shift && (s->perf.sample_shift < 6 || s->perf.sample_shift > 12)))
+ 		return 0;
+@@ -251,6 +251,9 @@
+ 	dp_free_head = dp_free_tail = dp_wait_count = 0;
+  dp_publish_limit = s->tuning.publish_batch;
+  dp_perf_flags = s->perf.flags;
++ /* Never inherit a previous session's proof: hart4 re-tests on its own core. */
++ dp_cached_hdr = 0;
++ dp_cached_pending = (dp_perf_flags & KDP_PERF_FAST) && (dp_perf_flags & KDP_PERF_CACHED_HDR);
+  /* DMA can only read 76 bytes. Keep the allocation tail deterministic at
+   * every BIND, even when a caller reuses the shared allocation. */
+  npu_memset((void *)s->txwi, 0, sizeof(s->txwi));
+@@ -841,8 +844,21 @@
+  } else {
+   fast = 0;
+   if ((dp_perf_flags & KDP_PERF_FAST) && len >= 48 &&
+-      !((unsigned long)payload & 3))
+-   compact_valid = dp_parse_ipv4_key((const volatile kdp_word *)payload, len, compact);
++      !((unsigned long)payload & 3)) {
++   if (dp_cached_hdr) {
++    /* r68: TDMA DONE gave hart4 exclusive ownership of this buffer; the DMA
++     * wrote DRAM behind the non-snooping D-cache. Drop the buffer's first
++     * line, then the header words (bytes 0..47) cost one line fill instead
++     * of eleven uncached loads. The buffer is 64-byte aligned and is never
++     * written through the cached alias, so no dirty data can be discarded.
++     * The second invalidate drops the now-dead clean line. */
++    u32 line = dp_payload_pa(token);
++    KDP_DCACHE_INV(line); KDP_DCACHE_FENCE();
++    compact_valid = dp_parse_ipv4_key(KDP_CACHED_WORDS(line), len, compact);
++    KDP_DCACHE_INV(line);
++   } else
++    compact_valid = dp_parse_ipv4_key((const volatile kdp_word *)payload, len, compact);
++  }
+   if (compact_valid) {
+    fast = parsed = 1; packet_valid = 0;
+    dp_performance[band].parse_fast++;

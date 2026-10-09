@@ -1,0 +1,283 @@
+From: ponwrt maintainers
+Subject: [PATCH] r71: Classify abnormal host returns without changing RX ownership or delivery.
+
+Native patch on the r70 prepared baseline. Datapath ABI12 unchanged.
+
+--- a/npu_internal.h
++++ b/npu_internal.h
+@@ -768,6 +768,7 @@
+ #endif
+ #define NDBG_SIZE	0x1000
+ extern u32 sram_alloc_offset;
++void kite_host_failure_snapshot(u32 *out);
+ /* tags and text read in order in a word dump, first char in the MSB */
+ #define NDBG_TAG(a, b, c, d)	((u32)(a) << 24 | (b) << 16 | (c) << 8 | (d))
+ #define NDBG_MAGIC	NDBG_TAG('N', 'D', 'B', 'G')
+@@ -807,6 +808,21 @@
+ 	NC_KITE_META_REORDER0, NC_KITE_META_REORDER1,
+ 	NC_KITE_META_UNKNOWN0, NC_KITE_META_UNKNOWN1,
+ 	NC_KITE_META_FALLBACK0, NC_KITE_META_FALLBACK1,
++	/* r71: core3 only, abnormal host returns; no successful-packet work.
++	 * First six pairs are causes; last six are caller dispositions.
++	 * HOLD retains ownership. A rejection is NOT always a wire-packet loss. */
++	NC_HOST_NOT_READY0 = 72, NC_HOST_NOT_READY1,
++	NC_HOST_INVALID0, NC_HOST_INVALID1,
++	NC_HOST_RING0, NC_HOST_RING1,
++	NC_HOST_GUARD0, NC_HOST_GUARD1,
++	NC_HOST_DESC0, NC_HOST_DESC1,
++	NC_HOST_COPY_HOLD0, NC_HOST_COPY_HOLD1,
++	NC_HOST_RX_REJECT0, NC_HOST_RX_REJECT1,
++	NC_HOST_RX_HOLD0, NC_HOST_RX_HOLD1,
++	NC_HOST_TX_REJECT0, NC_HOST_TX_REJECT1,
++	NC_HOST_TX_HOLD0, NC_HOST_TX_HOLD1,
++	NC_HOST_CHAIN_REJECT0, NC_HOST_CHAIN_REJECT1,
++	NC_HOST_CHAIN_HOLD0, NC_HOST_CHAIN_HOLD1,
+ 	NC_MAX = 96,
+ };
+ 
+--- a/npu_hostadpt.c
++++ b/npu_hostadpt.c
+@@ -280,6 +280,61 @@
+ 	return 0;
+ }
+ 
++/* Core3 is the sole writer. Core0 exports a bounded seqlock snapshot.
++ * 88 bytes of SRAM; no payload, pointer or key material is exported. */
++static volatile u32 host_failure[2][11];
++static int host_reject(u32 band, u32 counter, int ret)
++{
++	if (band < 2) {
++		NDBG_CNT(counter + band);
++		/* Temporary cause is consumed by the same hart's wrapper. */
++		host_failure[band][10] = counter;
++	}
++	return ret;
++}
++static void host_result(u32 band, u32 wcid, u32 len, u32 origin, int ret)
++{
++	volatile u32 *v;
++	u32 ring, idx, counter;
++	if (!ret || band > 1)
++		return;
++	counter = origin == 2 ? NC_HOST_CHAIN_REJECT0 :
++		(origin == 1 ? NC_HOST_TX_REJECT0 : NC_HOST_RX_REJECT0);
++	if (ret == KITE_HOST_HOLD)
++		counter += 2;
++	NDBG_CNT(counter + band);
++	v = host_failure[band];
++	v[0]++; /* odd while updating */
++	__asm__ volatile("fence iorw,iorw" ::: "memory");
++	v[1] = timer_raw_tick;
++	v[2] = v[10];
++	v[3] = wcid;
++	v[4] = origin | (ret == KITE_HOST_HOLD ? 0x100u : 0);
++	v[5] = len;
++	idx = REG32(HOSTADPT_RX_DMA_IDX(band));
++	v[6] = idx; v[7] = v[8] = 0;
++	v[9] = hostadpt_tx_ring_ready;
++	ring = band ? hostadpt_rx_ring_base : hostadpt_tx_ring_base;
++	if (hostadpt_tx_ring_ready && ring && idx < HOSTADPT_RING_SIZE) {
++		v[7] = *(volatile u32 *)(ring + idx * 24);
++		v[8] = *(volatile u32 *)(ring + ((idx + 2) % HOSTADPT_RING_SIZE) * 24);
++	}
++	__asm__ volatile("fence iorw,iorw" ::: "memory");
++	v[0]++;
++}
++void kite_host_failure_snapshot(u32 *out)
++{
++	for (u32 b = 0; b < 2; b++) {
++		u32 seq = host_failure[b][0];
++		u32 *d = out + b * 11;
++		__asm__ volatile("fence iorw,iorw" ::: "memory");
++		for (u32 i = 0; i < 10; i++)
++			d[i] = host_failure[b][i];
++		__asm__ volatile("fence iorw,iorw" ::: "memory");
++		d[10] = seq && !(seq & 1) && seq == host_failure[b][0];
++	}
++}
++
+ static int host_ring_submit_impl(u32 buf_addr, u16 pkt_len, u32 band,
+ 			    u16 wcid, u8 amsdu, u8 fwd_type,
+ 			    u16 orig_len, u8 is_last, u32 info)
+@@ -287,13 +342,15 @@
+ 	u32 idx, check_idx, ring_base, desc_addr;
+ 
+ 	if (kite_host_faulted())
+-		return KITE_HOST_HOLD;
+-	if (!hostadpt_tx_ring_ready || band > 1 || !pkt_len || !orig_len)
+-		return -1;
++		return host_reject(band, NC_HOST_COPY_HOLD0, KITE_HOST_HOLD);
++	if (!hostadpt_tx_ring_ready)
++		return host_reject(band, NC_HOST_NOT_READY0, -1);
++	if (band > 1 || !pkt_len || !orig_len)
++		return host_reject(band, NC_HOST_INVALID0, -1);
+ 	__asm__ volatile("fence iorw,iorw" ::: "memory");
+ #ifdef WIFI_KITE
+ 	if (pkt_len > HOSTADPT_BUFFER_LEN || orig_len != pkt_len)
+-		return -1; /* segmented frames use the all-or-nothing chain writer */
++		return host_reject(band, NC_HOST_INVALID0, -1); /* segmented frames use the all-or-nothing chain writer */
+ #endif
+ 
+ 	if (wifi_debug_flags & 4) {
+@@ -311,7 +368,7 @@
+ 		idx = REG32(HOSTADPT_RX_DMA_IDX(0));
+ 		ring_base = hostadpt_tx_ring_base;
+ 		if (!ring_base || idx >= HOSTADPT_RING_SIZE)
+-			return -1;
++			return host_reject(band, NC_HOST_RING0, -1);
+ 
+ 		check_idx = idx + 2;
+ 		if (check_idx > 511)
+@@ -325,17 +382,17 @@
+ 			else
+ 				REG32(HOSTADPT_RX_DMA_IDX(0)) = 511;
+ 			REG32(HOSTADPT_RX_DMA_IDX(0)) = idx;
+-			return -1;
++			return host_reject(band, NC_HOST_GUARD0, -1);
+ 		}
+ 
+ 		desc_addr = ring_base + idx * 24;
+ 		if (!((volatile u32 *)desc_addr)[3] ||
+ 		    (((volatile u32 *)desc_addr)[0] & 1))
+-			return -1;
++			return host_reject(band, NC_HOST_DESC0, -1);
+ 		__asm__ volatile("fence iorw,iorw" ::: "memory");
+ 		if (host_ring_write_desc(desc_addr, buf_addr, pkt_len, wcid,
+ 					 amsdu, fwd_type, orig_len, is_last, info))
+-			return KITE_HOST_HOLD;
++			return host_reject(band, NC_HOST_COPY_HOLD0, KITE_HOST_HOLD);
+ 		idx++;
+ 		REG32(HOSTADPT_RX_DMA_IDX(0)) = (idx < HOSTADPT_RING_SIZE) ? idx : 0;
+ 		return 0;
+@@ -344,7 +401,7 @@
+ 		idx = REG32(HOSTADPT_RX_DMA_IDX(1));
+ 		ring_base = hostadpt_rx_ring_base;
+ 		if (!ring_base || idx >= HOSTADPT_RING_SIZE)
+-			return -1;
++			return host_reject(band, NC_HOST_RING0, -1);
+ 
+ 		check_idx = idx + 2;
+ 		if (check_idx > 511)
+@@ -358,24 +415,24 @@
+ 			else
+ 				REG32(HOSTADPT_RX_DMA_IDX(1)) = 511;
+ 			REG32(HOSTADPT_RX_DMA_IDX(1)) = idx;
+-			return -1;
++			return host_reject(band, NC_HOST_GUARD0, -1);
+ 		}
+ 
+ 		desc_addr = ring_base + idx * 24;
+ 		if (!((volatile u32 *)desc_addr)[3] ||
+ 		    (((volatile u32 *)desc_addr)[0] & 1))
+-			return -1;
++			return host_reject(band, NC_HOST_DESC0, -1);
+ 		__asm__ volatile("fence iorw,iorw" ::: "memory");
+ 		if (host_ring_write_desc(desc_addr, buf_addr, pkt_len, wcid,
+ 					 amsdu, fwd_type, orig_len, is_last, info))
+-			return KITE_HOST_HOLD;
++			return host_reject(band, NC_HOST_COPY_HOLD0, KITE_HOST_HOLD);
+ 		idx++;
+ 		REG32(HOSTADPT_RX_DMA_IDX(1)) = (idx < HOSTADPT_RING_SIZE) ? idx : 0;
+ 		return 0;
+ 
+ 	} else {
+ 		npu_printf("Ring Index error!\n");
+-		return -1;
++		return host_reject(band, NC_HOST_INVALID0, -1);
+ 	}
+ }
+ 
+@@ -413,6 +470,9 @@
+ 		NDBG_CNT((ret ? NC_KITE_HOST_FAIL0 : NC_KITE_HOST0) + band);
+ 	if (!ret)
+ 		kite_host_meta_count(band, info);
++	else
++		host_result(band, wcid, pkt_len,
++			fwd_type == KDP_HOST_FWD_WIFI_TX, ret);
+ 	return ret;
+ }
+ 
+@@ -427,30 +487,33 @@
+ 	volatile u32 *d;
+ 
+ 	if (kite_host_faulted())
+-		return KITE_HOST_HOLD;
+-	if (band > 1 || !hostadpt_tx_ring_ready || !n || n > 7)
+-		return -1;
++		return host_reject(band, NC_HOST_COPY_HOLD0, KITE_HOST_HOLD);
++	if (!hostadpt_tx_ring_ready)
++		return host_reject(band, NC_HOST_NOT_READY0, -1);
++	if (band > 1 || !n || n > 7)
++		return host_reject(band, NC_HOST_INVALID0, -1);
+ 	__asm__ volatile("fence iorw,iorw" ::: "memory");
+ 	ring = band ? hostadpt_rx_ring_base : hostadpt_tx_ring_base;
+ 	if (!ring)
+-		return -1;
++		return host_reject(band, NC_HOST_RING0, -1);
+ 	idx = REG32(HOSTADPT_RX_DMA_IDX(band));
+ 	if (idx >= HOSTADPT_RING_SIZE)
+-		return -1;
++		return host_reject(band, NC_HOST_RING0, -1);
+ 	total = *(u16 *)(nodes[0] + 4);
+ 	for (i = 0, slot = idx; i < n; i++) {
+ 		u32 len = *(u16 *)(nodes[i] + 6);
+ 
+ 		slots[i] = ring + slot * 24;
+ 		d = (volatile u32 *)slots[i];
+-		if (!len || len > HOSTADPT_BUFFER_LEN || !d[3] ||
+-		    (d[0] & 1) || *(u16 *)(nodes[i] + 4) != total)
+-			return -1;
++		if (!len || len > HOSTADPT_BUFFER_LEN || *(u16 *)(nodes[i] + 4) != total)
++			return host_reject(band, NC_HOST_INVALID0, -1);
++		if (!d[3] || (d[0] & 1))
++			return host_reject(band, NC_HOST_DESC0, -1);
+ 		sum += len;
+ 		slot = (slot + 1) % HOSTADPT_RING_SIZE;
+ 	}
+ 	if (sum != total || total <= HOSTADPT_BUFFER_LEN || total >= 0x4000)
+-		return -1;
++		return host_reject(band, NC_HOST_INVALID0, -1);
+ 	__asm__ volatile("fence iorw,iorw" ::: "memory");
+ 	for (i = 0; i < n; i++) {
+ 		/* A segmented RX frame has no complete MT7916 header at any one
+@@ -467,7 +530,7 @@
+ 			wifi_pkt_dma(*(u32 *)nodes[i]), total, 0, 0,
+ 			(n << 3) | (i + 1), *(u16 *)(nodes[i] + 6), i == n - 1, meta);
+ 		if (!ctrl[i])
+-			return KITE_HOST_HOLD;
++			return host_reject(band, NC_HOST_COPY_HOLD0, KITE_HOST_HOLD);
+ 	}
+ 	for (i = n; i-- > 0; ) {
+ 		__asm__ volatile("fence iorw,iorw" ::: "memory");
+@@ -486,6 +549,8 @@
+ 	if (!ret)
+ 		kite_host_meta_count(band,
+ 			KITE_HOST_META_PACK(0, 0, KITE_HOST_META_MALFORMED));
++	else
++		host_result(band, 0xffff, n, 2, ret);
+ 	return ret;
+ }
+ 
+--- a/npu_wifi.c
++++ b/npu_wifi.c
+@@ -69,7 +69,7 @@
+ 	u32 page = msg[0] & 15, i;
+ 	u32 *d = msg + 2;
+ 
+-	if (cnt != 256 || page > 2)
++	if (cnt != 256 || page > 3)
+ 		return 0;
+ 	for (i = 0; i < 62; i++)
+ 		d[i] = 0;
+@@ -116,6 +116,11 @@
+ 			d[43 + i] = ndbg->cnt[NC_KITE_META_RAW0 + i];
+ 		kite_ctl_reorder_snapshot(d + 59);
+ 		d[61] = 0x4b530001; /* KS telemetry ABI 1 */
++	} else if (page == 3) {
++		for (i = 0; i < 24; i++)
++			d[4 + i] = ndbg->cnt[NC_HOST_NOT_READY0 + i];
++		kite_host_failure_snapshot(d + 28);
++		d[61] = 0x4b480001; /* KH cause/disposition ABI1 */
+ 	} else {
+ 		kite_wifi_ring_snapshot(d);
+ 	}

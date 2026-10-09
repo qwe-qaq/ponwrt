@@ -1,0 +1,167 @@
+Subject: [PATCH] r64 firmware downlink performance and resume correctness
+
+Revalidate native authority; preserve stopped unchanged soft rules, not old
+FOEs. Keep single hart, exact policy, PN and DMA/WA ownership contracts.
+
+--- a/kite-fast.inc
++++ b/kite-fast.inc
+@@ -24,7 +24,6 @@
+ };
+ struct dp_ipv4_key { u32 src, dst, ports, protocol, mac[3]; };
+ static struct {
+- u32 gate_active[2], gate_since[2];
+  struct dp_ipv4_key compact[2];
+  struct dp_parse_cache parse[2];
+  struct kdp_packet scratch[2];
+@@ -44,6 +43,7 @@
+ {
+  /* This function is called by hart4 on every PARK/resume transition. */
+  npu_memset(&dp_private, 0, sizeof(dp_private));
++ npu_memset(dp_gate_active, 0, sizeof(dp_gate_active));
+  dp_private_needs_init = 0;
+  if (dp) dp->perf.cache_flush++;
+ }
+--- a/kite-observe.inc
++++ b/kite-observe.inc
+@@ -10,8 +10,9 @@
+ static struct { u32 alloc_probe, alloc_empty, reap_probe, reap_ready; } dp_account;
+ static struct kdp_tune_stats dp_tune;
+ static u32 dp_observe_sample[2];
+-static struct { u32 pressure_tick; struct kdp_r63_band band[2]; } dp_r63
+- __attribute__((section(".kite_observe")));
++/* Polled on every TDMA descriptor: keep these small transition fields in
++ * SRAM, not in the DRAM observation region competing with packet keys. */
++static struct { u32 pressure_tick; struct kdp_r63_band band[2]; } dp_r63;
+ static struct kdp_r59 dp_r59 __attribute__((section(".kite_observe")));
+ static u32 dp_age_limit[7];
+ static void dp_hot(u32 stage, u32 start, u32 units)
+@@ -109,7 +110,7 @@
+  t->samples++; t->cycles+=elapsed; t->units++;
+  if (elapsed>t->max_cycles) t->max_cycles=elapsed;
+ }
+-static void dp_observe_empty(u32 band, int empty)
++static __attribute__((noinline)) void dp_observe_empty_change(u32 band, int empty)
+ {
+  struct kdp_r63_band *v=&dp_r63.band[band];
+  u32 now,age,i=0;
+@@ -119,6 +120,11 @@
+  age=now-v->empty_since; v->empty_active=0; v->empty_runs++;
+  while (i<7 && age>dp_age_limit[i]) i++;
+  v->empty_bins[i]++;
++}
++static inline void dp_observe_empty(u32 band, int empty)
++{
++ if (!!dp_r63.band[band].empty_active != !!empty)
++  dp_observe_empty_change(band, empty);
+ }
+ static void dp_observe_init(void)
+ {
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -34,6 +34,10 @@
+ };
+ static struct dp_publish_batch dp_batch[2];
+ static u32 dp_tid[2];
++static u32 dp_gate_active[2], dp_gate_since[2];
++/* Statistics only, never token/ownership authority. Flush at every bounded
++ * TDMA batch and at every transport tail, including held/full tails. */
++static u32 dp_sent_delta[2], dp_bytes_delta[2];
+ struct dp_parse_cache {
+ 	u32 valid, token, len, tag;
+ 	int parsed, fast;
+@@ -258,6 +262,8 @@
+ 	for (i = 0; i < KDP_TOKENS; i++)
+ 		dp_freeq[i] = i;
+ 	dp_private_needs_init = 1; /* hart4 initializes its own cached DRAM */
++ npu_memset(dp_sent_delta,0,sizeof(dp_sent_delta));
++ npu_memset(dp_bytes_delta,0,sizeof(dp_bytes_delta));
+  npu_memset((void *)dp_host, 0, sizeof(dp_host));
+  npu_memset((void *)dp_host_tail, 0, sizeof(dp_host_tail));
+  npu_memset((void *)dp_host_consume, 0, sizeof(dp_host_consume));
+@@ -508,7 +514,13 @@
+ {
+  struct dp_publish_batch *q = &dp_batch[band];
+  u32 n, last;
+- if (!dp || !q->count) return;
++ if (!dp) return;
++ if (dp_sent_delta[band]) {
++  dp->tx_sent[band] += dp_sent_delta[band];
++  dp->stats[band].tx_bytes += dp_bytes_delta[band];
++  dp_sent_delta[band] = dp_bytes_delta[band] = 0;
++ }
++ if (!q->count) return;
+  KDP_BARRIER(); /* all replacement addresses before any ready control */
+  for (n = 0; n < q->count; n++)
+   REG32(dp_ring + band * DP_TDMA_BYTES + ((q->first + n) % DP_TDMA_COUNT) * 32 + 4) = KDP_BUFFER_BYTES;
+@@ -676,11 +688,11 @@
+ static __attribute__((noinline)) int dp_gate_hold(u32 band)
+ {
+  u32 now=dp_observe_tick();
+- if (!dp_private.gate_active[band]) {
+-  dp_private.gate_active[band]=1; dp_private.gate_since[band]=now;
++ if (!dp_gate_active[band]) {
++  dp_gate_active[band]=1; dp_gate_since[band]=now;
+  }
+  /* Existing calibrated 64ms bin; a stuck healthy gate cannot pin a head. */
+- if ((u32)(now-dp_private.gate_since[band]) >= dp_age_limit[5]) {
++ if ((u32)(now-dp_gate_since[band]) >= dp_age_limit[5]) {
+   dp_r63.band[band].gate_timeout++; return 0;
+  }
+  dp_r63.band[band].gate_hold++; return 1;
+@@ -756,19 +768,23 @@
+ 		dp->quality[band].format_drop++;
+ 		goto drop;
+ 	}
+- if (dp->enabled && dp->gate && !dp->r60.degraded[band]) {
+-  if (dp_gate_hold(band)) return 0;
+- } else if (dp_private.gate_active[band]) {
+-  dp_private.gate_active[band]=0;
+- }
+-	if (!dp->enabled || dp->gate || dp->r60.degraded[band]) {
+-		if (!dp->enabled)
+-			dp->quality[band].disabled_drop++;
+-		else
+-			dp->quality[band].gate_drop++;
+-		dp->stats[band].reserved[KDP_STAT_TX_ADMISSION_DROP]++;
+-		goto drop;
+-	}
++ /* One gate snapshot decides hold vs admission. PARK cannot ACK until
++  * this hart reaches its pausepoint; concurrent close after this snapshot
++  * is therefore fenced before any host mutation of immutable state. */
++ {
++  u32 enabled=dp->enabled, gate=dp->gate, degraded=dp->r60.degraded[band];
++  if (!enabled || degraded) {
++   if (!enabled) dp->quality[band].disabled_drop++;
++   else dp->quality[band].gate_drop++;
++   dp->stats[band].reserved[KDP_STAT_TX_ADMISSION_DROP]++; goto drop;
++  }
++  if (gate) {
++   if (dp_gate_hold(band)) return 0;
++   dp->quality[band].gate_drop++;
++   dp->stats[band].reserved[KDP_STAT_TX_ADMISSION_DROP]++; goto drop;
++  }
++  dp_gate_active[band]=0;
++ }
+  sta = &dp->sta[wcid];
+  blocked = sta->tx_blocked;
+  if (!sta->enabled || !sta->authorized) {
+@@ -944,7 +960,7 @@
+  if (dp_observe_sample[0]) dp_hot(KDP_HOT_BUILD, hot, 1);
+ 	return 1;
+ drop:
+- dp_private.gate_active[band]=0;
++ dp_gate_active[band]=0;
+ 	dp->tx_drop[band]++;
+ 	dp_rearm(band, token);
+ 	return 0;
+@@ -975,8 +991,8 @@
+  dp_batch[band].token[dp_batch[band].packets] = token;
+  dp_batch[band].tid[dp_batch[band].packets++] = dp_tid[band];
+ 	dp_observe_submit(band, token);
+-	dp->tx_sent[band]++;
+-	dp->stats[band].tx_bytes += dp_len[band];
++ dp_sent_delta[band]++;
++ dp_bytes_delta[band] += dp_len[band];
+ 	dp_rearm(band, dp_replacement[band]);
+ 	dp_prepared[band] = dp_replacement[band] = 0xffff;
+  if (dp_observe_sample[0]) dp_hot(KDP_HOT_COMMIT, hot, 1);

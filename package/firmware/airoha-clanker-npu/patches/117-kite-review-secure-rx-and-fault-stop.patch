@@ -1,0 +1,197 @@
+Subject: [PATCH] Fix full Wi-Fi offload review safety and lifecycle findings
+
+--- a/kite-datapath-fw.h
++++ b/kite-datapath-fw.h
+@@ -17,6 +17,7 @@
+ void kite_dp_tx_dma_done(unsigned short token);
+ void kite_dp_tx_reap(void);
+ volatile struct kdp_shared *kite_dp_shared(void);
++volatile struct kdp_shared *kite_dp_stopping_shared(void);
+ int kite_dp_rx(unsigned int token, unsigned int len, unsigned int band);
+ void kite_dp_ba_set(unsigned int wcid, unsigned int tid,
+ 		    unsigned int ssn, unsigned int window);
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -29,11 +29,24 @@
+ static int dp_identity(void)
+ {
+ 	return dp && dp->magic == KDP_MAGIC && dp->bytes == sizeof(*dp) &&
+-	       dp->session == dp_session && dp->epoch == dp_epoch && !dp->fault;
++	       dp->session == dp_session && dp->epoch == dp_epoch;
+ }
+ volatile struct kdp_shared *kite_dp_shared(void)
+ {
+-	return dp_identity() ? dp : 0;
++	return dp_identity() && !dp->fault ? dp : 0;
++}
++/* Only protocol/accounting faults with intact buffer identity can use the
++ * normal physical-stop/abort contract. Never erase the recorded fault. */
++volatile struct kdp_shared *kite_dp_stopping_shared(void)
++{
++	if (!dp_identity())
++		return 0;
++	switch (dp->fault) {
++	case 0: case 2: case 5: case 6: case 7: case 9:
++		return dp;
++	default:
++		return 0; /* DMA address/ownership, BA or stop proof is uncertain */
++	}
+ }
+ int kite_dp_bound(void)
+ {
+@@ -125,7 +138,7 @@
+ void kite_dp_tx_reap(void)
+ {
+ 	u32 i;
+-	if (!dp_identity())
++	if (!kite_dp_shared())
+ 		return;
+ 	KDP_BARRIER();
+ 	for (i = 0; i < 32; i++) {
+@@ -146,7 +159,7 @@
+ 	u32 desc, len, addr, token, info, wcid, bss, b, i, tag;
+ 	int replacement;
+ 	struct kdp_packet packet;
+-	if (band > 1 || !dp_identity())
++	if (band > 1 || !kite_dp_shared())
+ 		return 0;
+ 	if (dp_prepared[band] != 0xffff) {
+ 		dp->fault = 2; /* caller must commit each successfully prepared frame */
+@@ -249,9 +262,9 @@
+ 
+ void kite_dp_tx_commit(u32 band, u16 token)
+ {
+-	if (!dp_identity() || band > 1 || dp_prepared[band] != token ||
++	if (!kite_dp_shared() || band > 1 || dp_prepared[band] != token ||
+ 	    dp_replacement[band] >= KDP_TOKENS) {
+-		if (dp)
++		if (dp && !dp->fault)
+ 			dp->fault = 6;
+ 		return;
+ 	}
+@@ -264,10 +277,10 @@
+ 
+ void kite_dp_tx_dma_done(u16 token)
+ {
+-	if (!dp_identity() || token >= KDP_TOKENS ||
++	if (!kite_dp_shared() || token >= KDP_TOKENS ||
+ 	    dp->token[token].state != KDP_TOKEN_WIFI ||
+ 	    dp->token[token].dma_done) {
+-		if (dp)
++		if (dp && !dp->fault)
+ 			dp->fault = 7;
+ 		return;
+ 	}
+@@ -281,7 +294,7 @@
+ int kite_dp_tx_halt(void)
+ {
+ 	if (!dp) return 1;
+-	if (!dp_identity() || !dp->gate || dp->enabled) return 0;
++	if (!kite_dp_stopping_shared() || !dp->gate || dp->enabled) return 0;
+ 	dp->stopped = 1;
+ 	KDP_BARRIER();
+ 	return 1;
+@@ -295,7 +308,7 @@
+ 	u32 i, abort;
+ 	if (!dp)
+ 		return 1;
+-	if (!dp_identity() || !dp->gate)
++	if (!kite_dp_stopping_shared() || !dp->gate)
+ 		return 0;
+ 	abort = dp->stopped == 1;
+ 	if (abort && (!kite_tx_dma_stopped() || !kite_dp_rx_empty()))
+--- a/npu_kite_secure_rx.c
++++ b/npu_kite_secure_rx.c
+@@ -59,13 +59,61 @@
+ 	return 0;
+ }
+ 
++/* The hardware splits translated A-MSDUs before this engine. Validate
++ * every child before releasing any of them: a bad FIRST must also suppress
++ * a later child that happens to match an authorized PPE rule. */
++static int dp_rx_mpdu_valid(struct dp_rx_context *ctx, const struct kdp_mpdu *m)
++{
++	volatile struct kdp_shared *s = ctx->s;
++	volatile struct kdp_rx_token *first;
++	u16 id = m->head;
++	u32 n;
++	static const u8 rfc1042[6] = { 0xaa, 0xaa, 3, 0, 0, 0 };
++
++	if (!m->complete || !m->count || m->count > 64 || id >= KDP_RX_TOKENS)
++		return 0;
++	first = &s->rx[id];
++	if (!first->wcid || first->wcid >= KDP_WCIDS || first->tid > 7 ||
++	    first->band != ctx->band)
++		return 0;
++	for (n = 0; n < m->count; n++) {
++		volatile struct kdp_rx_token *r;
++		const u8 *p;
++		u32 i, snap = 1, source = 0;
++
++		if (id >= KDP_RX_TOKENS)
++			return 0;
++		r = &s->rx[id];
++		if (r->wcid != first->wcid || r->tid != first->tid ||
++		    r->band != first->band || r->bss != first->bss ||
++		    r->generation != first->generation ||
++		    r->key_generation != first->key_generation || r->len > 3500)
++			return 0;
++		if (m->count > 1) {
++			if (!r->offset || r->offset > r->len || r->len - r->offset < 14)
++				return 0;
++			p = (const void *)(wifi_pkt_va(id) + r->offset);
++			for (i = 0; i < 6; i++) {
++				if (p[i] != rfc1042[i]) snap = 0;
++				source |= p[6 + i];
++			}
++			if ((!n && snap) || !source || (p[6] & 1))
++				return 0;
++		}
++		if (n + 1 == m->count && (id != m->tail || r->next != KDP_BA_NONE))
++			return 0;
++		id = r->next;
++	}
++	return 1;
++}
++
+ static void dp_rx_release(void *opaque, const struct kdp_mpdu *m)
+ {
+ 	struct dp_rx_context *ctx = opaque;
+ 	volatile struct kdp_shared *s = ctx->s;
+ 	volatile struct kdp_rx_token *first = &s->rx[m->head];
+ 	volatile struct kdp_sta *sta = &s->sta[first->wcid];
+-	u32 accepted = m->complete, n = 0;
++	u32 accepted = dp_rx_mpdu_valid(ctx, m), n = 0;
+ 	u16 id = m->head;
+ 	if (first->generation != sta->generation ||
+ 	    first->key_generation != sta->key_generation || !sta->authorized) {
+@@ -81,7 +129,7 @@
+ 			accepted = 0;
+ 		}
+ 	}
+-	while (id != KDP_BA_NONE && n++ < m->count) {
++	while (id < KDP_RX_TOKENS && n++ < m->count) {
+ 		volatile struct kdp_rx_token *r = &s->rx[id];
+ 		u16 next = r->next;
+ 		if (!accepted) {
+@@ -275,7 +323,7 @@
+  * host chains. Keep the negotiated BA window/head, discard every old MPDU. */
+ void kite_dp_rx_discard_all(void)
+ {
+-	volatile struct kdp_shared *s = kite_dp_shared();
++	volatile struct kdp_shared *s = kite_dp_stopping_shared();
+ 	u32 i;
+ 	if (!s) return;
+ 	for (i = 0; i < KDP_BA_SESSIONS; i++) {
+@@ -287,9 +335,9 @@
+ }
+ int kite_dp_rx_empty(void)
+ {
+-	volatile struct kdp_shared *s = kite_dp_shared();
++	volatile struct kdp_shared *s = kite_dp_stopping_shared();
+ 	u32 i, j;
+-	if (!s) return 1;
++	if (!s) return !kite_dp_bound();
+ 	for (i = 0; i < KDP_BA_SESSIONS; i++)
+ 		for (j = 0; j < KDP_BA_SLOTS; j++)
+ 			if (s->ba[i].slot[j].count) return 0;

@@ -1,0 +1,246 @@
+--- a/kite-datapath-fw.h
++++ b/kite-datapath-fw.h
+@@ -17,6 +17,8 @@
+ void kite_dp_tx_commit(unsigned int band, unsigned short token);
+ void kite_dp_tx_dma_done(unsigned short token);
+ void kite_dp_tx_reap(void);
++void kite_dp_host_drain(void);
++int kite_dp_host_idle(void);
+ int host_ring_submit(u32 buf_addr, u16 pkt_len, u32 band,
+ 			    u16 wcid, u8 amsdu, u8 fwd_type,
+ 			    u16 orig_len, u8 is_last, u32 info);
+--- a/npu_hostadpt.c
++++ b/npu_hostadpt.c
+@@ -231,6 +231,15 @@
+ 	}
+ #endif
+ 	d[2] = info;
++#if defined(AN7581) && defined(MT7916)
++	/* word1[31:26] is chain count/part, NOT a forwarding opcode. The
++	 * fallback discriminator is already in word2. Single frames use 0/0. */
++	if (fwd_type == KDP_HOST_FWD_WIFI_TX) {
++		d[1] = wcid & 0xffff;
++		return 1 | ((orig_len & 0x3fff) << 1) |
++		       ((pkt_len & 0x3fff) << 15) | ((is_last & 1) << 29);
++	}
++#endif
+ 	d[1] = (wcid & 0xFFFF) | ((amsdu & 0x1F) << 16) |
+ 	       ((u32)(fwd_type & 0x3F) << 26);
+ 	return 1 | ((orig_len & 0x3FFF) << 1) | ((pkt_len & 0x3FFF) << 15) |
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -16,6 +16,18 @@
+ static u32 dp_pa, dp_session, dp_epoch, dp_ring, dp_idx[2], dp_alloc, dp_reap;
+ static u16 dp_prepared[2], dp_replacement[2];
+ 
++/* One outstanding request per TDMA ring. Hart 4 publishes PENDING and owns
++ * the source/TDMA consumer; hart 3 alone writes the host ring and copy channel.
++ * DONE proves no DMA still references the source, never just submission.
++ * PARK retains requests across policy updates; their original STA/key fence
++ * stays in the token. TX_HALT cancels requests only with all workers parked.
++ */
++enum { DP_HOST_IDLE, DP_HOST_PENDING, DP_HOST_DONE };
++static volatile struct {
++	u32 state, token, addr, len, wcid;
++	int result;
++} dp_host[2];
++
+ static u32 dp_payload_pa(u32 token)
+ {
+ 	return dp_pa + __builtin_offsetof(struct kdp_shared, payload) +
+@@ -67,6 +79,7 @@
+ 		return 0;
+ 	switch (dp->fault) {
+ 	case 0: case 2: case 5: case 6: case 7: case 9:
++	case 10: /* host PPE revoke failure; buffer identity remains intact */
+ 		return dp;
+ 	default:
+ 		return 0; /* DMA address/ownership, BA or stop proof is uncertain */
+@@ -116,6 +129,7 @@
+ 	dp_epoch = epoch;
+ 	dp_ring = ring;
+ 	dp_alloc = dp_reap = 0;
++	npu_memset((void *)dp_host, 0, sizeof(dp_host));
+ 	npu_memset((void *)ring, 0, DP_TDMA_BYTES * 2);
+ 	for (b = 0; b < 2; b++) {
+ 		dp_idx[b] = 0;
+@@ -190,30 +204,53 @@
+ 	return 0;
+ }
+ 
+-static int dp_host_bridge_fallback(u32 band, u32 token, u32 addr, u32 len,
+-					  u32 wcid, volatile struct kdp_sta *sta)
++static void dp_host_bridge_fallback(u32 band, u32 token, u32 addr, u32 len,
++				   u32 wcid, volatile struct kdp_sta *sta)
+ {
+ 	volatile struct kdp_token *t = &dp->token[token];
+-	int ret;
+-
+-	/* The TDMA token remains owned while the host adaptor copies the frame.
+-	 * Publish the same STA incarnation that the fast path would use so a
+-	 * revoke/rekey can reject the queued software fallback. */
++
++	/* The ring head is held until hart 3 finishes copying. Do not resample
++	 * these generations on a retry after PARK/rekey. */
+ 	t->generation = sta->generation;
+ 	t->key_generation = sta->key_generation;
+ 	t->wcid = wcid;
+ 	t->band = band;
+-	KDP_BARRIER();
+-	ret = host_ring_submit(addr, len, band, wcid, 0,
+-		KDP_HOST_FWD_WIFI_TX, len, 1, KDP_HOST_FALLBACK_PACK(band, wcid));
+-	if (ret == KITE_HOST_HOLD)
+-		return ret;
+-	if (!ret)
+-		dp->stats[band].reserved[KDP_STAT_HOST_FALLBACK]++;
+-	else
+-		dp->stats[band].reserved[KDP_STAT_HOST_FALLBACK_DROP]++;
+-	dp_rearm(band, token);
+-	return ret;
++	dp_host[band].token = token;
++	dp_host[band].addr = addr;
++	dp_host[band].len = len;
++	dp_host[band].wcid = wcid;
++	KDP_BARRIER();
++	dp_host[band].state = DP_HOST_PENDING;
++}
++
++/* Called only by hart 3, between ordinary RX host deliveries. A DMA timeout
++ * retains PENDING and the TDMA source; it can never become a completion. */
++void kite_dp_host_drain(void)
++{
++	u32 b;
++	if (!dp_identity())
++		return;
++	for (b = 0; b < 2; b++) {
++		int ret;
++		if (dp_host[b].state != DP_HOST_PENDING)
++			continue;
++		KDP_BARRIER();
++		ret = host_ring_submit(dp_host[b].addr, dp_host[b].len, b,
++			dp_host[b].wcid, 0, KDP_HOST_FWD_WIFI_TX,
++			dp_host[b].len, 1, KDP_HOST_FALLBACK_PACK(b, dp_host[b].wcid));
++		if (ret == KITE_HOST_HOLD)
++			continue;
++		dp_host[b].result = ret;
++		KDP_BARRIER();
++		dp_host[b].state = DP_HOST_DONE;
++	}
++}
++
++int kite_dp_host_idle(void)
++{
++	KDP_BARRIER();
++	return dp_host[0].state != DP_HOST_PENDING &&
++	       dp_host[1].state != DP_HOST_PENDING;
+ }
+ 
+ static void dp_rearm(u32 band, u32 token)
+@@ -254,6 +291,21 @@
+ 	struct kdp_packet packet;
+ 	if (band > 1 || !kite_dp_shared())
+ 		return 0;
++	/* A held fallback must finish before this descriptor can be parsed or
++	 * submitted again, even if the bridge policy changed while PARKED. */
++	if (dp_host[band].state != DP_HOST_IDLE) {
++		if (dp_host[band].state != DP_HOST_DONE)
++			return 0;
++		KDP_BARRIER();
++		if (!dp_host[band].result)
++			dp->stats[band].reserved[KDP_STAT_HOST_FALLBACK]++;
++		else
++			dp->stats[band].reserved[KDP_STAT_HOST_FALLBACK_DROP]++;
++		dp_rearm(band, dp_host[band].token);
++		KDP_BARRIER();
++		dp_host[band].state = DP_HOST_IDLE;
++		return 0;
++	}
+ 	if (dp_prepared[band] != 0xffff) {
+ 		dp->fault = 2; /* caller must commit each successfully prepared frame */
+ 		return 0;
+@@ -313,9 +365,7 @@
+ 		int parsed = kdp_parse_packet((const void *)dp->payload[token], len, &packet);
+ 		int policy = dp_bridge_policy(dp, sta, &packet, parsed, wcid, band);
+ 		if (policy == 0) {
+-			int fallback = dp_host_bridge_fallback(band, token, addr, len, wcid, sta);
+-			if (fallback == KITE_HOST_HOLD)
+-				return 0;
++			dp_host_bridge_fallback(band, token, addr, len, wcid, sta);
+ 			return 0;
+ 		}
+ 	}
+@@ -395,8 +445,20 @@
+  * every outstanding buffer owned until the subsequent physical DMA stop. */
+ int kite_dp_tx_halt(void)
+ {
++	u32 b;
+ 	if (!dp) return 1;
+-	if (!kite_dp_stopping_shared() || !dp->gate || dp->enabled) return 0;
++	if (!kite_dp_stopping_shared() || !dp->gate || dp->enabled ||
++	    !kite_host_dma_idle()) return 0;
++	/* All harts are PARKED. A pending, not-started copy may be cancelled;
++	 * a timed-out copy above may not. Do not return its buffer to TDMA. */
++	for (b = 0; b < 2; b++) {
++		if (dp_host[b].state == DP_HOST_PENDING ||
++		    (dp_host[b].state == DP_HOST_DONE && dp_host[b].result))
++			dp->stats[b].reserved[KDP_STAT_HOST_FALLBACK_DROP]++;
++		else if (dp_host[b].state == DP_HOST_DONE)
++			dp->stats[b].reserved[KDP_STAT_HOST_FALLBACK]++;
++		dp_host[b].state = DP_HOST_IDLE;
++	}
+ 	dp->stopped = 1;
+ 	KDP_BARRIER();
+ 	return 1;
+@@ -410,7 +472,8 @@
+ 	u32 i, abort;
+ 	if (!dp)
+ 		return 1;
+-	if (!kite_dp_stopping_shared() || !dp->gate)
++	if (!kite_dp_stopping_shared() || !dp->gate ||
++	    !kite_dp_host_idle() || !kite_host_dma_idle())
+ 		return 0;
+ 	abort = dp->stopped == 1;
+ 	if (abort && (!kite_tx_dma_stopped() || !kite_dp_rx_empty()))
+--- a/npu_kite_dma.c
++++ b/npu_kite_dma.c
+@@ -58,7 +58,7 @@
+ int kite_host_stop_ready(void)
+ {
+ 	return !kite_host_faulted() && !kite_copy.inflight &&
+-	       kite_tdma_idle() && kite_host_rings_empty() &&
++	       kite_dp_host_idle() && kite_tdma_idle() && kite_host_rings_empty() &&
+ 	       kite_wifi_ba_empty() && kite_dp_rx_empty();
+ }
+ 
+--- a/npu_wifi.c
++++ b/npu_wifi.c
+@@ -10,6 +10,9 @@
+ #include "npu_wifi.h"
+ #include "kite-host.h"
+ #include "kite-control.h"
++#if defined(AN7581) && defined(MT7916)
++#include "kite-datapath-fw.h"
++#endif
+ 
+ 
+ /* ================================================================
+@@ -205,6 +208,9 @@
+ 				rxnode_drain(0);
+ 				pinode_drain(0);
+ 			}
++#if defined(AN7581) && defined(MT7916)
++			kite_dp_host_drain();
++#endif
+ 			if (!kite_host_stop_ready())
+ 				continue;
+ 			kite_ctl_pausepoint(3);
+@@ -212,6 +218,9 @@
+ 		}
+ 		if (kite_ctl_pausepoint(3))
+ 			continue;
++#if defined(AN7581) && defined(MT7916)
++		kite_dp_host_drain();
++#endif
+ 		if (rxd_5g_init_done != 0) {
+ 			if (hostadpt_tx_ring_ready == 1)
+ 				rxnode_drain(1);

@@ -1,0 +1,31 @@
+From: ponwrt maintainers
+Subject: Expose coherent submit/other worker loop samples from existing ABI8 reserved telemetry.
+
+--- a/mt7915/npu-control.c
++++ b/mt7915/npu-control.c
+@@ -1734,18 +1734,23 @@
+   READ_ONCE(dev->kite.ba_starts), READ_ONCE(dev->kite.ba_start_failed));
+  {
+   struct kdp_service v;
+-  u32 seq, end;
++  u32 load[6], seq, end;
+   int retry;
+   for (retry = 0; retry < 3; retry++) {
+    seq = READ_ONCE(s->service.seq);
+    if (seq & 1) continue;
+-   dma_rmb(); memcpy(&v, &s->service, sizeof(v)); dma_rmb();
++   dma_rmb(); memcpy(&v, &s->service, sizeof(v));
++   memcpy(load, s->perf.reserved, sizeof(load)); dma_rmb();
+    end = READ_ONCE(s->service.seq);
+    if (seq == end && !(end & 1)) break;
+   }
+   seq_printf(m, "service valid=%u seq=%u loop_samples=%u loop_cycles=%u loop_packets=%u loop_max_cycles=%u\n",
+    retry < 3, retry < 3 ? seq : 0, retry < 3 ? v.loop_samples : 0,
+    retry < 3 ? v.loop_cycles : 0, retry < 3 ? v.loop_packets : 0, retry < 3 ? v.loop_max_cycles : 0);
++  seq_printf(m, "service_load valid=%u revision=%u submit_samples=%u submit_cycles=%u submit_packets=%u other_samples=%u other_cycles=%u\n",
++   retry < 3, retry < 3 ? load[5] : 0, retry < 3 ? load[0] : 0,
++   retry < 3 ? load[1] : 0, retry < 3 ? load[2] : 0,
++   retry < 3 ? load[3] : 0, retry < 3 ? load[4] : 0);
+   if (retry < 3) for (b = 0; b < 2; b++) {
+    struct kdp_service_band *z = &v.band[b];
+    seq_printf(m, "service_band%u index_reads=%u idle_skips=%u tdma_publishes=%u wifi_publishes=%u prepare_samples=%u prepare_ticks=%u prepare_max_ticks=%u wire_dma_samples=%u wire_dma_ticks=%u wire_dma_max_ticks=%u\n",

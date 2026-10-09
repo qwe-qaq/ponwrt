@@ -1,0 +1,124 @@
+From: ponwrt maintainers
+Subject: [PATCH] r79 safe Kite forwarded skb accounting copy
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -3192,7 +3192,7 @@
+  *	within &struct ieee80211_sta.
+  * @chanctx_data_size: size (in bytes) of the drv_priv data area
+  *	within &struct ieee80211_chanctx_conf.
+- * @txq_condense: normalize unowned linear forwarded skb accounting before FQ
++ * @txq_condense: normalize/copy oversized unowned linear forwarded skbs before FQ
+  * @txq_data_size: size (in bytes) of the drv_priv data area
+  *	within @struct ieee80211_txq.
+  *
+--- a/net/mac80211/debugfs.c
++++ b/net/mac80211/debugfs.c
+@@ -91,6 +91,7 @@
+              &e->dst, ntohs(e->dport), e->seq, e->ack, e->frag_list, e->truesize, e->headlen, e->headroom, e->headsize, e->data_len, e->nr_frags, e->gso_size, e->gso_segs);
+  }
+  seq_printf(m,"queue_condense packets=%llu bytes=%llu\n",q->condensed,q->condensed_bytes);
++ seq_printf(m,"queue_copy packets=%llu bytes=%llu failed_kept=%llu\n",q->copied,q->copy_bytes,q->copy_failed);
+  first=q->burst_serial>IEEE80211_QUEUE_BURSTS?q->burst_serial-IEEE80211_QUEUE_BURSTS:0;
+  seq_printf(m,"queue_burst_ring first=%llu last=%llu overwritten=%llu capacity=%u\n",q->burst_serial?first+1:0,q->burst_serial,first,IEEE80211_QUEUE_BURSTS);
+  for (i=first;i<q->burst_serial;i++) {
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1467,6 +1467,7 @@
+ struct ieee80211_queue_loss {
+  u64 serial, capacity, codel, purge, burst_serial;
+  u64 condensed, condensed_bytes;
++ u64 copied, copy_failed, copy_bytes;
+  struct ieee80211_queue_burst bursts[IEEE80211_QUEUE_BURSTS];
+  struct ieee80211_queue_loss_event events[IEEE80211_QUEUE_LOSS_ENTRIES];
+ };
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -1532,17 +1532,38 @@
+ 	ieee80211_free_txskb(&local->hw, skb);
+ }
+ 
+-/* No copy/allocation and no socket-owned, shared or nonlinear rewrite.
+- * __pskb_pull_tail can leave fragment charges on an already linear skb;
+- * the core helper normalizes only actual head allocation accounting. */
++/* Normalize only driver-opted-in, unowned linear forwarded frames. */
+ static u32 ieee80211_txq_condense(struct sk_buff *skb)
+ {
+- u32 before = skb->truesize;
++ u32 before=skb->truesize;
+  if (!skb->sk && !skb->destructor && !skb_shared(skb) && !skb_cloned(skb) &&
+      !skb_is_nonlinear(skb) && !skb_is_gso(skb) && !skb_has_frag_list(skb) &&
+-     before > SKB_TRUESIZE(skb_end_offset(skb)))
+-  skb_condense(skb);
+- return before - skb->truesize;
++     before>SKB_TRUESIZE(skb_end_offset(skb))) skb_condense(skb);
++ return before-skb->truesize;
++}
++/* Run before FQ takes ownership. Preserve ALL headroom/header offsets and
++ * 64 bytes tailroom for encryption/padding. Core skb_copy_expand copies cb,
++ * device, priority, checksum, VLAN, mark, hash, timestamps, extensions and
++ * dst references. Never modify or free the original on allocation failure. */
++static struct sk_buff *ieee80211_txq_copy_forwarded(struct sk_buff *skb,
++                                                  bool *failed)
++{
++ struct sk_buff *copy;
++ unsigned int head=skb_headroom(skb);
++ if (!skb->skb_iif || skb->sk || skb->destructor || skb_shared(skb) ||
++     skb_cloned(skb) || skb_is_nonlinear(skb) || skb_is_gso(skb) ||
++     skb_has_frag_list(skb) || skb_shinfo(skb)->nr_frags ||
++     skb_shinfo(skb)->tx_flags || skb_shinfo(skb)->destructor_arg ||
++     skb->len>2048 || head>512 || skb->truesize<8192 ||
++     skb->truesize<4*SKB_TRUESIZE(head+skb->len+64)) return skb;
++ copy=skb_copy_expand(skb,head,64,GFP_ATOMIC);
++ if (!copy) { *failed=true; return skb; }
++ skb_copy_queue_mapping(copy,skb);
++ copy->next=skb->next;
++ /* A forward segment list uses next only. It has not entered a queue yet. */
++ skb->next=NULL;
++ consume_skb(skb);
++ return copy;
+ }
+ 
+ static void ieee80211_txq_enqueue(struct ieee80211_local *local,
+@@ -1551,20 +1572,35 @@
+ {
+ 	struct fq *fq = &local->fq;
+ 	struct fq_tin *tin = &txqi->tin;
+-	u32 flow_idx, condensed = 0;
++	u32 flow_idx, condensed = 0, copied=0, copy_failed=0;
++ u64 copy_bytes=0;
+ 	u64 saved = 0;
+ 	struct sk_buff *segment;
+ 
+-	if (local->hw.txq_condense)
+-		for (segment = skb; segment; segment = segment->next) {
+-			u32 bytes = ieee80211_txq_condense(segment);
+-			condensed += !!bytes; saved += bytes;
+-		}
++ if (local->hw.txq_condense) {
++  struct sk_buff **link=&skb;
++  while (*link) {
++   u32 before=(*link)->truesize;
++   bool failed=false;
++   segment=*link;
++   if (txqi->txq.sta && txqi->txq.tid<IEEE80211_NUM_TIDS) {
++    segment=ieee80211_txq_copy_forwarded(segment,&failed);
++    copy_failed+=failed;
++    if (segment!=*link) {copied++;copy_bytes+=before-segment->truesize;}
++    *link=segment;
++   }
++   u32 bytes=ieee80211_txq_condense(segment);
++   condensed+=!!bytes;saved+=bytes;
++   link=&segment->next;
++  }
++ }
+ 	ieee80211_set_skb_enqueue_time(skb);
+ 
+ 	spin_lock_bh(&fq->lock);
+ 	local->queue_loss.condensed += condensed;
+ 	local->queue_loss.condensed_bytes += saved;
++ local->queue_loss.copied+=copied;local->queue_loss.copy_failed+=copy_failed;
++ local->queue_loss.copy_bytes+=copy_bytes;
+ 	/*
+ 	 * For management frames, don't really apply codel etc.,
+ 	 * we don't want to apply any shaping or anything we just

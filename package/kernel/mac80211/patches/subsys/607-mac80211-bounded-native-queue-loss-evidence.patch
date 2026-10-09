@@ -1,0 +1,219 @@
+From: ponwrt maintainers
+Subject: [PATCH] r77: Correct AQM labels and retain bounded exceptional queue loss metadata.
+
+Native incremental patch on release76. Ownership and datapath ABI12 unchanged.
+
+--- a/net/mac80211/debugfs.c
++++ b/net/mac80211/debugfs.c
+@@ -10,6 +10,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/rtnetlink.h>
+ #include <linux/vmalloc.h>
++#include <linux/seq_file.h>
+ #include "ieee80211_i.h"
+ #include "driver-ops.h"
+ #include "rate.h"
+@@ -71,6 +72,52 @@
+ 		      local->wep_iv & 0xffffff);
+ DEBUGFS_READONLY_FILE(rate_ctrl_alg, "%s",
+ 	local->rate_ctrl ? local->rate_ctrl->ops->name : "hw/driver");
++
++/* Snapshot once per open, under fq.lock; formatting runs outside the lock. */
++static int queue_loss_show(struct seq_file *m, void *unused)
++{
++ struct ieee80211_queue_loss *q = m->private;
++ u64 first = q->serial > IEEE80211_QUEUE_LOSS_ENTRIES ?
++             q->serial - IEEE80211_QUEUE_LOSS_ENTRIES : 0;
++ u64 i;
++ seq_printf(m, "queue_loss_ring first=%llu last=%llu overwritten=%llu capacity=%u fq_capacity=%llu codel=%llu purge=%llu\n",
++            q->serial ? first + 1 : 0, q->serial, first,
++            IEEE80211_QUEUE_LOSS_ENTRIES, q->capacity, q->codel, q->purge);
++ for (i = first; i < q->serial; i++) {
++  const struct ieee80211_queue_loss_event *e = &q->events[i % IEEE80211_QUEUE_LOSS_ENTRIES];
++  seq_printf(m, "queue_loss serial=%llu ns=%llu reason=%u sta=%pM tid=%u len=%u backlog=%u memory=%u tcp_valid=%u src=%pI4 sport=%u dst=%pI4 dport=%u seq=%u ack=%u frag_list=%u\n",
++             e->serial, e->ns, e->reason, e->sta, e->tid, e->len,
++             e->backlog, e->memory, e->tcp_valid, &e->src, ntohs(e->sport),
++             &e->dst, ntohs(e->dport), e->seq, e->ack, e->frag_list);
++ }
++ seq_puts(m, "scope=FQ_only reason1=capacity reason2=CoDel reason3=purge tuple=head_only no_delivery_proof\n");
++ return 0;
++}
++static int queue_loss_open(struct inode *inode, struct file *file)
++{
++ struct ieee80211_local *local = inode->i_private;
++ struct ieee80211_queue_loss *q = kvzalloc(sizeof(*q), GFP_KERNEL);
++ int ret;
++ if (!q) return -ENOMEM;
++ spin_lock_bh(&local->fq.lock);
++ *q = local->queue_loss;
++ spin_unlock_bh(&local->fq.lock);
++ ret = single_open(file, queue_loss_show, q);
++ if (ret) kvfree(q);
++ return ret;
++}
++static int queue_loss_release(struct inode *inode, struct file *file)
++{
++ struct seq_file *m = file->private_data;
++ kvfree(m->private);
++ return single_release(inode, file);
++}
++static const struct file_operations queue_loss_ops = {
++ .open = queue_loss_open,
++ .read = seq_read,
++ .llseek = seq_lseek,
++ .release = queue_loss_release,
++};
+ 
+ static ssize_t aqm_read(struct file *file,
+ 			char __user *user_buf,
+@@ -97,8 +144,8 @@
+ 			"RW fq_quantum %u\n",
+ 			fq->flows_cnt,
+ 			fq->backlog,
++			fq->overlimit,
+ 			fq->overmemory,
+-			fq->overlimit,
+ 			fq->collisions,
+ 			fq->memory_usage,
+ 			fq->memory_limit,
+@@ -690,6 +737,7 @@
+ 	DEBUGFS_ADD_MODE(aql_enable, 0600);
+ 	DEBUGFS_ADD(aql_pending);
+ 	DEBUGFS_ADD_MODE(aqm, 0600);
++	DEBUGFS_ADD(queue_loss);
+ 
+ 	DEBUGFS_ADD_MODE(airtime_flags, 0600);
+ 
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -11,6 +11,8 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include <linux/ip.h>
++#include <linux/tcp.h>
+ #include <linux/slab.h>
+ #include <linux/skbuff.h>
+ #include <linux/if_vlan.h>
+@@ -1388,6 +1390,53 @@
+ 	return fq_flow_dequeue(fq, flow);
+ }
+ 
++/* Only exceptional frees touch this ring. The normal enqueue/dequeue path
++ * has no new clock read, header parse or printk. All callers hold fq.lock. */
++static void ieee80211_queue_loss_record(struct ieee80211_local *local,
++                                      struct txq_info *txqi,
++                                      struct sk_buff *skb, u8 reason)
++{
++ struct ieee80211_queue_loss *q = &local->queue_loss;
++ struct ieee80211_queue_loss_event *e;
++ struct iphdr ip;
++ struct tcphdr tcp;
++ int off = skb_network_offset(skb);
++
++ lockdep_assert_held(&local->fq.lock);
++ e = &q->events[q->serial % IEEE80211_QUEUE_LOSS_ENTRIES];
++ memset(e, 0, sizeof(*e));
++ e->serial = ++q->serial;
++ e->ns = ktime_get_ns();
++ e->reason = reason;
++ if (reason == 1) q->capacity++;
++ else if (reason == 2) q->codel++;
++ else q->purge++;
++ e->len = skb->len;
++ e->backlog = local->fq.backlog;
++ e->memory = local->fq.memory_usage;
++ e->tid = txqi->txq.tid;
++ if (txqi->txq.sta) ether_addr_copy(e->sta, txqi->txq.sta->addr);
++ e->frag_list = skb_has_frag_list(skb);
++ /* IPv4 TCP header identity only. Aggregates describe their head only;
++  * short/non-IP/fragmented/invalid headers keep tcp_valid=0. */
++ if (skb->protocol != htons(ETH_P_IP) || off < 0 ||
++     off > skb->len || skb->len - off < sizeof(ip) ||
++     skb_copy_bits(skb, off, &ip, sizeof(ip)) ||
++     ip.version != 4 || ip.ihl < 5 || ip.protocol != IPPROTO_TCP ||
++     (ntohs(ip.frag_off) & 0x3fff) ||
++     ntohs(ip.tot_len) < ip.ihl * 4 + sizeof(tcp) ||
++     ntohs(ip.tot_len) > skb->len - off)
++  return;
++ off += ip.ihl * 4;
++ if (skb_copy_bits(skb, off, &tcp, sizeof(tcp)) || tcp.doff < 5 ||
++     ip.ihl * 4 + tcp.doff * 4 > ntohs(ip.tot_len))
++  return;
++ e->src = ip.saddr; e->dst = ip.daddr;
++ e->sport = tcp.source; e->dport = tcp.dest;
++ e->seq = ntohl(tcp.seq); e->ack = ntohl(tcp.ack_seq);
++ e->tcp_valid = 1;
++}
++
+ static void codel_drop_func(struct sk_buff *skb,
+ 			    void *ctx)
+ {
+@@ -1399,6 +1448,7 @@
+ 	local = vif_to_sdata(txqi->txq.vif)->local;
+ 	hw = &local->hw;
+ 
++	ieee80211_queue_loss_record(local, txqi, skb, 2);
+ 	ieee80211_free_txskb(hw, skb);
+ }
+ 
+@@ -1441,6 +1491,19 @@
+ 	struct ieee80211_local *local;
+ 
+ 	local = container_of(fq, struct ieee80211_local, fq);
++	ieee80211_queue_loss_record(local, container_of(tin, struct txq_info, tin), skb, 3);
++	ieee80211_free_txskb(&local->hw, skb);
++}
++
++static void fq_skb_drop_func(struct fq *fq,
++			     struct fq_tin *tin,
++			     struct fq_flow *flow,
++			     struct sk_buff *skb)
++{
++	struct ieee80211_local *local;
++
++	local = container_of(fq, struct ieee80211_local, fq);
++	ieee80211_queue_loss_record(local, container_of(tin, struct txq_info, tin), skb, 1);
+ 	ieee80211_free_txskb(&local->hw, skb);
+ }
+ 
+@@ -1468,7 +1531,7 @@
+ 	} else {
+ 		flow_idx = fq_flow_idx(fq, skb);
+ 		fq_tin_enqueue(fq, tin, flow_idx, skb,
+-			       fq_skb_free_func);
++			       fq_skb_drop_func);
+ 	}
+ 	spin_unlock_bh(&fq->lock);
+ }
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1447,6 +1447,20 @@
+ 
+ DECLARE_STATIC_KEY_FALSE(aql_disable);
+ 
++/* Bounded metadata only; protected by local->fq.lock, no delivery authority. */
++#define IEEE80211_QUEUE_LOSS_ENTRIES 256
++struct ieee80211_queue_loss_event {
++ u64 serial, ns;
++ u32 len, backlog, memory, seq, ack;
++ __be32 src, dst;
++ __be16 sport, dport;
++ u8 sta[ETH_ALEN], tid, reason, tcp_valid, frag_list;
++};
++struct ieee80211_queue_loss {
++ u64 serial, capacity, codel, purge;
++ struct ieee80211_queue_loss_event events[IEEE80211_QUEUE_LOSS_ENTRIES];
++};
++
+ struct ieee80211_local {
+ 	/* embed the driver visible part.
+ 	 * don't cast (use the static inlines below), but we keep
+@@ -1454,6 +1468,7 @@
+ 	struct ieee80211_hw hw;
+ 
+ 	struct fq fq;
++	struct ieee80211_queue_loss queue_loss;
+ 	struct codel_vars *cvars;
+ 	struct codel_params cparams;
+ 

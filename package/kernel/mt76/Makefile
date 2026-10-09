@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=mt76
-PKG_RELEASE=1
+PKG_RELEASE=63
 
 PKG_LICENSE:=BSD-3-Clause-Clear
 PKG_LICENSE_FILES:=
@@ -17,6 +17,8 @@ PKG_USE_NINJA:=0
 PKG_BUILD_PARALLEL:=1
 
 PKG_CONFIG_DEPENDS += \
+	CONFIG_MT7915_NPU_PROFILE \
+	CONFIG_MT7915_NPU_PROFILE_SHIFT \
 	CONFIG_PACKAGE_kmod-mt76-usb \
 	CONFIG_PACKAGE_kmod-mt76x02-common \
 	CONFIG_PACKAGE_kmod-mt76x0-common \
@@ -241,6 +243,29 @@ define KernelPackage/mt7915e
 ifneq ($(CONFIG_TARGET_mediatek_filogic)$(CONFIG_TARGET_mediatek_mt7622),)
   MODPARAMS.mt7915e:=wed_enable=Y
 endif
+ifneq ($(CONFIG_TARGET_airoha_an7581),)
+  MODPARAMS.mt7915e:=wed_enable=Y npu_control=Y npu_enable=Y npu_tx=Y npu_cached_hdr=Y npu_profile=$(if $(CONFIG_MT7915_NPU_PROFILE),$(CONFIG_MT7915_NPU_PROFILE_SHIFT),0)
+endif
+endef
+
+define KernelPackage/mt7915e/config
+  config MT7915_NPU_PROFILE
+    bool "Sample Kite NPU cycle costs and token ages"
+    depends on TARGET_airoha_an7581
+    default n
+    help
+      Enables boot-time sampled cycle/age
+      diagnostics. Disable for a separately built light image (profile=0).
+      Ownership checks, faults, traffic and final-failure counters stay on.
+      Does not change FAST, TOKENQ, header caching or WED defaults.
+  config MT7915_NPU_PROFILE_SHIFT
+    int "Kite sample shift (one worker loop in 2^shift)"
+    depends on MT7915_NPU_PROFILE
+    range 6 12
+    default 10
+    help
+      Use 10 for low-rate r74 diagnosis, 6 for the earlier detailed profile.
+      Applied on boot through native module parameters, never hot reload.
 endef
 
 define KernelPackage/mt7916-firmware
@@ -479,6 +504,12 @@ ifdef CONFIG_PACKAGE_kmod-mt7663u
 endif
 ifdef CONFIG_PACKAGE_kmod-mt7915e
   PKG_MAKE_FLAGS += CONFIG_MT7915E=m
+  ifdef CONFIG_TARGET_airoha_an7581
+    PKG_MAKE_FLAGS += CONFIG_MT76_NPU=y
+    PKG_MAKE_FLAGS += CONFIG_MT7915_NPU=y
+    NOSTDINC_FLAGS += -DCONFIG_MT76_NPU
+    NOSTDINC_FLAGS += -DCONFIG_MT7915_NPU
+  endif
   ifdef CONFIG_TARGET_mediatek_filogic
     PKG_MAKE_FLAGS += CONFIG_MT798X_WMAC=y
     NOSTDINC_FLAGS += -DCONFIG_MT798X_WMAC

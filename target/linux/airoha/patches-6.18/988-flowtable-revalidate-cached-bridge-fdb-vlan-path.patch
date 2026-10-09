@@ -1,0 +1,186 @@
+From: ponwrt maintainers
+Subject: [PATCH] r72: Retire cached bridge paths after FDB/VLAN changes in existing GC.
+
+Native incremental patch on release71; no datapath ABI or DMA layout change.
+
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -183,10 +183,22 @@
+ enum flow_offload_type {
+ 	NF_FLOW_OFFLOAD_UNSPEC	= 0,
+ 	NF_FLOW_OFFLOAD_ROUTE,
++	NF_FLOW_OFFLOAD_BRIDGE,
++};
++
++/* Immutable bridge-only path identity; no borrowed netdev pointers.
++ * GC repeats only the bridge lookup, not downstream Wi-Fi/PS classification. */
++struct nf_flow_bridge_path {
++	u32 src_ifindex, dst_ifindex, bridge_ifindex;
++	u8 num_vlans, vlan_mode;
++	u16 vlan_id;
++	__be16 vlan_proto;
++	struct { u16 id; __be16 proto; } vlan[NET_DEVICE_PATH_VLAN_MAX];
+ };
+ 
+ struct flow_offload {
+ 	struct flow_hw_refresh *hw_refresh;
++	struct nf_flow_bridge_path bridge[FLOW_OFFLOAD_DIR_MAX];
+ 	struct flow_offload_tuple_rhash		tuplehash[FLOW_OFFLOAD_DIR_MAX];
+ 	struct nf_conn				*ct;
+ 	unsigned long				flags;
+--- a/include/net/netns/flow_table.h
++++ b/include/net/netns/flow_table.h
+@@ -9,6 +9,7 @@
+ 	unsigned int sw_bridge_packets;
+ 	unsigned int sw_routed_packets;
+ 	unsigned int hw_skipped_sw_path;
++	unsigned int bridge_path_retired;
+ };
+ 
+ struct netns_ft {
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -319,6 +319,7 @@
+ 	struct net_device_path_ctx ctx = {};
+ 	struct net_device_path_stack stack;
+ 	struct nft_forward_info info = {};
++	struct nf_flow_bridge_path *bp = &flow->bridge[dir];
+ 	int i, j = 0;
+ 
+ 	for (i = th[dir].tuple.encap_num - 1; i >= 0 ; i--) {
+@@ -344,8 +345,22 @@
+ 	ctx.dev = src_dev;
+ 	ether_addr_copy(ctx.daddr, dst_ha);
+ 
++	bp->src_ifindex = src_dev->ifindex;
++	bp->dst_ifindex = dst_dev->ifindex;
++	bp->num_vlans = ctx.num_vlans;
++	for (i = 0; i < ctx.num_vlans; i++) {
++		bp->vlan[i].id = ctx.vlan[i].id;
++		bp->vlan[i].proto = ctx.vlan[i].proto;
++	}
+ 	if (dev_fill_bridge_path(&ctx, &stack) < 0)
+ 		return -1;
++
++	if (!stack.num_paths || stack.path[0].type != DEV_PATH_BRIDGE)
++		return -1;
++	bp->bridge_ifindex = stack.path[0].dev->ifindex;
++	bp->vlan_mode = stack.path[0].bridge.vlan_mode;
++	bp->vlan_id = stack.path[0].bridge.vlan_id;
++	bp->vlan_proto = stack.path[0].bridge.vlan_proto;
+ 
+ 	nft_dev_path_info(&stack, &info, dst_ha, &ft->data);
+ 
+@@ -432,6 +447,7 @@
+ 	if (err < 0)
+ 		return err;
+ 
++	flow->type = NF_FLOW_OFFLOAD_BRIDGE;
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_bridge_init);
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -581,6 +581,68 @@
+ 	nf_ct_put(ct);
+ }
+ 
++/* Called inside flow iteration's RCU read section. A cached direct bridge
++ * path must not outlive an FDB move/delete or VLAN action change. Route flows
++ * never enter this lookup. Existing teardown performs the hardware fence. */
++static bool nf_flow_bridge_changed(struct nf_flowtable *ft,
++				   const struct flow_offload *flow)
++{
++	struct net *net = nf_ct_net(flow->ct);
++	unsigned int dir;
++
++	if (flow->type != NF_FLOW_OFFLOAD_BRIDGE)
++		return false;
++	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
++		const struct nf_flow_bridge_path *bp = &flow->bridge[dir];
++		const struct flow_offload_tuple *t = &flow->tuplehash[dir].tuple;
++		struct net_device_path_ctx ctx = {};
++		struct net_device_path path = {};
++		struct net_device *src, *br;
++		u32 actual = 0, reason = 1;
++		unsigned int i;
++
++		src = dev_get_by_index_rcu(net, bp->src_ifindex);
++		if (!src || !netif_running(src) || !netif_is_bridge_port(src))
++			goto changed;
++		br = netdev_master_upper_dev_get_rcu(src);
++		if (!br || br->ifindex != bp->bridge_ifindex ||
++		    !br->netdev_ops->ndo_fill_forward_path)
++			goto changed;
++		ctx.dev = src;
++		ether_addr_copy(ctx.daddr, t->out.h_dest);
++		ctx.num_vlans = bp->num_vlans;
++		for (i = 0; i < bp->num_vlans; i++) {
++			ctx.vlan[i].id = bp->vlan[i].id;
++			ctx.vlan[i].proto = bp->vlan[i].proto;
++		}
++		reason = 2; /* unresolved FDB/VLAN */
++		if (br->netdev_ops->ndo_fill_forward_path(&ctx, &path) < 0 ||
++		    !ctx.dev || path.type != DEV_PATH_BRIDGE)
++			goto changed;
++		actual = ctx.dev->ifindex;
++		reason = 3; /* changed or down egress */
++		if (actual != bp->dst_ifindex || !netif_running(ctx.dev))
++			goto changed;
++		reason = 4; /* changed VLAN action */
++		if (path.bridge.vlan_mode != bp->vlan_mode ||
++		    path.bridge.vlan_id != bp->vlan_id ||
++		    path.bridge.vlan_proto != bp->vlan_proto)
++			goto changed;
++		continue;
++changed:
++		NF_FLOW_TABLE_STAT_INC_ATOMIC(net, bridge_path_retired);
++		/* Exceptional transitions only; counter counts even suppressed logs.
++		 * Ports are wire TCP/UDP ports; addresses remain in network order. */
++		pr_info_ratelimited("flow bridge retire: dir=%u reason=%u bridge=%u src=%u old_dst=%u new_dst=%u vlan=%u smac=%pM dmac=%pM l3=%u l4=%u ports=%u/%u\n",
++			dir, reason, bp->bridge_ifindex, bp->src_ifindex,
++			bp->dst_ifindex, actual, bp->vlan_id,
++			t->out.h_source, t->out.h_dest, t->l3proto, t->l4proto,
++			ntohs(t->src_port), ntohs(t->dst_port));
++		return true;
++	}
++	return false;
++}
++
+ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
+ 				    struct flow_offload *flow, void *data)
+ {
+@@ -588,7 +650,8 @@
+ 
+ 	if (nf_flow_has_expired(flow) ||
+ 	    nf_ct_is_dying(flow->ct) ||
+-	    nf_flow_custom_gc(flow_table, flow)) {
++	    nf_flow_custom_gc(flow_table, flow) ||
++	    (!teardown && nf_flow_bridge_changed(flow_table, flow))) {
+ 		flow_offload_teardown(flow);
+ 		teardown = true;
+ 	} else if (!teardown) {
+--- a/net/netfilter/nf_flow_table_procfs.c
++++ b/net/netfilter/nf_flow_table_procfs.c
+@@ -45,17 +45,18 @@
+ 	const struct nf_flow_table_stat *st = v;
+ 
+ 	if (v == SEQ_START_TOKEN) {
+-		seq_puts(seq, "wq_add   wq_del   wq_stats sw_bridge_packets sw_routed_packets hw_skipped_sw_path\n");
++		seq_puts(seq, "wq_add   wq_del   wq_stats sw_bridge_packets sw_routed_packets hw_skipped_sw_path bridge_path_retired\n");
+ 		return 0;
+ 	}
+ 
+-	seq_printf(seq, "%8d %8d %8d %u %u %u\n",
++	seq_printf(seq, "%8d %8d %8d %u %u %u %u\n",
+ 		   st->count_wq_add,
+ 		   st->count_wq_del,
+ 		   st->count_wq_stats,
+ 		   st->sw_bridge_packets,
+ 		   st->sw_routed_packets,
+-		   st->hw_skipped_sw_path
++		   st->hw_skipped_sw_path,
++		   st->bridge_path_retired
+ 		);
+ 	return 0;
+ }

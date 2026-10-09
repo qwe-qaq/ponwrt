@@ -1,0 +1,78 @@
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -69,17 +69,18 @@
+ 	if (e->hash == 0xffff)
+ 		return 0;
+ 	hwe = airoha_ppe_foe_get_entry_locked(ppe, e->hash);
+-	if (!hwe)
++	if (!hwe) {
++		if (net_ratelimit())
++			dev_warn(ppe->eth->dev, "Kite revoke failed: slot=%u stage=read\n", e->hash);
+ 		return -EIO;
++	}
+ 	invalid = *hwe;
+ 	invalid.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
+ 	invalid.ib1 |= FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_INVALID);
+ 	ret = airoha_ppe_foe_commit_entry(ppe, &invalid, e->hash, true);
+ 	if (ret)
+ 		return ret;
+-	hwe = airoha_ppe_foe_get_entry_locked(ppe, e->hash);
+-	if (!hwe || FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe->ib1) == AIROHA_FOE_STATE_BIND)
+-		return -EIO;
++	/* commit_entry already proved INVALID/UNBIND under ppe_lock. */
+ 	e->hash = 0xffff;
+ 	return 0;
+ }
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -896,13 +896,27 @@
+ 					REG_PPE_RAM_CTRL(ppe2));
+ }
+ 
++/* Learning can replace INVALID with UNBIND before the readback. Both prove
++ * the old authorization is gone. BIND commits still require the exact type
++ * and protocol; never turn an unreadable/still-bound revoke into success. */
++static bool airoha_ppe_foe_commit_matches(u32 requested, u32 observed)
++{
++	u32 state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, observed);
++
++	if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, requested) == AIROHA_FOE_STATE_INVALID)
++		return state == AIROHA_FOE_STATE_INVALID || state == AIROHA_FOE_STATE_UNBIND;
++	return !((observed ^ requested) & (AIROHA_FOE_IB1_BIND_STATE |
++		AIROHA_FOE_IB1_BIND_PACKET_TYPE | AIROHA_FOE_IB1_BIND_UDP));
++}
++
+ static int airoha_ppe_foe_commit_entry(struct airoha_ppe *ppe,
+ 				       struct airoha_foe_entry *e,
+ 				       u32 hash, bool rx_wlan)
+ {
+ 	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
+ 	struct airoha_foe_entry *hwe;
+-	u32 ib1, ts = airoha_ppe_get_timestamp(ppe);
++	u32 ib1, observed = ~0U, ts = airoha_ppe_get_timestamp(ppe);
++	const char *stage = "write";
+ 	struct airoha_eth *eth = ppe->eth;
+ 	struct airoha_npu *npu;
+ 	int err = 0;
+@@ -933,13 +947,18 @@
+ unlock:
+ 	rcu_read_unlock();
+ 	if (!err) {
++		stage = "readback";
+ 		hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
+-		if (!hwe || ((READ_ONCE(hwe->ib1) ^ ib1) &
+-		    (AIROHA_FOE_IB1_BIND_STATE | AIROHA_FOE_IB1_BIND_PACKET_TYPE |
+-		     AIROHA_FOE_IB1_BIND_UDP)))
++		if (hwe)
++			observed = READ_ONCE(hwe->ib1);
++		if (!hwe || !airoha_ppe_foe_commit_matches(ib1, observed))
+ 			err = -EIO;
+ 	}
+ 	if (err) {
++		if (net_ratelimit())
++			dev_warn(eth->dev,
++				 "PPE commit failed: slot=%u stage=%s requested=%08x observed=%08x err=%d\n",
++				 hash, stage, ib1, observed, err);
+ 		atomic64_inc(&ppe->bind_fail);
+ 		WRITE_ONCE(ppe->bind_errno, err);
+ 	} else if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, ib1) == AIROHA_FOE_STATE_BIND) {

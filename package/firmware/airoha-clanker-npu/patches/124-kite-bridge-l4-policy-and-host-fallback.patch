@@ -1,0 +1,147 @@
+Subject: [PATCH] add bridge L4 policy lookup and Linux host fallback
+
+--- a/kite-datapath.h
++++ b/kite-datapath.h
+@@ -106,8 +106,22 @@
+ #define KDP_FLOW_IPV4 1u
+ #define KDP_FLOW_IPV6 2u
+ #define KDP_FLOW_BRIDGE 3u
++/* Bridge capture keeps the PPE MAC admission broad; the NPU applies the
++ * complete L3/L4 tuple before choosing the MT7916 fast path. */
++#define KDP_FLOW_BRIDGE_IPV4 4u
++#define KDP_FLOW_BRIDGE_IPV6 5u
+ #define KDP_SLOT_NONE 0xffffffffu
+ 
++/* Host-adaptor record for a PPE bridge-policy miss. The Ethernet frame is
++ * copied into Linux and re-entered through the selected AP netdev. */
++#define KDP_HOST_FWD_WIFI_TX 1u
++#define KDP_HOST_FALLBACK_MAGIC 0xd74b0000u
++#define KDP_HOST_FALLBACK_PACK(band, wcid) \
++	(KDP_HOST_FALLBACK_MAGIC | (((band) & 1u) << 10) | ((wcid) & 0x3ffu))
++#define KDP_HOST_FALLBACK_VALID(v) (((v) & 0xffff0000u) == KDP_HOST_FALLBACK_MAGIC)
++#define KDP_HOST_FALLBACK_BAND(v) (((v) >> 10) & 1u)
++#define KDP_HOST_FALLBACK_WCID(v) ((v) & 0x3ffu)
++
+ struct kdp_sta {
+ 	unsigned int generation, key_generation, enabled, band;
+ 	unsigned int bss, cipher, keyid, authorized;
+@@ -151,6 +165,11 @@
+ 	unsigned int rx_policy_hit, rx_policy_miss, rx_tdma_full;
+ 	unsigned int reserved[9];
+ };
++#define KDP_STAT_BRIDGE_HIT       0u
++#define KDP_STAT_BRIDGE_MISS      1u
++#define KDP_STAT_HOST_FALLBACK    2u
++#define KDP_STAT_HOST_FALLBACK_DROP 3u
++#define KDP_STAT_BRIDGE_STALE     4u
+ struct kdp_shared {
+ 	unsigned int magic, bytes, session, epoch;
+ 	unsigned int enabled, fault, gate, stopped;
+--- a/kite-datapath-fw.h
++++ b/kite-datapath-fw.h
+@@ -2,6 +2,7 @@
+ #ifndef PONWRT_KITE_DATAPATH_FW_H
+ #define PONWRT_KITE_DATAPATH_FW_H
+ #include "kite-tx.h"
++#include "kite-host.h"
+ #include "kite-datapath.h"
+ int kite_dp_bind(unsigned int pa, unsigned int bytes,
+ 		 unsigned int session, unsigned int epoch);
+@@ -16,6 +17,9 @@
+ void kite_dp_tx_commit(unsigned int band, unsigned short token);
+ void kite_dp_tx_dma_done(unsigned short token);
+ void kite_dp_tx_reap(void);
++int host_ring_submit(u32 buf_addr, u16 pkt_len, u32 band,
++			    u16 wcid, u8 amsdu, u8 fwd_type,
++			    u16 orig_len, u8 is_last, u32 info);
+ volatile struct kdp_shared *kite_dp_shared(void);
+ volatile struct kdp_shared *kite_dp_stopping_shared(void);
+ int kite_dp_rx(unsigned int token, unsigned int len, unsigned int band);
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -123,6 +123,67 @@
+ 	return 1;
+ }
+ 
++static void dp_rearm(u32 band, u32 token);
++
++static int dp_bridge_policy(volatile struct kdp_shared *s,
++	volatile struct kdp_sta *sta, const struct kdp_packet *packet,
++	int parsed, u32 wcid, u32 band)
++{
++	u32 base, i;
++	int present = 0;
++
++	/* First establish that this route has an explicitly installed bridge
++	 * L4 capture policy. Routed WAN->Wi-Fi entries do not have one and must
++	 * continue through the existing direct datapath. */
++	base = kdp_flow_bucket(packet->smac, packet->dmac, packet->vlan, wcid);
++	for (i = base; i < base + KDP_FLOW_WAYS; i++) {
++		volatile struct kdp_flow *f = &s->flow[i];
++		u32 version = f->version;
++		u32 j;
++		if (!version || (f->type != KDP_FLOW_BRIDGE_IPV4 &&
++				f->type != KDP_FLOW_BRIDGE_IPV6) ||
++			f->session != s->session || f->generation != sta->generation ||
++			f->key_generation != sta->key_generation || f->wcid != wcid ||
++			f->band != band || f->bss != sta->bss || f->vlan != packet->vlan)
++			continue;
++		for (j = 0; j < 6; j++)
++			if (f->smac[j] != packet->smac[j] || f->dmac[j] != packet->dmac[j])
++				break;
++		if (j == 6)
++			present = 1;
++	}
++	if (!present)
++		return -1;
++	if (!parsed)
++		return 0;
++	base = kdp_flow_l4_bucket(base, packet->src, packet->dst,
++			packet->ports, packet->protocol, packet->type);
++	for (i = base; i < base + KDP_FLOW_WAYS; i++)
++		if (kdp_flow_matches(&s->flow[i], packet, s->session,
++			sta->generation, sta->key_generation, wcid, band, sta->bss) &&
++			(s->flow[i].type == KDP_FLOW_BRIDGE_IPV4 ||
++			 s->flow[i].type == KDP_FLOW_BRIDGE_IPV6)) {
++			s->stats[band].reserved[KDP_STAT_BRIDGE_HIT]++;
++			return 1;
++		}
++	s->stats[band].reserved[KDP_STAT_BRIDGE_MISS]++;
++	return 0;
++}
++
++static int dp_host_bridge_fallback(u32 band, u32 token, u32 addr, u32 len, u32 wcid)
++{
++	int ret = host_ring_submit(addr, len, band, wcid, 0,
++		KDP_HOST_FWD_WIFI_TX, len, 1, KDP_HOST_FALLBACK_PACK(band, wcid));
++	if (ret == KITE_HOST_HOLD)
++		return ret;
++	if (!ret)
++		dp->stats[band].reserved[KDP_STAT_HOST_FALLBACK]++;
++	else
++		dp->stats[band].reserved[KDP_STAT_HOST_FALLBACK_DROP]++;
++	dp_rearm(band, token);
++	return ret;
++}
++
+ static void dp_rearm(u32 band, u32 token)
+ {
+ 	u32 idx = dp_idx[band];
+@@ -216,7 +277,16 @@
+ 		goto drop;
+ 	npu_memset(&packet, 0, sizeof(packet));
+ 	packet.vlan = KDP_SLOT_NONE;
+-	kdp_parse_packet((const void *)dp->payload[token], len, &packet);
++	{
++		int parsed = kdp_parse_packet((const void *)dp->payload[token], len, &packet);
++		int policy = dp_bridge_policy(dp, sta, &packet, parsed, wcid, band);
++		if (policy == 0) {
++			int fallback = dp_host_bridge_fallback(band, token, addr, len, wcid);
++			if (fallback == KITE_HOST_HOLD)
++				return 0;
++			return 0;
++		}
++	}
+ 	if (t->submitted == 0xffffffffu) {
+ 		t->state = KDP_TOKEN_QUARANTINE;
+ 		dp->fault = 5;

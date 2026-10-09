@@ -1,0 +1,418 @@
+Subject: [PATCH] r60 wire keys, ordered PS handoff and ingress proof
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -575,7 +575,9 @@
+ 	struct list_head kite_node;
+ 	u32 kite_in_wcid, kite_out_wcid, kite_policy, kite_capture_policy;
+ 	u32 kite_session, kite_in_gen, kite_in_key, kite_out_gen, kite_out_key;
+-	bool kite_retired, kite_published;
++	bool kite_retired, kite_published, kite_suspended;
++ u32 kite_soft_slot;
++ struct kdp_flow kite_tx_key;
+ 	struct kdp_flow kite_key;
+ 	u16 kite_rule_len;
+ 	u8 kite_rule_bytes[1024];
+@@ -755,6 +757,9 @@
+ 	spinlock_t kite_scan_lock;
+ 	u32 kite_scan_slot, kite_version;
+ 	unsigned long kite_scan_next;
++ unsigned long kite_health_at, kite_stall_at[2];
++ u32 kite_health_ready[2];
++ u64 kite_health_packets[2];
+ 	atomic64_t kite_scanned, kite_learned, kite_revoked;
+ 	/* Rule admission and hardware learning are separate evidence. */
+ 	atomic64_t kite_policy_accept, kite_policy_reject, kite_l4_learned, kite_l2_learned;
+--- a/drivers/net/ethernet/airoha/airoha_kite.c
++++ b/drivers/net/ethernet/airoha/airoha_kite.c
+@@ -34,6 +34,22 @@
+ 		WRITE_ONCE(s->sta[wi].tx_tag, tag);
+ 		return;
+ 	}
++}
++
++/* Caller holds ppe_lock; normal admission checked the current STA/key.
++ * This records first successful readback after reopen, including idle time
++ * before a flow appears. It never changes admission or policy contents. */
++static void airoha_kite_note_bind(struct airoha_ppe *ppe,
++                                struct airoha_flow_table_entry *e)
++{
++ struct kdp_shared *s=READ_ONCE(ppe->kite_dp);
++ u32 wi=e->kite_out_wcid,request;
++ if (!s || !wi || wi>=KDP_WCIDS || !airoha_kite_flow_live(ppe,e)) return;
++ request=READ_ONCE(s->r60.ps[wi].request);
++ if (!request || READ_ONCE(s->r60.ps[wi].active) ||
++     READ_ONCE(s->r60.ps[wi].learned_request)==request) return;
++ WRITE_ONCE(s->r60.ps[wi].learned_ms,(u32)jiffies_to_msecs(jiffies)); dma_wmb();
++ WRITE_ONCE(s->r60.ps[wi].learned_request,request);
+ }
+ 
+ static bool airoha_kite_flow_live(struct airoha_ppe *ppe,
+@@ -386,6 +402,35 @@
+ 	return true;
+ }
+ 
++/* Snapshot exactly the egress tuple accepted by Linux. Unsupported
++ * encapsulations simply have no PS exception; normal steady TX is unchanged. */
++static void airoha_kite_tx_key(struct airoha_flow_table_entry *e,
++ const struct kdp_shared *s, const struct ethhdr *eth)
++{
++ struct kdp_flow *k = &e->kite_tx_key;
++ const struct airoha_foe_entry *h = &e->data;
++ u32 wi=e->kite_out_wcid, type=FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE,h->ib1);
++ u32 layers=FIELD_GET(AIROHA_FOE_IB1_BIND_VLAN_LAYER,h->ib1);
++ if (layers > 1 || (h->ib1 & AIROHA_FOE_IB1_BIND_PPPOE)) return;
++ k->session=s->session; k->generation=s->sta[wi].generation;
++ k->key_generation=s->sta[wi].key_generation; k->wcid=wi;
++ k->band=s->sta[wi].band; k->bss=s->sta[wi].bss;
++ ether_addr_copy(k->smac,eth->h_source); ether_addr_copy(k->dmac,eth->h_dest);
++ k->vlan=KDP_SLOT_NONE; k->hw_slot=KDP_SLOT_NONE;
++ k->cookie_lo=lower_32_bits(e->cookie); k->cookie_hi=upper_32_bits(e->cookie);
++ if (type == PPE_PKT_TYPE_IPV4_HNAPT) {
++  k->type=KDP_FLOW_IPV4; k->src[0]=h->ipv4.new_tuple.src_ip;
++  k->dst[0]=h->ipv4.new_tuple.dest_ip; k->ports=h->ipv4.new_tuple.ports;
++  if (layers) k->vlan=h->ipv4.l2.common.vlan1;
++ } else if (type == PPE_PKT_TYPE_IPV6_ROUTE_5T) {
++  k->type=KDP_FLOW_IPV6;
++  memcpy(k->src,h->ipv6.src_ip,sizeof(k->src));
++  memcpy(k->dst,h->ipv6.dest_ip,sizeof(k->dst)); k->ports=h->ipv6.ports;
++  if (layers) k->vlan=h->ipv6.l2.vlan1;
++ } else return;
++ k->protocol=(h->ib1 & AIROHA_FOE_IB1_BIND_UDP) ? IPPROTO_UDP : IPPROTO_TCP;
++}
++
+ static int airoha_kite_flow_prepare(struct airoha_ppe *ppe,
+ 	struct airoha_flow_table_entry *e, struct flow_rule *rule,
+ 	struct net_device *odev, const struct ethhdr *eth)
+@@ -412,7 +457,8 @@
+ 		 * downlink rule back to mac80211 while TX is blocked. */
+ 		if (!airoha_kite_endpoint(ppe, &out))
+ 			return -EAGAIN;
+-		if (READ_ONCE(s->sta[out.airoha_npu.wcid].tx_blocked)) {
++		if (READ_ONCE(s->sta[out.airoha_npu.wcid].tx_blocked) ||
++      READ_ONCE(s->r60.degraded[out.airoha_npu.band])) {
+ 			atomic64_inc(&ppe->kite_egress_blocked);
+ 			return -EAGAIN;
+ 		}
+@@ -420,6 +466,7 @@
+ 		e->kite_out_gen = out.airoha_npu.generation;
+ 		e->kite_out_key = out.airoha_npu.key_generation;
+ 		e->kite_session = out.airoha_npu.session;
++  airoha_kite_tx_key(e, s, eth);
+ 	}
+ 	/* A bridge L4 rule is a downlink capture policy. The PPE entry keeps
+ 	 * exact MAC forwarding, while the NPU receives the complete tuple below. */
+@@ -865,6 +912,12 @@
+ static void airoha_kite_policy_retire(struct airoha_ppe *ppe,
+ 				      struct airoha_flow_table_entry *e)
+ {
++ if (e->kite_suspended) {
++  if (e->kite_soft_slot < KDP_FLOWS)
++   WRITE_ONCE(ppe->kite_dp->r60.soft[e->kite_soft_slot].version,0);
++  dma_wmb(); e->kite_suspended=false;
++ }
++
+ 	if (!e->kite_in_wcid)
+ 		return;
+ 	airoha_kite_bucket_begin(ppe->kite_dp, e->kite_policy);
+@@ -1028,6 +1081,7 @@
+ 			 * UNBIND slot without waiting for the Linux rule to expire. */
+ 			if (!airoha_ppe_foe_commit_entry(ppe, &e->data, slot, true)) {
+ 				e->hash = slot;
++				airoha_kite_note_bind(ppe,e);
+ 				WRITE_ONCE(ppe->kite_dp->flow[e->kite_policy].hw_slot, slot);
+ 				atomic64_inc(&ppe->kite_learned);
+ 				atomic64_inc(&ppe->kite_l4_learned);
+@@ -1193,6 +1247,57 @@
+ 	mutex_unlock(&flow_offload_mutex);
+ 	return ret;
+ }
++/* Soft suspend keeps cookie ownership in flow_table/kite_flows, but stops
++ * every hardware capture. A later DESTROY/REPLACE still reaches its record.
++ * New learning is excluded by tx_blocked throughout the transaction. */
++int airoha_kite_suspend_tx(struct airoha_ppe_dev *dev, unsigned int wi, u32 request)
++{
++ struct airoha_ppe *ppe=dev->priv;
++ struct airoha_flow_table_entry *e;
++ struct kdp_shared *s;
++ int ret=0;
++ mutex_lock(&flow_offload_mutex);
++ s=ppe->kite_dp;
++ if (!s || !wi || wi>=KDP_WCIDS || !request ||
++     READ_ONCE(s->r60.ps[wi].request)!=request ||
++     !(READ_ONCE(s->sta[wi].tx_blocked)&KDP_TX_BLOCK_SOFTWARE)) { ret=-EINVAL; goto out; }
++ ret=ppe->kite_ops->pause(ppe->kite_priv); if (ret) goto out;
++ list_for_each_entry(e,&ppe->kite_flows,kite_node) {
++  struct kdp_flow key;
++  u32 base,i;
++  if (e->kite_out_wcid!=wi) continue;
++  if (e->kite_suspended) {
++   ret=airoha_kite_invalidate(ppe,e); if (ret) goto out;
++   continue; /* a partial revoke retry must still prove every slot stopped */
++  }
++  key=e->kite_capture_policy!=KDP_SLOT_NONE ? e->kite_key : e->kite_tx_key;
++  e->kite_soft_slot=KDP_SLOT_NONE;
++  if (key.type && ppe->kite_version != U32_MAX) {
++   base=kdp_flow_bucket(key.smac,key.dmac,key.vlan,wi);
++   base=kdp_flow_l4_bucket(base,key.src,key.dst,key.ports,key.protocol,
++      key.type==KDP_FLOW_BRIDGE_IPV4 ? KDP_FLOW_IPV4 :
++      key.type==KDP_FLOW_BRIDGE_IPV6 ? KDP_FLOW_IPV6 : key.type);
++   for (i=base;i<base+KDP_FLOW_WAYS;i++) {
++    struct kdp_flow *dst=&s->r60.soft[i];
++    if (READ_ONCE(dst->version)) continue;
++    key.version=0; *dst=key;
++    WRITE_ONCE(s->r60.soft_request[i],request); dma_wmb();
++    WRITE_ONCE(dst->version,++ppe->kite_version);
++    e->kite_soft_slot=i; break;
++   }
++  }
++  if (!key.type) s->r60.soft_unsupported++;
++  else if (e->kite_soft_slot==KDP_SLOT_NONE) s->r60.soft_full++;
++  e->kite_suspended=true;
++  ret=airoha_kite_invalidate(ppe,e); if (ret) goto out;
++ }
++ dma_wmb(); WRITE_ONCE(s->r60.ps[wi].active,request); dma_wmb();
++ ret=ppe->kite_ops->resume(ppe->kite_priv);
++out:
++ mutex_unlock(&flow_offload_mutex); return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_kite_suspend_tx);
++
+ int airoha_kite_revoke_tx(struct airoha_ppe_dev *dev, unsigned int wcid)
+ {
+ 	return airoha_kite_tx_update(dev, wcid, NULL, false);
+@@ -1228,3 +1333,64 @@
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(airoha_kite_detach);
++
++/* Called from the existing slow Wi-Fi watchdog under mt76.mutex. */
++int airoha_kite_health(struct airoha_ppe_dev *dev)
++{
++ struct airoha_ppe *ppe=dev->priv;
++ struct kdp_shared *s;
++ struct airoha_flow_table_entry *e;
++ u64 packets[2]={};
++ u32 bound[2]={},ready[2],p7=0,degrade=0,wi;
++ bool blocked=false;
++ int b,ret=0;
++ mutex_lock(&flow_offload_mutex);
++ s=ppe->kite_dp;
++ if (!s || !s->enabled || s->gate || kdp_failed(s) ||
++     time_before(jiffies,ppe->kite_health_at+HZ)) goto out;
++ ppe->kite_health_at=jiffies;
++ p7=airoha_fe_rr(ppe->eth,0x16c); /* AN7581 PSE port7 IQ:OQ */
++ WRITE_ONCE(s->r60.ingress_p7,p7);
++ blocked=s->tuning.ba.tids || s->perf.free_count<64;
++ for (wi=1;wi<KDP_WCIDS;wi++)
++  if (s->sta[wi].enabled && (s->sta[wi].tx_blocked || s->r60.ps[wi].active)) blocked=true;
++ list_for_each_entry(e,&ppe->kite_flows,kite_node) {
++  struct airoha_foe_stats64 st={};
++  wi=e->kite_out_wcid;
++  if (!wi || e->kite_suspended || !airoha_kite_flow_live(ppe,e)) continue;
++  b=s->sta[wi].band; if (b>1) continue;
++  if (e->type==FLOW_TYPE_L2) {
++   struct airoha_flow_table_entry *sub;
++   hlist_for_each_entry(sub,&e->l2_flows,l2_subflow_node) bound[b]+=sub->hash!=0xffff;
++  } else if (e->hash!=0xffff) {
++   bound[b]++; airoha_ppe_foe_entry_get_stats(ppe,e->hash,&st);
++   packets[b]+=st.packets;
++  }
++ }
++ for (b=0;b<2;b++) ready[b]=READ_ONCE(s->performance[b].reserved[KDP_PERF_TDMA_REARM]);
++ for (b=0;b<2;b++) {
++  u32 reason=0;
++  if (packets[b]>ppe->kite_health_packets[b]) reason|=1;
++  if (bound[b] && (p7&0xffff) && ready[1-b]==ppe->kite_health_ready[1-b]) reason|=2;
++  if (blocked || !bound[b] || s->r60.degraded[b] ||
++      ready[b]!=ppe->kite_health_ready[b] || !reason) ppe->kite_stall_at[b]=0;
++  else if (!ppe->kite_stall_at[b]) ppe->kite_stall_at[b]=jiffies;
++  else if (time_after_eq(jiffies,ppe->kite_stall_at[b]+2*HZ)) {
++   WRITE_ONCE(s->r60.ingress_reason[b],reason);
++   WRITE_ONCE(s->r60.degraded[b],1); dma_wmb(); degrade|=BIT(b);
++  }
++ }
++ for (b=0;b<2;b++) { ppe->kite_health_ready[b]=ready[b]; ppe->kite_health_packets[b]=packets[b]; }
++out:
++ mutex_unlock(&flow_offload_mutex);
++ if (!degrade) return ret;
++ /* Close new flow admission before retiring every current egress. RX PN,
++  * host TX, token allocations and DMA owners are retained. */
++ for (wi=1;wi<KDP_WCIDS;wi++) {
++  if (!s->sta[wi].generation || !(degrade & BIT(s->sta[wi].band))) continue;
++  ret=airoha_kite_revoke_tx(dev,wi); if (ret) break;
++ }
++ dev_warn(ppe->eth->dev,"Kite ingress stalled: bands=%x P7=%08x; hardware capture revoked, software retained, result=%d\n",degrade,p7,ret);
++ return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_kite_health);
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -24,6 +24,7 @@
+  */
+ DEFINE_MUTEX(flow_offload_mutex);
+ static DEFINE_SPINLOCK(ppe_lock);
++static void airoha_kite_note_bind(struct airoha_ppe *ppe, struct airoha_flow_table_entry *e);
+ static bool airoha_kite_flow_live(struct airoha_ppe *ppe,
+ 				   struct airoha_flow_table_entry *e);
+ static int airoha_kite_flow_remove(struct airoha_ppe *ppe,
+@@ -1121,6 +1122,7 @@
+ 			kfree(f);
+ 		return err;
+ 	}
++	airoha_kite_note_bind(ppe,e);
+ 	if (fresh)
+ 		hlist_add_head(&f->l2_subflow_node, &e->l2_flows);
+ 
+@@ -1173,6 +1175,7 @@
+ 			goto unlock;
+ 		commit_done = true;
+ 		e->hash = hash;
++		airoha_kite_note_bind(ppe,e);
+ 	}
+ 
+ 	if (commit_done)
+--- a/include/linux/soc/airoha/airoha_kite.h
++++ b/include/linux/soc/airoha/airoha_kite.h
+@@ -13,9 +13,11 @@
+ int airoha_kite_attach(struct airoha_ppe_dev *dev, struct kdp_shared *shared,
+ 	const struct airoha_kite_ops *ops, void *priv);
+ int airoha_kite_revoke(struct airoha_ppe_dev *dev, unsigned int wcid);
++int airoha_kite_suspend_tx(struct airoha_ppe_dev *dev, unsigned int wcid, u32 request);
+ int airoha_kite_revoke_tx(struct airoha_ppe_dev *dev, unsigned int wcid);
+ int airoha_kite_update_qos(struct airoha_ppe_dev *dev, unsigned int wcid,
+ 			 const u8 *map, bool custom);
++int airoha_kite_health(struct airoha_ppe_dev *dev);
+ int airoha_kite_detach(struct airoha_ppe_dev *dev);
+ void airoha_kite_learn_hint(struct airoha_ppe_dev *dev);
+ #endif
+--- a/include/linux/soc/airoha/kite-datapath.h
++++ b/include/linux/soc/airoha/kite-datapath.h
+@@ -9,8 +9,8 @@
+  */
+ #include "kite-reorder.h"
+ 
+-#define KDP_ABI_VERSION 10u
+-#define KDP_MAGIC 0x4b44000au
++#define KDP_ABI_VERSION 11u
++#define KDP_MAGIC 0x4b44000bu
+ #define KDP_WCIDS 544u
+ #define KDP_ROUTES 2048u
+ #define KDP_ROUTE_MAX 0x1ffffu
+@@ -344,6 +344,32 @@
+  unsigned int seq, revision;
+  struct kdp_observe_time hot[6];
+  struct kdp_r59_band band[2];
++};
++/* ABI11: bounded PS authorization and ordered host handoff. Existing DMA
++ * offsets stay fixed. ARM owns request/active and soft flow versions;
++ * hart4 owns issued/failed/drained; the host RX consumer owns consumed.
++ * Counters are cumulative for the shared session, never reset on a wake. */
++struct kdp_suspend {
++ unsigned int request, active, issued, failed, consumed, drained;
++ unsigned int consumed_serial;
++ /* ARM-only observation: first real BIND after wake, millisecond clock. */
++ unsigned int resume_ms, learned_ms, learned_request;
++};
++#define KDP_HOST_FALLBACK_RECORD 0x800u
++#define KDP_HOST_RECORD_WORDS 6u
++#define KDP_HOST_RECORD_BYTES (KDP_HOST_RECORD_WORDS * 4u)
++struct kdp_r60 {
++ unsigned int drain_wcid; /* host selects one bounded drain probe */
++ unsigned int bind_state, bind_glb_before, bind_glb_after, unbind_glb;
++ unsigned int bind_ring[2][4]; /* base/count/cpu/dma readback */
++ unsigned int degraded[2], ingress_reason[2], ingress_p7;
++ unsigned int ps_wait_polls[2], ps_parse_drop[2], ps_policy_drop[2];
++ unsigned int host_ps_rejected[2], host_ps_delivered[2];
++ unsigned int soft_full, soft_unsupported;
++ struct kdp_observe_time gap[2][2]; /* TDMA ready / WFDMA publish; ticks=256 cycles */
++ struct kdp_suspend ps[KDP_WCIDS];
++ struct kdp_flow soft[KDP_FLOWS];
++ unsigned int soft_request[KDP_FLOWS];
+ };
+ struct kdp_shared {
+ 	unsigned int magic, bytes, session, epoch;
+@@ -371,6 +397,7 @@
+ 	struct kdp_service service;
+ 	struct kdp_tuning tuning;
+  struct kdp_r59 r59;
++ struct kdp_r60 r60;
+ };
+ 
+ /* ABI9 extends the tail, never the header or DMA regions. Magic and bytes
+@@ -430,15 +457,11 @@
+  t->queue = wmm * 4;
+  return 1;
+ }
+-static inline int kdp_write_txwi(unsigned char *p, const struct kdp_txwi_template *t,
++static inline void kdp_write_txwi_validated(unsigned char *p, const struct kdp_txwi_template *t,
+  unsigned int pa, unsigned int len, unsigned int token, unsigned int tid, unsigned int amsdu)
+ {
+  static const unsigned char queue[8] = {1, 0, 0, 1, 2, 2, 3, 3};
+  volatile kdp_word *d = (void *)p;
+- if (((unsigned long)p & 3) || len < 14 || len > KDP_BUFFER_BYTES ||
+-     token >= KDP_TOKENS || tid > 7 || pa < 0x80000000u || pa >= 0xc0000000u ||
+-     KDP_BUFFER_BYTES > 0xc0000000u - pa)
+-  return 0;
+  /* Full overwrite, including reserved words: no DMA-mutation assumption. */
+  d[0] = (len + 32) | ((t->queue + queue[tid]) << 25);
+  d[1] = t->w1 | (tid << 20); d[2] = t->w2; d[3] = t->w3;
+@@ -451,6 +474,17 @@
+  d[17] = 0; d[18] = 0; d[19] = 0; d[20] = 0; d[21] = 0;
+  d[22] = 0; d[23] = 0; d[24] = 0; d[25] = 0; d[26] = 0;
+  d[27] = 0; d[28] = 0; d[29] = 0; d[30] = 0; d[31] = 0;
++}
++/* Public checked entry. The TDMA producer uses the word writer only
++ * after its descriptor range, token, frame length and TID checks. */
++static inline int kdp_write_txwi(unsigned char *p, const struct kdp_txwi_template *t,
++ unsigned int pa, unsigned int len, unsigned int token, unsigned int tid, unsigned int amsdu)
++{
++ if (((unsigned long)p & 3) || len < 14 || len > KDP_BUFFER_BYTES ||
++     token >= KDP_TOKENS || tid > 7 || pa < 0x80000000u || pa >= 0xc0000000u ||
++     KDP_BUFFER_BYTES > 0xc0000000u - pa)
++  return 0;
++ kdp_write_txwi_validated(p,t,pa,len,token,tid,amsdu);
+  return 1;
+ }
+ static inline int kdp_make_txwi(unsigned char *p, unsigned int pa,
+--- a/include/linux/soc/airoha/kite-packet.h
++++ b/include/linux/soc/airoha/kite-packet.h
+@@ -235,5 +235,38 @@
+ 	KDP_BARRIER();
+ 	return f->version == version;
+ }
++static inline int kdp_soft_type(unsigned int type)
++{
++ return type==KDP_FLOW_IPV4 || type==KDP_FLOW_IPV6 ||
++        type==KDP_FLOW_BRIDGE_IPV4 || type==KDP_FLOW_BRIDGE_IPV6;
++}
++static inline unsigned int kdp_soft_find(const volatile struct kdp_shared *s,
++ const struct kdp_packet *p, unsigned int wi, unsigned int request)
++{
++ unsigned int base,i;
++ const volatile struct kdp_sta *sta=&s->sta[wi];
++ if (!request || s->r60.ps[wi].active!=request) return KDP_SLOT_NONE;
++ base=kdp_flow_bucket(p->smac,p->dmac,p->vlan,wi);
++ base=kdp_flow_l4_bucket(base,p->src,p->dst,p->ports,p->protocol,p->type);
++ for (i=base;i<base+KDP_FLOW_WAYS;i++)
++  if (kdp_soft_type(s->r60.soft[i].type) && s->r60.soft_request[i]==request &&
++      kdp_flow_matches(&s->r60.soft[i],p,s->session,sta->generation,
++                       sta->key_generation,wi,sta->band,sta->bss)) return i;
++ return KDP_SLOT_NONE;
++}
++static inline int kdp_soft_record_matches(const volatile struct kdp_shared *s,
++ const struct kdp_packet *p, unsigned int wi, unsigned int request,
++ unsigned int slot, unsigned int version, unsigned int tag)
++{
++ if (!wi || wi>=KDP_WCIDS || !request || slot>=KDP_FLOWS || !version ||
++     s->r60.ps[wi].request!=request || s->r60.ps[wi].active!=request ||
++     !kdp_soft_type(s->r60.soft[slot].type) || s->r60.soft_request[slot]!=request || s->r60.soft[slot].version!=version ||
++     s->sta[wi].tx_tag!=tag || !s->sta[wi].enabled || !s->sta[wi].authorized)
++  return 0;
++ if (!kdp_flow_matches(&s->r60.soft[slot],p,s->session,s->sta[wi].generation,
++     s->sta[wi].key_generation,wi,s->sta[wi].band,s->sta[wi].bss)) return 0;
++ KDP_BARRIER();
++ return s->r60.soft[slot].version==version && s->r60.ps[wi].active==request;
++}
+ #endif
+ #endif

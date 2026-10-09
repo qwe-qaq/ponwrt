@@ -1,0 +1,344 @@
+From: ponwrt maintainers
+Subject: [PATCH] r78: Bypass disabled observers and repeated transaction-hit writes.
+
+Native incremental patch on release77. Ownership and datapath ABI12 unchanged.
+
+--- a/link.ld
++++ b/link.ld
+@@ -22,6 +22,10 @@
+     .text : {
+         *(.text.init)
+         *(.text.hot)
++        . = ALIGN(64);
++        __kite_tx_text_start = .;
++        *(.text.kite_tx)
++        __kite_tx_text_end = .;
+         *(.text .text.*)
+     } > DRAM
+ 
+--- a/npu_kite_tx.c
++++ b/npu_kite_tx.c
+@@ -132,7 +132,7 @@
+ }
+ /* Owner values below KITE_TX_COUNT are host input indices; higher values
+  * name a PPE token. Never release payloads from this descriptor ledger. */
+-static int kite_tx_push(struct kite_tx_ring *t, const struct kite_tx_desc *v,
++KITE_TX_HOT static int kite_tx_push(struct kite_tx_ring *t, const struct kite_tx_desc *v,
+ 		       u16 owner)
+ {
+ 	u32 i = t->hw_producer, next = (i + 1) & KITE_TX_MASK;
+@@ -150,7 +150,7 @@
+ 	return 1;
+ }
+ 
+-static void kite_tx_publish(struct kite_tx_ring *t, u32 b)
++KITE_TX_HOT static void kite_tx_publish(struct kite_tx_ring *t, u32 b)
+ {
+  volatile struct kite_tx_shared *s = t->s;
+  u32 stamp, service_stamp = kite_dp_service_stamp();
+@@ -174,7 +174,7 @@
+  t->batch_ppe = 0;
+ }
+ 
+-static void kite_tx_step_inner(u32 b)
++KITE_TX_HOT static void kite_tx_step_inner(u32 b)
+ {
+ 	struct kite_tx_ring *t = &tx[b];
+ 	volatile struct kite_tx_shared *s = t->s;
+--- a/kite-observe.inc
++++ b/kite-observe.inc
+@@ -184,6 +184,7 @@
+  * in the maximum; no regular CSR read on unsampled per-packet events. */
+ static void dp_observe_gap(u32 band,u32 kind)
+ {
++ if (!dp_observe_mask) return;
+  u32 now,elapsed;
+  volatile struct kdp_observe_time *t;
+  if (!dp_gap_armed[band][kind] && !dp_observe_sample[band]) return;
+@@ -209,6 +210,7 @@
+ }
+ static inline void dp_observe_empty(u32 band, int empty)
+ {
++ if (!dp_observe_mask) return;
+  if (!!dp_r63.band[band].empty_active != !!empty)
+   dp_observe_empty_change(band, empty);
+ }
+@@ -265,6 +267,7 @@
+  * at the DMA callback. No invented hardware/peer ACK timestamp. */
+ static void dp_observe_submit(u32 band, u32 token)
+ {
++ if (!dp_observe_mask) return;
+  struct dp_observe_token *t = &dp_observe_tokens[token];
+  if (dp_observe_active_test(token)) {
+   dp_obs.band[band].sample_cancelled++; t->active = 0;
+@@ -289,6 +292,7 @@
+ }
+ static void dp_observe_publish(u32 token)
+ {
++ if (!dp_observe_mask) return;
+  struct dp_observe_token *t;
+  struct kdp_service_band *b;
+  if (!dp_observe_active_test(token)) return;
+@@ -330,6 +334,7 @@
+ }
+ static void dp_observe_dma(u32 token, int wa_ready, u32 band)
+ {
++ if (!dp_observe_mask) return;
+  if (!dp_observe_active_test(token)) return;
+  struct dp_observe_token *t = &dp_observe_tokens[token];
+  struct kdp_observe_band *b = &dp_obs.band[band];
+@@ -353,6 +358,7 @@
+ }
+ static void dp_observe_reap(u32 token, int reusable, int wa_ready, u32 band)
+ {
++ if (!dp_observe_mask) return;
+  if (!dp_observe_active_test(token)) return;
+  struct dp_observe_token *t = &dp_observe_tokens[token];
+  struct kdp_observe_band *b;
+--- a/npu_kite_datapath.c
++++ b/npu_kite_datapath.c
+@@ -148,7 +148,7 @@
+ }
+ /* Only hart4 TX helpers use this context. RX/host helpers continue using
+  * the complete cross-hart identity check. Context ends before PARK ACK. */
+-void kite_dp_tx_begin(void)
++KITE_TX_HOT void kite_dp_tx_begin(void)
+ {
+  dp_batch_valid = dp_identity();
+  if (dp_batch_valid && dp_observe_needs_init) dp_observe_init();
+@@ -160,7 +160,7 @@
+  dp_private.context_session = dp_session; dp_private.context_epoch = dp_epoch;
+  dp_freed_defer = 1;
+ }
+-void kite_dp_tx_end(void)
++KITE_TX_HOT void kite_dp_tx_end(void)
+ {
+  dp_publish_sent(0); dp_publish_sent(1);
+  dp_publish_freed(); dp_freed_defer = 0;
+@@ -168,7 +168,7 @@
+  dp_private.sta_checked[0] = dp_private.sta_checked[1] = 0;
+  dp_private.hint_checked[0] = dp_private.hint_checked[1] = 0;
+ }
+-static volatile struct kdp_shared *dp_tx_shared(void)
++KITE_TX_HOT static volatile struct kdp_shared *dp_tx_shared(void)
+ {
+  return (dp_batch_valid || dp_identity()) && !kdp_failed(dp) ? dp : 0;
+ }
+@@ -191,7 +191,7 @@
+ {
+ 	return dp != 0;
+ }
+-static int dp_alloc_token(void)
++KITE_TX_HOT static int dp_alloc_token(void)
+ {
+ 	u32 i;
+ 	if (dp_perf_flags & KDP_PERF_TOKENQ) {
+@@ -371,7 +371,7 @@
+ 	return 1;
+ }
+ 
+-static void dp_rearm(u32 band, u32 token);
++KITE_TX_HOT static void dp_rearm(u32 band, u32 token);
+ 
+ static __attribute__((noinline)) int dp_bridge_policy(volatile struct kdp_shared *s,
+ 	const struct dp_sta_tx *sta, const struct kdp_packet *packet,
+@@ -671,7 +671,7 @@
+   dp_bridge_delta[band] = 0;
+  }
+ }
+-void kite_dp_tx_flush(u32 band)
++KITE_TX_HOT void kite_dp_tx_flush(u32 band)
+ {
+  struct dp_publish_batch *q = &dp_batch[band];
+  u32 n, last;
+@@ -716,7 +716,7 @@
+ 
+ /* One decision and one observer invocation per actual completion event.
+  * A stale notification can never release a new incarnation of a token. */
+-static int dp_complete(u32 id, u32 seq, u32 band, u32 dma, u32 wa)
++KITE_TX_HOT static int dp_complete(u32 id, u32 seq, u32 band, u32 dma, u32 wa)
+ {
+  int reusable = seq && dma == seq && wa == seq;
+  dp_observe_reap(id, reusable, wa == seq, band);
+@@ -818,14 +818,14 @@
+  dp_observe_time(0, KDP_OBS_REAP, stamp, units);
+ }
+ 
+-void kite_dp_tx_reap(void)
++KITE_TX_HOT void kite_dp_tx_reap(void)
+ {
+  u32 deferred = dp_freed_defer;
+  dp_freed_defer = 1; dp_tx_reap_inner();
+  dp_publish_freed(); dp_freed_defer = deferred;
+ }
+ 
+-void kite_dp_tx_pressure_reap(void)
++KITE_TX_HOT void kite_dp_tx_pressure_reap(void)
+ {
+  if (dp_tx_shared() && dp_free_count < DP_CREDIT_RESERVE &&
+      dp->done.producer != dp->done.consumer) {
+@@ -836,7 +836,7 @@
+ 
+ /* Only called after WFDMA doorbell/readback. Publish a batched per-TID
+  * activity snapshot, never a completion or fictitious peer ACK. */
+-void kite_dp_tx_published(u32 band)
++KITE_TX_HOT void kite_dp_tx_published(u32 band)
+ {
+  struct dp_publish_batch *q = &dp_batch[band];
+  u32 n, j;
+@@ -889,7 +889,34 @@
+  }
+  dp_r63.band[band].gate_hold++; return 1;
+ }
+-int kite_dp_tx_next(u32 band, struct kite_tx_desc *out, u16 *id)
++static __attribute__((noinline)) int dp_parse_legacy(u32 band,
++ const unsigned char *payload, u32 len, const struct dp_sta_tx *sta,
++ struct dp_parse_cache *cache, struct kdp_packet *packet, int *parsed, int *fast)
++{
++ u32 i;
++   /* Short, VLAN, IPv6, nonzero DS and control use the original checks.
++    * Failed compact parsing is not permission to skip destination checks. */
++   for (i = 0; i < 6; i++)
++    if (payload[i] != sta->addr[i]) { dp->quality[band].identity_drop++; return 0; }
++   if (kdp_be16(payload + 12) < 0x600 || kdp_be16(payload + 12) == 0x888e) {
++    dp->quality[band].control_drop++; return 0;
++   }
++   if ((dp_perf_flags & KDP_PERF_FAST) && cache->valid) {
++    dp_packet_copy(packet, &cache->packet);
++    *parsed=cache->parsed; *fast=cache->fast;
++    dp_performance[band].parse_reuse++;
++   } else {
++    if ((dp_perf_flags & KDP_PERF_FAST) &&
++        (len < 48 || ((unsigned long)payload & 3)))
++     *fast = kdp_parse_ipv4_fast(payload, len, packet);
++    *parsed = *fast ? 1 : dp_parse_slow(payload, len, packet);
++    if (*fast) dp_performance[band].parse_fast++;
++    else dp_performance[band].parse_slow++;
++   }
++ return 1;
++}
++
++KITE_TX_HOT int kite_dp_tx_next(u32 band, struct kite_tx_desc *out, u16 *id)
+ {
+ 	volatile struct kdp_sta *sta;
+ 	volatile struct kdp_token *t;
+@@ -1061,25 +1088,7 @@
+    fast = parsed = 1; packet_valid = 0;
+    dp_performance[band].parse_fast++;
+   } else {
+-   /* Short, VLAN, IPv6, nonzero DS and control use the original checks.
+-    * Failed compact parsing is not permission to skip destination checks. */
+-   for (i = 0; i < 6; i++)
+-    if (payload[i] != sc->value.addr[i]) { dp->quality[band].identity_drop++; goto drop; }
+-   if (kdp_be16(payload + 12) < 0x600 || kdp_be16(payload + 12) == 0x888e) {
+-    dp->quality[band].control_drop++; goto drop;
+-   }
+-   if ((dp_perf_flags & KDP_PERF_FAST) && cache->valid) {
+-    dp_packet_copy(packet, &cache->packet);
+-    parsed=cache->parsed; fast=cache->fast;
+-    dp_performance[band].parse_reuse++;
+-   } else {
+-    if ((dp_perf_flags & KDP_PERF_FAST) &&
+-        (len < 48 || ((unsigned long)payload & 3)))
+-     fast = kdp_parse_ipv4_fast(payload, len, packet);
+-    parsed = fast ? 1 : dp_parse_slow(payload, len, packet);
+-    if (fast) dp_performance[band].parse_fast++;
+-    else dp_performance[band].parse_slow++;
+-   }
++   if (!dp_parse_legacy(band,payload,len,&sc->value,cache,packet,&parsed,&fast)) goto drop;
+   }
+  }
+  if (compact_valid && !dp_compact_destination(compact, &sc->value)) {
+@@ -1201,7 +1210,7 @@
+ 	return 0;
+ }
+ 
+-void kite_dp_tx_commit(u32 band, u16 token)
++KITE_TX_HOT void kite_dp_tx_commit(u32 band, u16 token)
+ {
+  u32 cost = kite_dp_cost_stamp(band);
+  u32 hot = 0;
+@@ -1237,7 +1246,7 @@
+  kite_dp_cost_step(band, 9, cost, 1);
+ }
+ 
+-void kite_dp_tx_dma_done(u16 token)
++KITE_TX_HOT void kite_dp_tx_dma_done(u16 token)
+ {
+  volatile struct kdp_token *t;
+  u32 seq, band, wa;
+--- a/kite-fast.inc
++++ b/kite-fast.inc
+@@ -188,12 +188,14 @@
+   * this begin/end, immutable identity cannot change. Live admission/PS/
+   * AMSDU and policy versions are still checked by every packet. */
+  u32 bit = 1u << (wcid & 3);
+- if (c->valid && c->wcid == wcid &&
+-     ((dp_private.context_valid && (dp_private.sta_checked[band] & bit)) ||
+-      (c->value.generation == s->generation &&
+-       c->value.key_generation == s->key_generation && c->value.tx_tag == s->tx_tag))) {
+-  if (dp_private.context_valid) dp_private.sta_checked[band] |= bit;
+-  return c;
++ if (c->valid && c->wcid == wcid) {
++  /* The already proved transaction hit needs no repeat DRAM store. */
++  if (dp_private.context_valid && (dp_private.sta_checked[band] & bit)) return c;
++  if (c->value.generation == s->generation &&
++      c->value.key_generation == s->key_generation && c->value.tx_tag == s->tx_tag) {
++   if (dp_private.context_valid) dp_private.sta_checked[band] |= bit;
++   return c;
++  }
+  }
+  dp_private.sta_checked[band] &= ~bit;
+  c = dp_sta_fill(s, c, wcid, band);
+@@ -431,7 +433,7 @@
+  if (s->tuning.bucket_seq[bucket] == seq) c->seq = seq;
+ }
+ 
+-static int dp_hint_ipv4(volatile struct kdp_shared *s, const struct dp_sta_tx *sta,
++KITE_TX_HOT static int dp_hint_ipv4(volatile struct kdp_shared *s, const struct dp_sta_tx *sta,
+                        const struct dp_ipv4_key *p, u32 wcid, u32 band)
+ {
+  u32 hash = 0, way = 0, index, last = dp_private.last_hint[band];
+--- a/kite-datapath-fw.h
++++ b/kite-datapath-fw.h
+@@ -1,6 +1,13 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ #ifndef PONWRT_KITE_DATAPATH_FW_H
+ #define PONWRT_KITE_DATAPATH_FW_H
++/* AN7581 Kite layout only: no global HAS_HOT_TEXT feature enable and no
++ * change to loop budgets, barriers, ownership or host/RX scheduling. */
++#if defined(AN7581) && defined(MT7916)
++#define KITE_TX_HOT __attribute__((section(".text.kite_tx")))
++#else
++#define KITE_TX_HOT
++#endif
+ #include "kite-tx.h"
+ #include "kite-host.h"
+ #include "kite-datapath.h"
+--- a/kite-credit.inc
++++ b/kite-credit.inc
+@@ -18,7 +18,7 @@
+ /* Hart4-only SRAM control state. BIND initializes; PARK preserves ownership.
+  * Large diagnostics remain in DRAM, outside the per-packet credit ledger. */
+ static struct {
+- u32 pending[2], demand[2];
++ u32 pending[2], demand[2], waiting;
+  u32 band1[KDP_TOKENS/32];
+ } dp_credit_hot;
+ static volatile u32 dp_credit_seq;
+@@ -42,12 +42,14 @@
+ static void dp_credit_wait(u32 b, u32 kind)
+ {
+  struct dp_credit_band *v=&dp_credit.band[b];
+- if (!v->wait_kind && !kind) return;
++ if (!kind && !(dp_credit_hot.waiting & (1u << b))) return;
+  u32 now=csr_read(mcycle);
+  dp_credit_elapsed(v,now);
+  if (kind==1) v->empty++;
+  if (kind==2) v->holds++;
+  v->wait_at=now; v->wait_kind=kind;
++ if (kind) dp_credit_hot.waiting |= 1u << b;
++ else dp_credit_hot.waiting &= ~(1u << b);
+ }
+ /* Called only on the first PARK observation, after the ACK. Local hart4
+  * state and clock only: never dereference the now host-owned mapping. */
