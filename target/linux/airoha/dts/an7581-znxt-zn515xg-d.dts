@@ -5,6 +5,7 @@
 /memreserve/ 0x80000000 0x200000;
 
 #include "an7581-znxt-zn50xg-d-common.dtsi"
+#include "an7581-npu-mt7916.dtsi"
 
 / {
 	model = "ZNXT ZN515XG-D";
