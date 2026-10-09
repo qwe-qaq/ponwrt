@@ -123,6 +123,7 @@
 			mediatek,eeprom-merge-otp;
 			airoha,npu = <&npu>;
 			airoha,eth = <&eth>;
+			airoha,npu-pcie-port-type = <3>;
 
 			band@0 {
 				reg = <0>;
