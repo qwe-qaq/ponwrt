@@ -1,0 +1,31 @@
+From: FTTR maintainers
+Subject: [PATCH] netfilter: drain hardware flows before removing block callbacks
+
+Direct ndo_setup_tc callbacks are removed before nf_flow_table_free() tears
+down the flows. On Airoha this leaves PPE entries forwarding after a fw4
+reload, with no software flow remaining to revoke them on policy changes.
+
+Drain outstanding work and tear down the table while the callbacks are
+still installed. Drain the whole table: a detached device can be an
+egress device, or a physical lower device absent from the logical ingress
+ifindices stored in bridge tuples. Remaining devices can admit new flows
+after the detach operation completes.
+
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -1282,6 +1282,15 @@ int nf_flow_table_offload_setup(struct nf
+ 	if (!nf_flowtable_hw_offload(flowtable))
+ 		return nf_flow_offload_xdp_setup(flowtable, dev, cmd);
+ 
++	/* Destroy rules before ndo_setup_tc removes their block callbacks.
++	 * Device-only ingress cleanup misses egress and lower-device rules.
++	 * Finish queued installs before collecting flows for teardown.
++	 */
++	if (cmd == FLOW_BLOCK_UNBIND) {
++		nf_flow_table_offload_flush(flowtable);
++		nf_flow_table_gc_cleanup(flowtable, NULL);
++	}
++
+ 	if (dev->netdev_ops->ndo_setup_tc)
+ 		err = nf_flow_table_offload_cmd(&bo, flowtable, dev, cmd,
+ 						&extack);

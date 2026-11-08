@@ -1,0 +1,21 @@
+From: FTTR maintainers
+Subject: [PATCH] fw4: include FTTR physical transport in routed offload hooks
+
+FMCS logical ports resolve routed paths through fttr0. The lower device is
+not a bridge member and is absent from zone.related_physdevs; without its
+ingress hook the return path cannot bind. Keep admission under the driver's
+per-port and per-direction gates. Do not add the transport to firewall zones.
+
+--- a/root/usr/share/ucode/fw4.uc
++++ b/root/usr/share/ucode/fw4.uc
+@@ -551,3 +551,10 @@
+ 		devices = sort(uniq(devices));
+ 
++		// FMCS routed paths use the physical transport, not the bridge port.
++		if (fs.access('/sys/class/net/fttr0') &&
++		    length(filter(devices, d => match(d, /^fttr([1-9]|1[0-6])$/)))) {
++			push(devices, 'fttr0');
++			devices = sort(uniq(devices));
++		}
++
+ 		if (!nft_try_hw_offload(devices)) {
