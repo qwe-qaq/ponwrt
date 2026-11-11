@@ -35,7 +35,7 @@
 		 * mt76_abort_scan. Suppressing AER keeps link recovery in hardware
 		 * where the driver expects it, and disabling ASPM keeps L1 out of
 		 * the firmware download window. */
-		bootargs = "console=ttyS0,115200 earlycon pci=noaer pcie_aspm=off ubi.block=0,fit root=/dev/fit0 rootwait";
+		bootargs = "console=ttyS0,115200 earlycon";
 		stdout-path = "serial0:115200n8";
 	};
 
