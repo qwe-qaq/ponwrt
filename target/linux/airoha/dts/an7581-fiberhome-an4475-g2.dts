@@ -24,17 +24,6 @@
 
 	chosen {
 		rootdisk = <&ubi_fit>;
-		/* pci=noaer / pcie_aspm=off:
-		 * During the mt7990 ROM patch download both Wi-Fi endpoints drop
-		 * their PCIe link (Root Port logs correctable RxErr, then a fatal
-		 * SDES "Surprise Down"). Native AER treats that as uncorrectable,
-		 * resets the root port and fails recovery because no error_detected
-		 * callback is bound yet, leaving the chip unreachable: every later
-		 * MCU message times out ("Failed to start patch"), mac80211 asks
-		 * for a hardware restart and mt7996_mac_reset_work panics in
-		 * mt76_abort_scan. Suppressing AER keeps link recovery in hardware
-		 * where the driver expects it, and disabling ASPM keeps L1 out of
-		 * the firmware download window. */
 		bootargs = "console=ttyS0,115200 earlycon";
 		stdout-path = "serial0:115200n8";
 	};
@@ -101,9 +90,22 @@
 		led-usb {
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_USB;
-			gpios = <&en7581_pinctrl 6 GPIO_ACTIVE_LOW>;
+			gpios = <&en7581_pinctrl 1 GPIO_ACTIVE_LOW>;
 			linux,default-trigger = "usbport";
 			trigger-sources = <&usb_port2>;
+		};
+	};
+
+	pwmleds {
+		compatible = "pwm-leds";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pwm_gpio18_idx10_pins>;
+
+		led_pon: led-pon {
+			label = "pon:green";
+			pwms = <&en7581_pwm 10 4000000 PWM_POLARITY_INVERTED>;
+			max-brightness = <255>;
+			linux,default-trigger = "pon0-registration";
 		};
 	};
 
@@ -160,7 +162,30 @@
 			drive-open-drain = <1>;
 		};
 	};	
-	
+
+	pwm_gpio18_idx10_pins: pwm-gpio18-idx10-pins {
+		mux {
+			function = "pwm";
+			pins = "gpio18";
+		};
+
+		conf {
+			pins = "gpio18";
+			output-enable;
+		};
+	};
+	tx_ben_hog: tx-ben-hog {
+		gpio-hog;
+		gpios = <41 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "phy-tx-ben";
+	};
+	gpon_power_hog: gpon-power-hog {
+		gpio-hog;
+		gpios = <20 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "gpon-power";
+	};
 
 	gswp1_led1_pins: gswp1-led1-pins {
 		mux {
@@ -189,6 +214,16 @@
 			pins = "gpio46";
 		};
 	};
+};
+
+&xpon_mac {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pon_pins>;
+	optical-front-end = <&an4475_bosa>;
+	nvmem-cells = <&pon_serial>;
+	nvmem-cell-names = "pon-serial";
+	data-path = <&gdm2>;
+	status = "okay";
 };
 
 &snfi {
