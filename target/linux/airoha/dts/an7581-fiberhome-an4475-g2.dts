@@ -74,21 +74,21 @@
 		led-pon {
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_WAN;
-			gpios = <&en7581_pinctrl 18 GPIO_ACTIVE_LOW>;
+			gpios = <&en7581_pinctrl 14 GPIO_ACTIVE_LOW>;
 			linux,default-trigger = "pon0-registration";
 		};
 
 		led-los {
 			color = <LED_COLOR_ID_RED>;
 			function = LED_FUNCTION_WAN;
-			gpios = <&en7581_pinctrl 19 GPIO_ACTIVE_LOW>;
+			gpios = <&en7581_pinctrl 16 GPIO_ACTIVE_LOW>;
 			linux,default-trigger = "pon0-los";
 		};
 
 		led-internet {
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_WAN_ONLINE;
-			gpios = <&en7581_pinctrl 20 GPIO_ACTIVE_LOW>;
+			gpios = <&en7581_pinctrl 5 GPIO_ACTIVE_LOW>;
 			linux,default-trigger = "pon0-online";
 		};
 
@@ -101,7 +101,7 @@
 		led-usb {
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_USB;
-			gpios = <&en7581_pinctrl 34 GPIO_ACTIVE_LOW>;
+			gpios = <&en7581_pinctrl 6 GPIO_ACTIVE_LOW>;
 			linux,default-trigger = "usbport";
 			trigger-sources = <&usb_port2>;
 		};
