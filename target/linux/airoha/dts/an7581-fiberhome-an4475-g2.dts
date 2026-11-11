@@ -436,22 +436,6 @@
 		nvmem-cell-names = "mac-address";
 		nvmem-cells = <&eth_base_mac 0>;
 	};
-
-	ethernet-port@1 {
-		compatible = "airoha,eth-port";
-		reg = <1>;
-		pcs-handle = <&usb_pcs>;
-		phy-mode = "2500base-x";
-		openwrt,netdev-name = "fttr0";
-		/* No factory MAC for this link; use the LAN block, not voipmac. */
-		nvmem-cell-names = "mac-address";
-		nvmem-cells = <&eth_base_mac 5>;
-
-		fixed-link {
-			speed = <2500>;
-			full-duplex;
-		};
-	};
 };
 
 &switch {
