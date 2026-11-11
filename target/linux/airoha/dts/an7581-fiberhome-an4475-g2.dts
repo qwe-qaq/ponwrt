@@ -24,7 +24,18 @@
 
 	chosen {
 		rootdisk = <&ubi_fit>;
-		bootargs = "console=ttyS0,115200 earlycon ubi.block=0,fit root=/dev/fit0 rootwait";
+		/* pci=noaer / pcie_aspm=off:
+		 * During the mt7990 ROM patch download both Wi-Fi endpoints drop
+		 * their PCIe link (Root Port logs correctable RxErr, then a fatal
+		 * SDES "Surprise Down"). Native AER treats that as uncorrectable,
+		 * resets the root port and fails recovery because no error_detected
+		 * callback is bound yet, leaving the chip unreachable: every later
+		 * MCU message times out ("Failed to start patch"), mac80211 asks
+		 * for a hardware restart and mt7996_mac_reset_work panics in
+		 * mt76_abort_scan. Suppressing AER keeps link recovery in hardware
+		 * where the driver expects it, and disabling ASPM keeps L1 out of
+		 * the firmware download window. */
+		bootargs = "console=ttyS0,115200 earlycon pci=noaer pcie_aspm=off ubi.block=0,fit root=/dev/fit0 rootwait";
 		stdout-path = "serial0:115200n8";
 	};
 
@@ -371,6 +382,15 @@
 
 &usb1 {
 	status = "okay";
+	/* Only the USB2 lines are wired here. With no mask at all xhci-mtk
+	 * powers up every U3 port the IPPC reports and then polls ip_pw_sts1
+	 * for STS1_U3_MAC_RST as well; that bit never comes back while the U3
+	 * serdes is left to usb_pcs (pcie2/fttr0), so probe failed with
+	 * "clocks are not stable (0x1003d0f)" and "can't setup: -110".
+	 * Mask the U3 ports and bind only the USB2 PHY, so the driver neither
+	 * waits for that bit nor powers up the serdes fttr0 is using. */
+	mediatek,u3p-dis-msk = <0x3>;
+	phys = <&usb1_phy PHY_TYPE_USB2>;
 	vusb33-supply = <&reg_3p3v>;
 	#address-cells = <1>;
 	#size-cells = <0>;
