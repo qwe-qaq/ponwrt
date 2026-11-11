@@ -63,31 +63,31 @@
 			panic-indicator;
 		};
 
-		led_lan1: led-lan1 {
-			color = <LED_COLOR_ID_GREEN>;
-			function = LED_FUNCTION_LAN;
-			function-enumerator = <1>;
-			gpios = <&en7581_pinctrl 43 GPIO_ACTIVE_LOW>;
-		};
-
 		led_lan2: led-lan2 {
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_LAN;
 			function-enumerator = <2>;
-			gpios = <&en7581_pinctrl 44 GPIO_ACTIVE_LOW>;
+			gpios = <&en7581_pinctrl 43 GPIO_ACTIVE_LOW>;
 		};
 
 		led_lan3: led-lan3 {
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_LAN;
 			function-enumerator = <3>;
-			gpios = <&en7581_pinctrl 45 GPIO_ACTIVE_LOW>;
+			gpios = <&en7581_pinctrl 44 GPIO_ACTIVE_LOW>;
 		};
 
 		led_lan4: led-lan4 {
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_LAN;
 			function-enumerator = <4>;
+			gpios = <&en7581_pinctrl 45 GPIO_ACTIVE_LOW>;
+		};
+
+		led_lan5: led-lan5 {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <5>;
 			gpios = <&en7581_pinctrl 46 GPIO_ACTIVE_LOW>;
 		};
 
@@ -504,22 +504,22 @@
 
 
 &gsw_phy1 {
-	interrupts = <1>;
-	status = "okay";
-};
-
-&gsw_phy2 {
 	interrupts = <2>;
 	status = "okay";
 };
 
-&gsw_phy3 {
+&gsw_phy2 {
 	interrupts = <3>;
 	status = "okay";
 };
 
-&gsw_phy4 {
+&gsw_phy3 {
 	interrupts = <4>;
+	status = "okay";
+};
+
+&gsw_phy4 {
+	interrupts = <5>;
 	status = "okay";
 };
 
