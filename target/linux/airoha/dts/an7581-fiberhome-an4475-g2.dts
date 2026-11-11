@@ -6,6 +6,7 @@
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/leds/common.h>
+#include <dt-bindings/pwm/pwm.h>
 #include "an7581.dtsi"
 
 / {
@@ -53,47 +54,43 @@
 
 	leds {
 		compatible = "gpio-leds";
-		
+
 		led_power: led-power {
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_POWER;
 			gpios = <&en7581_pinctrl 35 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+			panic-indicator;
 		};
 
-		led-pon {
+		led_lan1: led-lan1 {
 			color = <LED_COLOR_ID_GREEN>;
-			function = LED_FUNCTION_WAN;
-			gpios = <&en7581_pinctrl 14 GPIO_ACTIVE_LOW>;
-			linux,default-trigger = "pon0-registration";
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <1>;
+			gpios = <&en7581_pinctrl 43 GPIO_ACTIVE_LOW>;
 		};
 
-		led-los {
-			color = <LED_COLOR_ID_RED>;
-			function = LED_FUNCTION_WAN;
-			gpios = <&en7581_pinctrl 16 GPIO_ACTIVE_LOW>;
-			linux,default-trigger = "pon0-los";
-		};
-
-		led-internet {
+		led_lan2: led-lan2 {
 			color = <LED_COLOR_ID_GREEN>;
-			function = LED_FUNCTION_WAN_ONLINE;
-			gpios = <&en7581_pinctrl 5 GPIO_ACTIVE_LOW>;
-			linux,default-trigger = "pon0-online";
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <2>;
+			gpios = <&en7581_pinctrl 44 GPIO_ACTIVE_LOW>;
 		};
 
-		led-wlan {
+		led_lan3: led-lan3 {
 			color = <LED_COLOR_ID_GREEN>;
-			function = LED_FUNCTION_WLAN;
-			gpios = <&en7581_pinctrl 15 GPIO_ACTIVE_LOW>;
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <3>;
+			gpios = <&en7581_pinctrl 45 GPIO_ACTIVE_LOW>;
 		};
 
-		led-usb {
+		led_lan4: led-lan4 {
 			color = <LED_COLOR_ID_GREEN>;
-			function = LED_FUNCTION_USB;
-			gpios = <&en7581_pinctrl 1 GPIO_ACTIVE_LOW>;
-			linux,default-trigger = "usbport";
-			trigger-sources = <&usb_port2>;
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <4>;
+			gpios = <&en7581_pinctrl 46 GPIO_ACTIVE_LOW>;
 		};
+
 	};
 
 	pwmleds {
@@ -161,7 +158,7 @@
 			pins = "pcie_reset1";
 			drive-open-drain = <1>;
 		};
-	};	
+	};
 
 	pwm_gpio18_idx10_pins: pwm-gpio18-idx10-pins {
 		mux {
@@ -174,12 +171,14 @@
 			output-enable;
 		};
 	};
+
 	tx_ben_hog: tx-ben-hog {
 		gpio-hog;
 		gpios = <41 GPIO_ACTIVE_HIGH>;
 		output-high;
 		line-name = "phy-tx-ben";
 	};
+
 	gpon_power_hog: gpon-power-hog {
 		gpio-hog;
 		gpios = <20 GPIO_ACTIVE_HIGH>;
@@ -187,33 +186,6 @@
 		line-name = "gpon-power";
 	};
 
-	gswp1_led1_pins: gswp1-led1-pins {
-		mux {
-			function = "phy1_led1";
-			pins = "gpio43";
-		};
-	};
-
-	gswp2_led1_pins: gswp2-led1-pins {
-		mux {
-			function = "phy2_led1";
-			pins = "gpio44";
-		};
-	};
-
-	gswp3_led1_pins: gswp3-led1-pins {
-		mux {
-			function = "phy3_led1";
-			pins = "gpio45";
-		};
-	};
-
-	gswp4_led1_pins: gswp4-led1-pins {
-		mux {
-			function = "phy4_led1";
-			pins = "gpio46";
-		};
-	};
 };
 
 &xpon_mac {
@@ -415,13 +387,6 @@
 
 &usb1 {
 	status = "okay";
-	/* Only the USB2 lines are wired here. With no mask at all xhci-mtk
-	 * powers up every U3 port the IPPC reports and then polls ip_pw_sts1
-	 * for STS1_U3_MAC_RST as well; that bit never comes back while the U3
-	 * serdes is left to usb_pcs (pcie2/fttr0), so probe failed with
-	 * "clocks are not stable (0x1003d0f)" and "can't setup: -110".
-	 * Mask the U3 ports and bind only the USB2 PHY, so the driver neither
-	 * waits for that bit nor powers up the serdes fttr0 is using. */
 	mediatek,u3p-dis-msk = <0x3>;
 	phys = <&usb1_phy PHY_TYPE_USB2>;
 	vusb33-supply = <&reg_3p3v>;
@@ -537,63 +502,24 @@
 	status = "okay";
 };
 
+
 &gsw_phy1 {
 	interrupts = <1>;
-	pinctrl-names = "gbe-led";
-	pinctrl-0 = <&gswp1_led1_pins>;
 	status = "okay";
 };
 
 &gsw_phy2 {
 	interrupts = <2>;
-	pinctrl-names = "gbe-led";
-	pinctrl-0 = <&gswp2_led1_pins>;
 	status = "okay";
 };
 
 &gsw_phy3 {
 	interrupts = <3>;
-	pinctrl-names = "gbe-led";
-	pinctrl-0 = <&gswp3_led1_pins>;
 	status = "okay";
 };
 
 &gsw_phy4 {
 	interrupts = <4>;
-	pinctrl-names = "gbe-led";
-	pinctrl-0 = <&gswp4_led1_pins>;
-	status = "okay";
-};
-
-&gsw_phy1_led1 {
-	color = <LED_COLOR_ID_GREEN>;
-	function = LED_FUNCTION_LAN;
-	function-enumerator = <1>;
-	active-low;
-	status = "okay";
-};
-
-&gsw_phy2_led1 {
-	color = <LED_COLOR_ID_GREEN>;
-	function = LED_FUNCTION_LAN;
-	function-enumerator = <2>;
-	active-low;
-	status = "okay";
-};
-
-&gsw_phy3_led1 {
-	color = <LED_COLOR_ID_GREEN>;
-	function = LED_FUNCTION_LAN;
-	function-enumerator = <3>;
-	active-low;
-	status = "okay";
-};
-
-&gsw_phy4_led1 {
-	color = <LED_COLOR_ID_GREEN>;
-	function = LED_FUNCTION_LAN;
-	function-enumerator = <4>;
-	active-low;
 	status = "okay";
 };
 
@@ -667,6 +593,7 @@
 		};
 	};
 };
+
 &pcie1 {
 	status = "okay";
 	max-link-speed = <2>;
@@ -681,6 +608,10 @@
 		wifi_companion: wifi@0,0 {
 			compatible = "mediatek,mt76";
 			reg = <0x0000 0 0 0 0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			airoha,npu = <&npu>;
+			airoha,eth = <&eth>;
 		};
 	};
 };
