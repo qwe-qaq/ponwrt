@@ -116,16 +116,6 @@
 		regulator-name = "fixed-3.3V";
 	};
 
-	fmcs: fmcs {
-		compatible = "h3c,fmcs";
-		spi-controller = <&snfi>;
-		fpga-spi-int-gpios = <&en7581_pinctrl 23 GPIO_ACTIVE_HIGH>;
-		fpga-clk-gpios = <&en7581_pinctrl 29 GPIO_ACTIVE_HIGH>;
-		fpga-data-gpios = <&en7581_pinctrl 30 GPIO_ACTIVE_HIGH>;
-		nvmem-cell-names = "mac-address";
-		nvmem-cells = <&eth_base_mac 6>;
-		status = "disabled";
-	};
 };
 
 &en7581_pinctrl {
