@@ -426,22 +426,14 @@
 };
 
 &gdm4 {
-	/delete-property/ pcs-handle;
-	#address-cells = <1>;
-	#size-cells = <0>;
+	phy-handle = <&phy_2p5g>;
+	phy-mode = "2500base-x";
+	openwrt,netdev-name = "lan1";
+	nvmem-cell-names = "mac-address";
+	nvmem-cells = <&eth_base_mac 0>;
 	status = "okay";
-
-	lan_2p5g: ethernet-port@0 {
-		compatible = "airoha,eth-port";
-		reg = <0>;
-		pcs-handle = <&eth_pcs>;
-		phy-handle = <&phy_2p5g>;
-		phy-mode = "2500base-x";
-		openwrt,netdev-name = "lan1";
-		nvmem-cell-names = "mac-address";
-		nvmem-cells = <&eth_base_mac 0>;
-	};
 };
+
 
 &switch {
 	pinctrl-names = "default";
