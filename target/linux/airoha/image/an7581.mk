@@ -471,9 +471,9 @@ define Device/fiberhome_an4475-g2
   # confirmed on hardware; the DTS currently describes 001c.c849.
   DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio \
 	kmod-leds-pwm kmod-pwm-airoha \
-	kmod-phy-realtek kmod-phy-airoha-en8811h kmod-usb3 \
+	kmod-phy-realtek kmod-usb3 \
 	kmod-airoha-paged-bosa kmod-airoha-xpon airoha-ponctl airoha-pond \
-	kmod-mt7990-firmware airoha-en7581-mt7996-npu-firmware wpad-openssl \
+	wpad-openssl \
 	fitblk nand-utils ubi-utils
 endef
 TARGET_DEVICES += fiberhome_an4475-g2
