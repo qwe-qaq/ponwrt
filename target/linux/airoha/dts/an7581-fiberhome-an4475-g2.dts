@@ -124,6 +124,13 @@
 	pon_pins: pon-pins {
 	};
 
+	pcm_spi_pins: pcm-spi-pins {
+		mux {
+			function = "pcm_spi";
+			groups = "pcm_spi";
+		};
+	};
+
 	mdio_pins: mdio-pins {
 		mux {
 			function = "mdio";
@@ -377,8 +384,6 @@
 
 &usb1 {
 	status = "okay";
-	mediatek,u3p-dis-msk = <0x3>;
-	phys = <&usb1_phy PHY_TYPE_USB2>;
 	vusb33-supply = <&reg_3p3v>;
 	#address-cells = <1>;
 	#size-cells = <0>;
@@ -478,22 +483,22 @@
 
 
 &gsw_phy1 {
-	interrupts = <2>;
+	interrupts = <1>;
 	status = "okay";
 };
 
 &gsw_phy2 {
-	interrupts = <3>;
+	interrupts = <2>;
 	status = "okay";
 };
 
 &gsw_phy3 {
-	interrupts = <4>;
+	interrupts = <3>;
 	status = "okay";
 };
 
 &gsw_phy4 {
-	interrupts = <5>;
+	interrupts = <4>;
 	status = "okay";
 };
 
@@ -568,3 +573,28 @@
 	};
 };
 
+&pcm_spi {
+	status = "okay";
+
+	pinctrl-names = "default";
+	pinctrl-0 = <&pcm_spi_pins>;
+
+	resets = <&scuclk EN7581_SFC2_PCM_RST>;
+	reset-names = "pcm";
+
+	fsl: fsl@0 {
+		compatible = "fiberhome,an4475-fsl";
+		reg = <0>;
+
+		/* 原厂 FDT：20MHz、CPOL+CPHA = mode 3 */
+		spi-max-frequency = <20000000>;
+		spi-cpol;
+		spi-cpha;
+
+		/* GPIO4（pad17）低有效；原厂 rcS 是「低 1s → 高 1s」。
+		 * 这里只声明线，时序交给端点驱动，且不要在每次 open 时执行。 */
+		reset-gpios = <&en7581_pinctrl 4 GPIO_ACTIVE_LOW>;
+
+		status = "disabled";
+	};
+};
