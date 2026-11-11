@@ -1,0 +1,617 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/dts-v1/;
+
+/memreserve/ 0x80000000 0x200000;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/pwm/pwm.h>
+#include "an7581.dtsi"
+
+/ {
+	model = "FiberHome AN4475-G2";
+	compatible = "fiberhome,an4475-g2", "airoha,an7581", "airoha,en7581";
+
+	aliases {
+		label-mac-device = &gdm2;
+		led-boot = &led_power;
+		led-failsafe = &led_power;
+		led-running = &led_power;
+		led-upgrade = &led_power;
+
+		serial0 = &uart1;
+	};
+
+	chosen {
+		rootdisk = <&ubi_fit>;
+		bootargs = "console=ttyS0,115200 earlycon";
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x0 0x20000000>;
+	};
+
+	keys {
+		compatible = "gpio-keys";
+
+		key-reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&en7581_pinctrl 0 GPIO_ACTIVE_LOW>;
+			debounce-interval = <60>;
+		};
+
+		key-wlan {
+			label = "wlan";
+			linux,code = <KEY_WLAN>;
+			gpios = <&en7581_pinctrl 17 GPIO_ACTIVE_LOW>;
+			debounce-interval = <60>;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led_power: led-power {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_POWER;
+			gpios = <&en7581_pinctrl 35 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+			panic-indicator;
+		};
+
+		led_lan1: led-lan1 {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <1>;
+			gpios = <&en7581_pinctrl 43 GPIO_ACTIVE_LOW>;
+		};
+
+		led_lan2: led-lan2 {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <2>;
+			gpios = <&en7581_pinctrl 44 GPIO_ACTIVE_LOW>;
+		};
+
+		led_lan3: led-lan3 {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <3>;
+			gpios = <&en7581_pinctrl 45 GPIO_ACTIVE_LOW>;
+		};
+
+		led_lan4: led-lan4 {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <4>;
+			gpios = <&en7581_pinctrl 46 GPIO_ACTIVE_LOW>;
+		};
+
+	};
+
+	pwmleds {
+		compatible = "pwm-leds";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pwm_gpio18_idx10_pins>;
+
+		led_pon: led-pon {
+			label = "pon:green";
+			pwms = <&en7581_pwm 10 4000000 PWM_POLARITY_INVERTED>;
+			max-brightness = <255>;
+			linux,default-trigger = "pon0-registration";
+		};
+	};
+
+	/* The USB PHY 3.3V reference supply is always on. */
+	reg_3p3v: regulator-3p3v {
+		compatible = "regulator-fixed";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-name = "fixed-3.3V";
+	};
+
+	fmcs: fmcs {
+		compatible = "h3c,fmcs";
+		spi-controller = <&snfi>;
+		fpga-spi-int-gpios = <&en7581_pinctrl 23 GPIO_ACTIVE_HIGH>;
+		fpga-clk-gpios = <&en7581_pinctrl 29 GPIO_ACTIVE_HIGH>;
+		fpga-data-gpios = <&en7581_pinctrl 30 GPIO_ACTIVE_HIGH>;
+		nvmem-cell-names = "mac-address";
+		nvmem-cells = <&eth_base_mac 6>;
+		status = "disabled";
+	};
+};
+
+&en7581_pinctrl {
+	gpio-ranges = <&en7581_pinctrl 0 13 47>;
+
+	pon_pins: pon-pins {
+	};
+
+	mdio_pins: mdio-pins {
+		mux {
+			function = "mdio";
+			groups = "mdio";
+		};
+
+		conf {
+			pins = "gpio2";
+			output-high;
+		};
+	};
+	
+	pcie0_rst_pins: pcie0-rst-pins {
+		conf {
+			pins = "pcie_reset0";
+			drive-open-drain = <1>;
+		};
+	};
+
+	pcie1_rst_pins: pcie1-rst-pins {
+		conf {
+			pins = "pcie_reset1";
+			drive-open-drain = <1>;
+		};
+	};
+
+	pwm_gpio18_idx10_pins: pwm-gpio18-idx10-pins {
+		mux {
+			function = "pwm";
+			pins = "gpio18";
+		};
+
+		conf {
+			pins = "gpio18";
+			output-enable;
+		};
+	};
+
+	tx_ben_hog: tx-ben-hog {
+		gpio-hog;
+		gpios = <41 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "phy-tx-ben";
+	};
+
+	gpon_power_hog: gpon-power-hog {
+		gpio-hog;
+		gpios = <20 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "gpon-power";
+	};
+
+};
+
+&xpon_mac {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pon_pins>;
+	optical-front-end = <&an4475_bosa>;
+	nvmem-cells = <&pon_serial>;
+	nvmem-cell-names = "pon-serial";
+	data-path = <&gdm2>;
+	status = "okay";
+};
+
+&snfi {
+	status = "okay";
+};
+
+&spi_nand {
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	partitions: partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/* BootROM reads the BL2 FIP at offset 0x800 in the first eraseblock. */
+		partition@0 {
+			label = "bl2";
+			reg = <0x00000000 0x00020000>;
+			read-only;
+		};
+
+		/* UBI manages every eraseblock after BL2. */
+		partition@20000 {
+			label = "ubi";
+			reg = <0x00020000 0x00000000>;
+			compatible = "linux,ubi";
+
+			volumes {
+				ubi_fip: ubi-volume-fip {
+					/* The second-stage FIP contains BL31 and U-Boot. */
+					volname = "fip";
+				};
+
+				ubi_env: ubi-volume-ubootenv {
+					volname = "ubootenv";
+				};
+
+				ubi_env2: ubi-volume-ubootenv2 {
+					volname = "ubootenv2";
+				};
+
+				ubi_factory: ubi-volume-factory {
+					volname = "factory";
+				};
+
+				ubi_fit: ubi-volume-fit {
+					volname = "fit";
+				};
+			};
+		};
+	};
+};
+
+&ubi_factory {
+	nvmem-layout {
+		compatible = "fixed-layout";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		container_magic: magic@0 {
+			reg = <0x000000 0x000008>;
+		};
+
+		device_serial: device-serial@20 {
+			reg = <0x000020 0x000018>;
+		};
+
+		pon_serial: pon-serial@38 {
+			reg = <0x000038 0x000008>;
+		};
+
+		base_mac: base-mac@40 {
+			compatible = "mac-base";
+			reg = <0x000040 0x000006>;
+			#nvmem-cell-cells = <1>;
+		};
+
+		eth_base_mac: eth-base-mac@46 {
+			compatible = "mac-base";
+			reg = <0x000046 0x000006>;
+			#nvmem-cell-cells = <1>;
+		};
+
+		oui: oui@4c {
+			reg = <0x00004c 0x000003>;
+		};
+
+		vendor_code: vendor-code@4f {
+			reg = <0x00004f 0x000002>;
+		};
+
+		gpon_password: gpon-password@51 {
+			reg = <0x000051 0x00000a>;
+		};
+
+		internet_mac: internet-mac@60 {
+			reg = <0x000060 0x000006>;
+		};
+
+		tr069_mac: tr069-mac@66 {
+			reg = <0x000066 0x000006>;
+		};
+
+		voip_mac: voip-mac@6c {
+			reg = <0x00006c 0x000006>;
+		};
+
+		priprotocol_mac: priprotocol-mac@72 {
+			reg = <0x000072 0x000006>;
+		};
+
+		wifi_mac_2g4: wifi-mac-2g4@96 {
+			reg = <0x000096 0x000006>;
+		};
+
+		wifi_mac_5g: wifi-mac-5g@9c {
+			reg = <0x00009c 0x000006>;
+		};
+
+		/* MT7993_EEPROM.bin: 1353728 B, stored verbatim, ends at 0x18a800. */
+		vendor_eeprom: eeprom-vendor@40000 {
+			reg = <0x040000 0x14a800>;
+		};
+
+		pon_cal_10ge_asym: calibration-10ge-asym@1a0000 {
+			reg = <0x1a0000 0x000800>;
+		};
+
+		pon_cal_10ge_sym: calibration-10ge-sym@1a1000 {
+			reg = <0x1a1000 0x000800>;
+		};
+
+		pon_cal_xg: calibration-xg@1a2000 {
+			reg = <0x1a2000 0x000800>;
+		};
+
+		pon_cal_xgs: calibration-xgs@1a3000 {
+			reg = <0x1a3000 0x000800>;
+		};
+
+		pon_calibration: calibration@1a4000 {
+			reg = <0x1a4000 0x000800>;
+		};
+
+		pon_cal_olt_downlink: calibration-olt-downlink@1a5000 {
+			reg = <0x1a5000 0x000800>;
+		};
+
+		apd_wtd01: apd-wtd01@1a6000 {
+			reg = <0x1a6000 0x00012a>;
+		};
+
+		apd_ys01: apd-ys01@1a7000 {
+			reg = <0x1a7000 0x00012c>;
+		};
+
+		bosa_info: bosa-info@1a8000 {
+			reg = <0x1a8000 0x0000e6>;
+		};
+
+		bosa_rssi: bosa-rssi@1a9000 {
+			reg = <0x1a9000 0x0000cc>;
+		};
+
+		lan_optic_tx: lan-optic-tx-calib@1aa000 {
+			reg = <0x1aa000 0x000218>;
+		};
+
+		wifi_eeprom: eeprom@1ab000 {
+			/* Exactly 7680 B = the mt76/OpenWrt EEPROM view. The full
+			 * vendor image is 1353728 B (0x14a800) in vendor_eeprom. */
+			reg = <0x1ab000 0x001e00>;
+		};
+	};
+};
+
+&ubi_env {
+	nvmem-layout {
+		compatible = "u-boot,env-redundant-bool";
+	};
+};
+
+&ubi_env2 {
+	nvmem-layout {
+		compatible = "u-boot,env-redundant-bool";
+	};
+};
+
+&usb1 {
+	status = "okay";
+	mediatek,u3p-dis-msk = <0x3>;
+	phys = <&usb1_phy PHY_TYPE_USB2>;
+	vusb33-supply = <&reg_3p3v>;
+	#address-cells = <1>;
+	#size-cells = <0>;
+	usb_port2: port@1 { reg = <1>; #trigger-source-cells = <0>; };
+};
+
+
+&npu {
+	status = "okay";
+};
+
+&eth {
+	status = "okay";
+};
+
+&gdm1 {
+	/* Internal switch/MAC conduit, LAN side -> LAN block, last slot. */
+	nvmem-cell-names = "mac-address";
+	nvmem-cells = <&eth_base_mac 7>;
+	status = "okay";
+};
+
+&eth_pcs {
+	status = "okay";
+};
+
+&usb_pcs {
+	status = "okay";
+};
+
+&mdio {
+
+	phy_2p5g: ethernet-phy@7 {
+		compatible = "ethernet-phy-id001c.c849";
+		reg = <7>;
+		reset-gpios = <&en7581_pinctrl 30 GPIO_ACTIVE_LOW>;
+		reset-assert-us = <10000>;
+		reset-deassert-us = <50000>;
+	};
+};
+
+&gdm4 {
+	/delete-property/ pcs-handle;
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	lan_2p5g: ethernet-port@0 {
+		compatible = "airoha,eth-port";
+		reg = <0>;
+		pcs-handle = <&eth_pcs>;
+		phy-handle = <&phy_2p5g>;
+		phy-mode = "2500base-x";
+		openwrt,netdev-name = "lan1";
+		nvmem-cell-names = "mac-address";
+		nvmem-cells = <&eth_base_mac 0>;
+	};
+
+	ethernet-port@1 {
+		compatible = "airoha,eth-port";
+		reg = <1>;
+		pcs-handle = <&usb_pcs>;
+		phy-mode = "2500base-x";
+		openwrt,netdev-name = "fttr0";
+		/* No factory MAC for this link; use the LAN block, not voipmac. */
+		nvmem-cell-names = "mac-address";
+		nvmem-cells = <&eth_base_mac 5>;
+
+		fixed-link {
+			speed = <2500>;
+			full-duplex;
+		};
+	};
+};
+
+&switch {
+	pinctrl-names = "default";
+	pinctrl-0 = <&mdio_pins>;
+	status = "okay";
+};
+
+&gsw_port1 {
+	label = "lan2";
+	/* eth2mac = eth_base_mac + 1 (was base_mac+6 — wrong reserved range). */
+	nvmem-cell-names = "mac-address";
+	nvmem-cells = <&eth_base_mac 1>;
+	status = "okay";
+};
+
+&gsw_port2 {
+	label = "lan3";
+	/* eth3mac */
+	nvmem-cell-names = "mac-address";
+	nvmem-cells = <&eth_base_mac 2>;
+	status = "okay";
+};
+
+&gsw_port3 {
+	label = "lan4";
+	/* eth4mac */
+	nvmem-cell-names = "mac-address";
+	nvmem-cells = <&eth_base_mac 3>;
+	status = "okay";
+};
+
+&gsw_port4 {
+	label = "lan5";
+	/* eth5mac */
+	nvmem-cell-names = "mac-address";
+	nvmem-cells = <&eth_base_mac 4>;
+	status = "okay";
+};
+
+
+&gsw_phy1 {
+	interrupts = <1>;
+	status = "okay";
+};
+
+&gsw_phy2 {
+	interrupts = <2>;
+	status = "okay";
+};
+
+&gsw_phy3 {
+	interrupts = <3>;
+	status = "okay";
+};
+
+&gsw_phy4 {
+	interrupts = <4>;
+	status = "okay";
+};
+
+
+&i2c0 {
+	status = "okay";
+
+	an4475_bosa: optical-front-end@51 {
+		
+		compatible = "fiberhome,hg5x-bosa", "airoha,paged-bosa";
+		reg = <0x51>;
+		fiberhome,ben-active-high;
+		tx-disable-gpios = <&en7581_pinctrl 38 GPIO_ACTIVE_HIGH>;
+		status = "okay";
+	};
+};
+
+&pon_pcs {
+	status = "okay";
+};
+
+
+&an4475_bosa {
+	nvmem-cell-names = "calibration";
+	nvmem-cells = <&pon_calibration>;
+};
+
+&gdm2 {
+	nvmem-cell-names = "mac-address";
+	nvmem-cells = <&base_mac 0>;
+	airoha,pon-data-path;
+	status = "okay";
+};
+
+
+&pcie0 {
+	status = "okay";
+	max-link-speed = <2>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&pcie0_rst_pins>;
+
+	pcie@0,0 {
+		device_type = "pci";
+		reg = <0x0000 0 0 0 0>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+
+		wifi_main: wifi@0,0 {
+			compatible = "mediatek,mt76";
+			reg = <0x0000 0 0 0 0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			airoha,npu = <&npu>;
+			airoha,eth = <&eth>;
+			nvmem-cells = <&wifi_eeprom>;
+			nvmem-cell-names = "eeprom";
+			band@0 {
+				/* 2.4 GHz */
+				reg = <0>;
+				nvmem-cells = <&wifi_mac_2g4>;
+				nvmem-cell-names = "mac-address";
+			};
+
+			band@1 {
+				/* 5 GHz */
+				reg = <1>;
+				nvmem-cells = <&wifi_mac_5g>;
+				nvmem-cell-names = "mac-address";
+			};
+		};
+	};
+};
+
+&pcie1 {
+	status = "okay";
+	max-link-speed = <2>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&pcie1_rst_pins>;
+
+	pcie@0,0 {
+		device_type = "pci";
+		reg = <0x0000 0 0 0 0>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		wifi_companion: wifi@0,0 {
+			compatible = "mediatek,mt76";
+			reg = <0x0000 0 0 0 0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			airoha,npu = <&npu>;
+			airoha,eth = <&eth>;
+		};
+	};
+};
