@@ -360,7 +360,7 @@
 			reg = <0x1aa000 0x000218>;
 		};
 
-		wifi_eeprom: eeprom@1ab000 {
+		eeprom: eeprom@1ab000 {
 			/* Exactly 7680 B = the mt76/OpenWrt EEPROM view. The full
 			 * vendor image is 1353728 B (0x14a800) in vendor_eeprom. */
 			reg = <0x1ab000 0x001e00>;
@@ -616,7 +616,7 @@
 
 			airoha,npu = <&npu>;
 			airoha,eth = <&eth>;
-			nvmem-cells = <&wifi_eeprom>;
+			nvmem-cells = <&eeprom>;
 			nvmem-cell-names = "eeprom";
 			band@0 {
 				/* 2.4 GHz */
