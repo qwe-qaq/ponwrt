@@ -234,8 +234,8 @@
 		mux {
 			function = "i2c";
 			groups = "i2c1";
+		};
 	};
-};
 
 	tx_ben_hog: tx-ben-hog {
 		gpio-hog;
@@ -612,8 +612,6 @@
 
 &i2c1 {
  status = "okay";
- pinctrl-names = "default";
- pinctrl-0 = <&i2c1_pins>;
  clock-frequency = <400000>;
  pca9555: gpio@20 {
 	compatible = "nxp,pca9555";
