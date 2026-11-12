@@ -409,13 +409,12 @@
 };
 
 &mdio {
-
 	phy_2p5g: ethernet-phy@7 {
 		compatible = "ethernet-phy-id001c.c849";
 		reg = <7>;
 		reset-gpios = <&en7581_pinctrl 30 GPIO_ACTIVE_LOW>;
-		reset-assert-us = <10000>;
-		reset-deassert-us = <50000>;
+		reset-assert-us = <15000>;
+		reset-deassert-us = <68000>;
 	};
 };
 
