@@ -133,7 +133,7 @@
 
 		led_pon: led-pon {
 			label = "pon:green";
-			pwms = <&en7581_pwm 10 4000000 PWM_POLARITY_INVERTED>;
+			pwms = <&en7581_pwm 10 4000000 0>;
 			max-brightness = <255>;
 			linux,default-trigger = "pon0-registration";
 		};
@@ -230,6 +230,12 @@
 		};
 	};
 
+	i2c1_pins: i2c1-pins {
+		mux {
+			function = "i2c";
+			groups = "i2c1";
+	};
+};
 
 	tx_ben_hog: tx-ben-hog {
 		gpio-hog;
@@ -243,6 +249,19 @@
 		gpios = <20 GPIO_ACTIVE_HIGH>;
 		output-high;
 		line-name = "gpon-power";
+	};
+	combo_mux_sel0_hog: combo-mux-sel0-hog {
+		gpio-hog;
+		gpios = <22 GPIO_ACTIVE_HIGH>;
+		output-low;
+		line-name = "combo-mux-sel0";
+	};
+
+	combo_mux_sel1_hog: combo-mux-sel1-hog {
+		gpio-hog;
+		gpios = <23 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "combo-mux-sel1";
 	};
 
 };
@@ -593,6 +612,9 @@
 
 &i2c1 {
  status = "okay";
+ pinctrl-names = "default";
+ pinctrl-0 = <&i2c1_pins>;
+ clock-frequency = <400000>;
  pca9555: gpio@20 {
 	compatible = "nxp,pca9555";
  	reg = <0x20>;
