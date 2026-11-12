@@ -42,10 +42,11 @@ unionman,ung00a)
 	ucidef_set_led_netdev "lan4" "lan4" "mt7530-0:09:green:lan-4" "lan4" "link tx rx"
 	;;
 fiberhome,an4475-g2)
-	ucidef_set_led_netdev "lan2" "lan2" "led-lan2" "lan2" "link tx rx"
-	ucidef_set_led_netdev "lan3" "lan3" "led-lan3" "lan3" "link tx rx"
-	ucidef_set_led_netdev "lan4" "lan4" "led-lan4" "lan4" "link tx rx"
-	ucidef_set_led_netdev "lan5" "lan5" "led-lan5" "lan5" "link tx rx"
+	ucidef_set_led_netdev "lan2" "lan2" "green:lan-2" "lan2" "link tx rx"
+	ucidef_set_led_netdev "lan3" "lan3" "green:lan-3" "lan3" "link tx rx"
+	ucidef_set_led_netdev "lan4" "lan4" "green:lan-4" "lan4" "link tx rx"
+	ucidef_set_led_netdev "lan5" "lan5" "green:lan-5" "lan5" "link tx rx"
+	ucidef_set_led_netdev "wlan" "wlan" "green:wlan" "phy0-ap0" "link"
 	;;
 fiberhome,hg5585f-ct)
 	# No GE port or USB3.0 LED on this panel.
