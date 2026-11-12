@@ -433,9 +433,10 @@
 	usb_port2: port@1 { reg = <1>; #trigger-source-cells = <0>; };
 };
 
-
 &npu {
 	status = "okay";
+	firmware-name = "airoha/en7581_MT7996_npu_rv32.bin",
+			"airoha/en7581_MT7996_npu_data.bin";
 };
 
 &eth {
