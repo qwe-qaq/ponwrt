@@ -597,32 +597,21 @@
 		status = "okay";
 	};
 
-	pca9555: gpio@20 {
-		compatible = "nxp,pca9555";
-		reg = <0x20>;
-		gpio-controller;
-		#gpio-cells = <2>;
-	};
-
 	downstream_bosa: optical-front-end@63 {
 		compatible = "fiberhome,ux3326s";
 		reg = <0x63>;
 	};
 };
 
-/* 换总线的备选写法（与上面同一份，只是换个控制器）：
- *
- * &i2c1 {
- *	status = "okay";
- *
- *	pca9555: gpio@20 {
- *		compatible = "nxp,pca9555";
- *		reg = <0x20>;
- *		gpio-controller;
- *		#gpio-cells = <2>;
- *	};
- * };
- */
+&i2c1 {
+ status = "okay";
+ pca9555: gpio@20 {
+	compatible = "nxp,pca9555";
+ 	reg = <0x20>;
+ 	gpio-controller;
+ 	#gpio-cells = <2>;
+	};
+};
 
 &pon_pcs {
 	status = "okay";
