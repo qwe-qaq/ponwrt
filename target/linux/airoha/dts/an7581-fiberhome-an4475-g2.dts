@@ -139,6 +139,21 @@
 		};
 	};
 
+	i2c_gpio: i2c-gpio {
+		compatible = "i2c-gpio";
+		sda-gpios = <&en7581_pinctrl 29 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		scl-gpios = <&en7581_pinctrl 28 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		i2c-gpio,delay-us = <10>;	/* ~50 kHz, conservative */
+		i2c-gpio,timeout-ms = <100>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		pca9555: gpio@20 {
+			compatible = "nxp,pca9555";
+			reg = <0x20>;
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
 
 	leds_expander: leds-expander {
 		compatible = "gpio-leds";
@@ -613,12 +628,6 @@
 &i2c1 {
  status = "okay";
  clock-frequency = <400000>;
- pca9555: gpio@20 {
-	compatible = "nxp,pca9555";
- 	reg = <0x20>;
- 	gpio-controller;
- 	#gpio-cells = <2>;
-	};
 };
 
 &pon_pcs {
