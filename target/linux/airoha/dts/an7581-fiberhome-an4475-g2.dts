@@ -63,6 +63,12 @@
 			panic-indicator;
 		};
 
+		led_wlan: led-wlan {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_WLAN;
+			gpios = <&en7581_pinctrl 15 GPIO_ACTIVE_LOW>;
+		};
+
 		led_lan2: led-lan2 {
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_LAN;
@@ -91,8 +97,33 @@
 			gpios = <&en7581_pinctrl 46 GPIO_ACTIVE_LOW>;
 		};
 
+		/* ---- LOS / USB 两颗仍无实证，量到焊盘再开 -------------------
+		 * LOS：led_cfg 里 los_led=0，脚本和原厂 DTB 都没有引脚；
+		 * USB：整个镜像搜不到任何引用。
+		 *
+		 * led_los: led-los {
+		 *	color = <LED_COLOR_ID_RED>;
+		 *	function = LED_FUNCTION_WAN;
+		 *	gpios = <&en7581_pinctrl 19 GPIO_ACTIVE_LOW>;
+		 *	linux,default-trigger = "pon0-los";
+		 * };
+		 *
+		 * led_usb: led-usb {
+		 *	color = <LED_COLOR_ID_GREEN>;
+		 *	function = LED_FUNCTION_USB;
+		 *	gpios = <&en7581_pinctrl 34 GPIO_ACTIVE_LOW>;
+		 * };
+		 */
 	};
 
+	/* PON LED: stock FDT
+	 *   pwmleds { lan4_green { label = "pon:green";
+	 *                         pwms = <&pwm 0xa 0x3d0900 0x1>; }; };
+	 * i.e. PWM channel 10 (0xa), period 0x3d0900 = 4 ms, polarity 1
+	 * (= PWM_POLARITY_INVERTED), max-brightness 0xff. The node name
+	 * "lan4_green" in the vendor DTB is a copy-paste leftover; the label is
+	 * what matters.
+	 */
 	pwmleds {
 		compatible = "pwm-leds";
 		pinctrl-names = "default";
@@ -103,6 +134,30 @@
 			pwms = <&en7581_pwm 10 4000000 PWM_POLARITY_INVERTED>;
 			max-brightness = <255>;
 			linux,default-trigger = "pon0-registration";
+		};
+	};
+
+
+	leds_expander: leds-expander {
+		compatible = "gpio-leds";
+
+		led_sys: led-sys {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_STATUS;
+			gpios = <&pca9555 6 GPIO_ACTIVE_LOW>;
+			default-state = "keep";
+		};
+
+		led_vpn: led-vpn {
+			label = "green:vpn";
+			gpios = <&pca9555 7 GPIO_ACTIVE_LOW>;
+		};
+
+		led_internet: led-internet {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_WAN_ONLINE;
+			gpios = <&pca9555 0 GPIO_ACTIVE_LOW>;
+			linux,default-trigger = "pon0-online";
 		};
 	};
 
@@ -125,13 +180,6 @@
 		mux {
 			function = "pon";
 			groups = "pon_tx_disable_gpio";
-		};
-	};
-
-	pcm_spi_pins: pcm-spi-pins {
-		mux {
-			function = "pcm_spi";
-			groups = "pcm_spi";
 		};
 	};
 
@@ -172,6 +220,7 @@
 			output-enable;
 		};
 	};
+
 
 	tx_ben_hog: tx-ben-hog {
 		gpio-hog;
@@ -409,14 +458,22 @@
 };
 
 &mdio {
-	reset-gpios = <&en7581_pinctrl 30 GPIO_ACTIVE_LOW>;
-	reset-delay-us = <15000>;
-	reset-post-delay-us = <68000>;
 
 	phy_2p5g: ethernet-phy@7 {
-		compatible = "ethernet-phy-ieee802.3-c45";
 		reg = <7>;
-		realtek,aldps-enable;
+		reset-gpios = <&en7581_pinctrl 30 GPIO_ACTIVE_LOW>;
+		reset-assert-us = <15000>;
+		reset-deassert-us = <68000>;
+		leds {
+		#address-cells = <1>;
+		#size-cells = <0>;
+			led@0 {
+		 		reg = <0>;
+		 		color = <LED_COLOR_ID_GREEN>;
+		 		function = LED_FUNCTION_LAN;
+		 		function-enumerator = <1>;
+		 		};
+		  	};
 	};
 };
 
@@ -468,7 +525,6 @@
 	status = "okay";
 };
 
-
 &gsw_phy1 {
 	interrupts = <1>;
 	status = "okay";
@@ -492,16 +548,37 @@
 
 &i2c0 {
 	status = "okay";
-
 	an4475_bosa: optical-front-end@51 {
-		
 		compatible = "fiberhome,hg5x-bosa", "airoha,paged-bosa";
 		reg = <0x51>;
 		fiberhome,ben-active-high;
 		tx-disable-gpios = <&en7581_pinctrl 38 GPIO_ACTIVE_HIGH>;
+		nvmem-cells = <&pon_calibration>;
+		nvmem-cell-names = "calibration";
 		status = "okay";
 	};
+
+	pca9555: gpio@20 {
+		compatible = "nxp,pca9555";
+		reg = <0x20>;
+		gpio-controller;
+		#gpio-cells = <2>;
+	};
 };
+
+/* 换总线的备选写法（与上面同一份，只是换个控制器）：
+ *
+ * &i2c1 {
+ *	status = "okay";
+ *
+ *	pca9555: gpio@20 {
+ *		compatible = "nxp,pca9555";
+ *		reg = <0x20>;
+ *		gpio-controller;
+ *		#gpio-cells = <2>;
+ *	};
+ * };
+ */
 
 &pon_pcs {
 	status = "okay";
@@ -515,11 +592,6 @@
 	nvmem-cell-names = "pon-serial";
 	data-path = <&gdm2>;
 	status = "okay";
-};
-
-&an4475_bosa {
-	nvmem-cell-names = "calibration";
-	nvmem-cells = <&pon_calibration>;
 };
 
 &gdm2 {
@@ -569,28 +641,38 @@
 	};
 };
 
-&pcm_spi {
-	status = "okay";
-
-	pinctrl-names = "default";
-	pinctrl-0 = <&pcm_spi_pins>;
-
-	resets = <&scuclk EN7581_SFC2_PCM_RST>;
-	reset-names = "pcm";
-
-	fsl: fsl@0 {
-		compatible = "fiberhome,an4475-fsl";
-		reg = <0>;
-
-		/* 原厂 FDT：20MHz、CPOL+CPHA = mode 3 */
-		spi-max-frequency = <20000000>;
-		spi-cpol;
-		spi-cpha;
-
-		/* GPIO4（pad17）低有效；原厂 rcS 是「低 1s → 高 1s」。
-		 * 这里只声明线，时序交给端点驱动，且不要在每次 open 时执行。 */
-		reset-gpios = <&en7581_pinctrl 4 GPIO_ACTIVE_LOW>;
-
-		status = "disabled";
-	};
-};
+/* ---- 语音接口（PCM/SPI + fsl）暂不写 -------------------------------
+ *
+ * 这里原本挂着 &pcm_spi { ... fsl@0 { ... } }，但 an7581.dtsi **没有**
+ * pcm_spi 这个 label（全树只有 U-Boot 的 pinctrl 补丁提到 pcm_spi 引脚组），
+ * dtc 会直接报：
+ *
+ *   ERROR (phandle_references): Reference to non-existent node or label
+ *   "pcm_spi"
+ *
+ * 也就是说这不是"运行期不工作"，而是编不过。另外 fsl 的
+ * compatible = "fiberhome,an4475-fsl" 在本树里也没有对应驱动。
+ *
+ * 等两件事都齐了再放开（引脚组那段在 &en7581_pinctrl 里也一并注释好了）：
+ *
+ * &pcm_spi {
+ *	status = "okay";
+ *	pinctrl-names = "default";
+ *	pinctrl-0 = <&pcm_spi_pins>;
+ *	resets = <&scuclk EN7581_SFC2_PCM_RST>;
+ *	reset-names = "pcm";
+ *
+ *	fsl: fsl@0 {
+ *		compatible = "fiberhome,an4475-fsl";
+ *		reg = <0>;
+ *		spi-max-frequency = <20000000>;// 原厂 FDT：20MHz、mode 3
+ *		spi-cpol;
+ *		spi-cpha;
+ *		reset-gpios = <&en7581_pinctrl 4 GPIO_ACTIVE_LOW>;
+ *		status = "disabled";
+ *	};
+ * };
+ *
+ * 注：原厂 rcS 对这个端点做「低 1s → 高 1s」复位，时序要放在驱动里，
+ * 不能每 open 一次就复位一次。
+ */
