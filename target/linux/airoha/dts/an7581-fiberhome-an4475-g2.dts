@@ -119,9 +119,13 @@
 };
 
 &en7581_pinctrl {
-	gpio-ranges = <&en7581_pinctrl 0 13 47>;
+	gpio-ranges = <&en7581_pinctrl 0 13 50>;
 
 	pon_pins: pon-pins {
+		mux {
+			function = "pon";
+			groups = "pon_tx_disable_gpio";
+		};
 	};
 
 	pcm_spi_pins: pcm-spi-pins {
@@ -183,16 +187,6 @@
 		line-name = "gpon-power";
 	};
 
-};
-
-&xpon_mac {
-	pinctrl-names = "default";
-	pinctrl-0 = <&pon_pins>;
-	optical-front-end = <&an4475_bosa>;
-	nvmem-cells = <&pon_serial>;
-	nvmem-cell-names = "pon-serial";
-	data-path = <&gdm2>;
-	status = "okay";
 };
 
 &snfi {
@@ -512,6 +506,15 @@
 	status = "okay";
 };
 
+&xpon_mac {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pon_pins>;
+	optical-front-end = <&an4475_bosa>;
+	nvmem-cells = <&pon_serial>;
+	nvmem-cell-names = "pon-serial";
+	data-path = <&gdm2>;
+	status = "okay";
+};
 
 &an4475_bosa {
 	nvmem-cell-names = "calibration";
