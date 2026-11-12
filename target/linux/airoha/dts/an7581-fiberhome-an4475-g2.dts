@@ -473,8 +473,6 @@
 
 &npu {
 	status = "okay";
-	firmware-name = "airoha/en7581_MT7996_npu_rv32.bin",
-			"airoha/en7581_MT7996_npu_data.bin";
 };
 
 &eth {
@@ -503,16 +501,6 @@
 		reset-gpios = <&en7581_pinctrl 30 GPIO_ACTIVE_LOW>;
 		reset-assert-us = <15000>;
 		reset-deassert-us = <68000>;
-		leds {
-		#address-cells = <1>;
-		#size-cells = <0>;
-			led@0 {
-		 		reg = <0>;
-		 		color = <LED_COLOR_ID_GREEN>;
-		 		function = LED_FUNCTION_LAN;
-		 		function-enumerator = <1>;
-		 		};
-		  	};
 	};
 };
 
