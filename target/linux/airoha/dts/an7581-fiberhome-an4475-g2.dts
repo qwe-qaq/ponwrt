@@ -7,6 +7,8 @@
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/leds/common.h>
 #include <dt-bindings/pwm/pwm.h>
+#include <dt-bindings/clock/en7523-clk.h>
+#include <dt-bindings/reset/airoha,en7581-reset.h>
 #include "an7581.dtsi"
 
 / {
@@ -183,6 +185,13 @@
 		};
 	};
 
+	downstream_pon_spi_pins: downstream-pon-spi-pins {
+		mux {
+			function = "pcm_spi";
+			groups = "pcm_spi";
+		};
+	};
+
 	mdio_pins: mdio-pins {
 		mux {
 			function = "mdio";
@@ -240,6 +249,35 @@
 
 &snfi {
 	status = "okay";
+};
+
+&{/soc} {
+	pcm_spi: spi@1fbd4000 {
+		compatible = "airoha,en7581-spi", "airoha,spi";
+		reg = <0x0 0x1fbd4000 0x0 0x140>;
+
+		clocks = <&scuclk EN7523_CLK_SPI>;
+		clock-names = "spi";
+		resets = <&scuclk EN7581_SFC2_PCM_RST>;
+		reset-names = "pcm";
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&downstream_pon_spi_pins>;
+
+		status = "disabled";
+
+		fsl: fsl@0 {
+			compatible = "fiberhome,an4475-fsl";
+			reg = <0>;
+			spi-max-frequency = <20000000>;
+			spi-cpol;
+			spi-cpha;
+			reset-gpios = <&en7581_pinctrl 4 GPIO_ACTIVE_LOW>;
+		};
+	};
 };
 
 &spi_nand {
@@ -565,6 +603,11 @@
 		gpio-controller;
 		#gpio-cells = <2>;
 	};
+
+	downstream_bosa: optical-front-end@63 {
+		compatible = "fiberhome,ux3326s";
+		reg = <0x63>;
+	};
 };
 
 /* 换总线的备选写法（与上面同一份，只是换个控制器）：
@@ -641,39 +684,3 @@
 		};
 	};
 };
-
-/* ---- 语音接口（PCM/SPI + fsl）暂不写 -------------------------------
- *
- * 这里原本挂着 &pcm_spi { ... fsl@0 { ... } }，但 an7581.dtsi **没有**
- * pcm_spi 这个 label（全树只有 U-Boot 的 pinctrl 补丁提到 pcm_spi 引脚组），
- * dtc 会直接报：
- *
- *   ERROR (phandle_references): Reference to non-existent node or label
- *   "pcm_spi"
- *
- * 也就是说这不是"运行期不工作"，而是编不过。另外 fsl 的
- * compatible = "fiberhome,an4475-fsl" 在本树里也没有对应驱动。
- *
- * 等两件事都齐了再放开（引脚组那段在 &en7581_pinctrl 里也一并注释好了）：
- *
- * &pcm_spi {
- *	status = "okay";
- *	pinctrl-names = "default";
- *	pinctrl-0 = <&pcm_spi_pins>;
- *	resets = <&scuclk EN7581_SFC2_PCM_RST>;
- *	reset-names = "pcm";
- *
- *	fsl: fsl@0 {
- *		compatible = "fiberhome,an4475-fsl";
- *		reg = <0>;
- *		spi-max-frequency = <20000000>;// 原厂 FDT：20MHz、mode 3
- *		spi-cpol;
- *		spi-cpha;
- *		reset-gpios = <&en7581_pinctrl 4 GPIO_ACTIVE_LOW>;
- *		status = "disabled";
- *	};
- * };
- *
- * 注：原厂 rcS 对这个端点做「低 1s → 高 1s」复位，时序要放在驱动里，
- * 不能每 open 一次就复位一次。
- */
