@@ -653,30 +653,39 @@
 	pinctrl-0 = <&pcie0_rst_pins>;
 
 	pcie@0,0 {
-		device_type = "pci";
 		reg = <0x0000 0 0 0 0>;
-		#address-cells = <3>;
-		#size-cells = <2>;
 
-		wifi_main: wifi@0,0 {
+		wifi@0,0 {
 			compatible = "mediatek,mt76";
 			reg = <0x0000 0 0 0 0>;
-			#address-cells = <1>;
-			#size-cells = <0>;
+		};
+	};
+};
 
-			airoha,npu = <&npu>;
-			airoha,eth = <&eth>;
+&pcie1 {
+	status = "okay";
+	max-link-speed = <2>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&pcie1_rst_pins>;
+
+	pcie@0,0 {
+		reg = <0x0000 0 0 0 0>;
+
+		wifi@0,0 {
+			compatible = "mediatek,mt76";
+			reg = <0x0000 0 0 0 0>;
 			nvmem-cells = <&wifi_eeprom>;
 			nvmem-cell-names = "eeprom";
+			mediatek,eeprom-merge-otp;
+			airoha,npu = <&npu>;
+			airoha,eth = <&eth>;
 			band@0 {
-				/* 2.4 GHz */
 				reg = <0>;
 				nvmem-cells = <&wifi_mac_2g4>;
 				nvmem-cell-names = "mac-address";
 			};
 
 			band@1 {
-				/* 5 GHz */
 				reg = <1>;
 				nvmem-cells = <&wifi_mac_5g>;
 				nvmem-cell-names = "mac-address";
