@@ -104,6 +104,20 @@ h3c,hm2004-du)
 	json_close_object
 	json_close_object
 	;;
+fiberhome,an4475-g2)
+	identity_available=1
+	json_add_object identity
+	json_add_object targets
+	json_add_object factory
+	json_add_object fields
+	identity_field pon_sn pon-sn 162 12 pon-ascii12
+	identity_field pon_mac mac 64 6 mac-binary6
+	identity_field lan_base_mac mac 70 6 mac-binary6
+	json_close_object
+	json_close_object
+	json_close_object
+	json_close_object
+	;;
 esac
 
 board_config_flush
