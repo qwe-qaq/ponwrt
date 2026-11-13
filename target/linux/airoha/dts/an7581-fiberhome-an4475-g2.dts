@@ -749,6 +749,19 @@
 		reset-gpios = <&en7581_pinctrl 30 GPIO_ACTIVE_LOW>;
 		reset-assert-us = <15000>;
 		reset-deassert-us = <68000>;
+
+		/* Restores the 2.5G-port LED node (mt7530-0:07:green:lan-1).
+		 * Delete this block if the PHY LED is intentionally disabled. */
+		leds {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			led@0 {
+				reg = <0>;
+				color = <LED_COLOR_ID_GREEN>;
+				function = LED_FUNCTION_LAN;
+				function-enumerator = <1>;
+			};
 		};
 	};
 };
@@ -933,10 +946,17 @@
 
 	pcie@0,0 {
 		reg = <0x0000 0 0 0 0>;
+		/* PCI 桥节点必须声明 3/2，否则下面 wifi@0,0 的 reg
+		 * 会被 dtc 按默认 2/1 校验，报 invalid length。 */
+		#address-cells = <3>;
+		#size-cells = <2>;
 
 		wifi@0,0 {
 			compatible = "mediatek,mt76";
 			reg = <0x0000 0 0 0 0>;
+			/* band 用 reg = <0>/<1> 做索引，父节点按 1/0 解析 */
+			#address-cells = <1>;
+			#size-cells = <0>;
 
 			nvmem-cells = <&wifi_eeprom>;
 			nvmem-cell-names = "eeprom";
@@ -968,6 +988,8 @@
 
 	pcie@0,0 {
 		reg = <0x0000 0 0 0 0>;
+		#address-cells = <3>;
+		#size-cells = <2>;
 
 		/* 与 pcie0 下的 wifi@0,0 完全一致，原因见上面那段长注释：
 		 * 哪条 PCIe 挂 0x7993 是硬件决定的，DTS 层没法判断，
@@ -975,6 +997,9 @@
 		wifi@0,0 {
 			compatible = "mediatek,mt76";
 			reg = <0x0000 0 0 0 0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
 			nvmem-cells = <&wifi_eeprom>;
 			nvmem-cell-names = "eeprom";
 			mediatek,eeprom-merge-otp;
