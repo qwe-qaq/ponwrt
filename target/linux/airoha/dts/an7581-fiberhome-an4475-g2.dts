@@ -536,6 +536,14 @@
 
 &usb1 {
 	status = "okay";
+	/*
+	 * Only the USB2 companion port is wired on this panel; the SuperSpeed
+	 * lane of usb1_phy is not routed. Keep just the USB2 phy and mask U3
+	 * port 0, or xhci_mtk_host_enable() polls STS1_U3_MAC_RST forever
+	 * (ip_pw_sts1 reads 0x3d0f, bit16 never sets) and probe fails -110.
+	 */
+	mediatek,u3p-dis-msk = <0x1>;
+	phys = <&usb1_phy PHY_TYPE_USB2>;
 	vusb33-supply = <&reg_3p3v>;
 	#address-cells = <1>;
 	#size-cells = <0>;
