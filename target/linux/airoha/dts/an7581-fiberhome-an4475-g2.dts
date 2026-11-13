@@ -169,7 +169,7 @@
 
 		led-usb2: led-usb2 {
 			label = "green:usb2";
-			gpios = <&pca9555 6 GPIO_ACTIVE_LOW>;
+			gpios = <&pca9555 7 GPIO_ACTIVE_LOW>;
 			default-state = "keep";
 		};
 
