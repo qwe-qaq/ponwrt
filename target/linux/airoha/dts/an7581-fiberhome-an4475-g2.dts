@@ -176,15 +176,15 @@
 		led_usb: led-usb {
 			label = "green:usb";
 			gpios = <&pca9555 8 GPIO_ACTIVE_LOW>;
-			default-state = "off";
+			linux,default-trigger = "usbport";
+			trigger-sources = <&usb_port2>;
 		};
 
 		/* 2.5G 光电复用口的光口（SFP 笼）指示，与 PHY 侧无关 */
 		led_2g5_fiber: led-2g5-fiber {
 			label = "green:2g5-fiber";
 			gpios = <&pca9555 9 GPIO_ACTIVE_LOW>;
-			linux,default-trigger = "usbport";
-			trigger-sources = <&usb_port2>;
+			default-state = "off";
 		};
 
 		led_voice1: led-voice-1 {
