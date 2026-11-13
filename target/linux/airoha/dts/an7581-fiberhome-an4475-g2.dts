@@ -583,7 +583,7 @@
 		status = "okay";
 	};
 
-	wan_2p5g: ethernet-port@1 {
+	phy_2p5g: ethernet-port@1 {
 		compatible = "airoha,eth-port";
 		reg = <1>;
 		pcs-handle = <&usb_pcs>;
