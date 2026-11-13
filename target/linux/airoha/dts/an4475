@@ -7,7 +7,49 @@
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/leds/common.h>
 #include <dt-bindings/pwm/pwm.h>
+#include <dt-bindings/clock/en7523-clk.h>
+#include <dt-bindings/reset/airoha,en7581-reset.h>
 #include "an7581.dtsi"
+
+/* ==========================================================================
+ * 2.5G 光电复用口（LAN1）
+ *
+ * 硬件：gdm4 的 eth_pcs SerDes 走同一对差分，两个对端二选一
+ *       电口 -> 板载 RTL8221B / YT8821（MDIO 7，HSGMII 2.5G）
+ *       光口 -> 光模块直连 SerDes（无 PHY，链路靠 PCS 带内状态）
+ *       媒体选择由 GPIO22/23 完成（原厂电平：电口 22=0 23=1；光口 22=1 23=0）
+ *
+ * 为什么是编译期开关而不是运行时切换：
+ *   phylink 在 MLO_AN_INBAND 下只要存在 phydev 就一律取 PHY 状态、
+ *   彻底忽略 PCS 带内状态（phylink.c: phylink_ethtool_ksettings_get()
+ *   "If there is a phy attached, then use the reported settings from the phy"）。
+ *   也就是说 “phy-handle + managed=in-band-status” 不能共存，
+ *   phy-mode 又只在 probe 时读一次（of_get_phy_mode）。
+ *   所以 电口/光口 必须对应两份不同的 DT —— 这与原厂“Web 改完必须重启”
+ *   的语义一致，只是把“重启后由驱动读配置”换成了“编译时选定”。
+ *
+ * 切换方法：把下面 0 改成 1，重新编译 DTB（不改其它任何一行）。
+ * ========================================================================== */
+#define AN4475_LAN1_MEDIA_FIBER		0
+/* 光模块速率：2.5G 光模块用 "2500base-x"；1G 光模块改成 "1000base-x" */
+#define AN4475_LAN1_FIBER_PHYMODE	"2500base-x"
+
+/* ==========================================================================
+ * 下行 PON（PON-SPI 上的 fsl OLT MAC + UX3326S 光模块）总开关
+ *
+ * 0 = 只保留拓扑描述，不启用：
+ *     - spi@1fbd4000 保持 disabled，fsl 子节点不实例化；
+ *     - GPIO4（fsl 复位）用 hog 按住，状态确定、不浮空。
+ * 1 = 启用：
+ *     - spi@1fbd4000 改 okay，pinctrl 把 pin18..25 切成 pcm_spi；
+ *     - 删掉 GPIO4 的 hog，把复位交给 fsl 的 reset-gpios。
+ *
+ * !! 现在只能填 0。主线与 ponwrt 都没有 0x1fbd4000 这颗 SPI 控制器的
+ *    驱动（spi-airoha-snfi 只 match 0x1fa10000 的 SNAND），填 1 也只是
+ *    让一个没人 probe 的节点变成 okay，fsl 仍然起不来。
+ *    等 drivers/spi/spi-airoha-pcm.c 进树后，这一行改成 1 即可。
+ * ========================================================================== */
+#define AN4475_DOWNSTREAM_PON		0
 
 / {
 	model = "FiberHome AN4475-G2";
@@ -34,6 +76,12 @@
 		reg = <0x0 0x80000000 0x0 0x20000000>;
 	};
 
+	/* 原厂用的是 gpio-keys-polled，且只有一个 reset_ 键：
+	 *   gpios = <0 GPIO_ACTIVE_LOW>;  linux,code = <KEY_RESTART>;
+	 * 这里换成中断式 gpio-keys（省掉 poll-interval 100ms 的常驻开销）。
+	 * key-wlan(GPIO17) 原厂无对应项，是按面板有 WPS 键倒推的；
+	 * 若该键在系统里自触发，先把它删掉再排查。
+	 */
 	keys {
 		compatible = "gpio-keys";
 
@@ -52,6 +100,15 @@
 		};
 	};
 
+	/* 证据等级说明（原厂 DTB /leds 只有 4 个子节点：
+	 *   pwr_led              GPIO35 AL   -> ✅ 与下面 led_power 一致
+	 *   phy_tx_power_disable GPIO38 AH   -> 由 &an4475_bosa 的 tx-disable-gpios 表达
+	 *   phy_tx_ben           GPIO41 AH   -> 已删除 hog，交给 PON 硬件（见 pinctrl 段）
+	 *   an8811_reset         GPIO31 AL   -> 已改为 en8811_reset_hog
+	 * 下面 led_wlan(15) 与 led_lan2..5(43..46) 在原厂 DTB / led_cfg 里
+	 * 都找不到对应项（led_cfg 里所有 *_led 全是 value '0'），属于按面板
+	 * 实测补的。若上机发现某颗灯乱闪或常亮，先怀疑这几行。
+	 */
 	leds {
 		compatible = "gpio-leds";
 
@@ -63,36 +120,73 @@
 			panic-indicator;
 		};
 
-		led_lan1: led-lan1 {
+		led_wlan: led-wlan {
 			color = <LED_COLOR_ID_GREEN>;
-			function = LED_FUNCTION_LAN;
-			function-enumerator = <1>;
-			gpios = <&en7581_pinctrl 43 GPIO_ACTIVE_LOW>;
+			function = LED_FUNCTION_WLAN;
+			gpios = <&en7581_pinctrl 15 GPIO_ACTIVE_LOW>;
 		};
 
 		led_lan2: led-lan2 {
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_LAN;
 			function-enumerator = <2>;
-			gpios = <&en7581_pinctrl 44 GPIO_ACTIVE_LOW>;
+			gpios = <&en7581_pinctrl 43 GPIO_ACTIVE_LOW>;
 		};
 
 		led_lan3: led-lan3 {
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_LAN;
 			function-enumerator = <3>;
-			gpios = <&en7581_pinctrl 45 GPIO_ACTIVE_LOW>;
+			gpios = <&en7581_pinctrl 44 GPIO_ACTIVE_LOW>;
 		};
 
 		led_lan4: led-lan4 {
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_LAN;
 			function-enumerator = <4>;
+			gpios = <&en7581_pinctrl 45 GPIO_ACTIVE_LOW>;
+		};
+
+		led_lan5: led-lan5 {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <5>;
 			gpios = <&en7581_pinctrl 46 GPIO_ACTIVE_LOW>;
 		};
 
+		/* ---- LOS / USB 两颗仍无实证，量到焊盘再开 -------------------
+		 * LOS：led_cfg 里 los_led=0，脚本和原厂 DTB 都没有引脚；
+		 * USB：整个镜像搜不到任何引用。
+		 *
+		 * led_los: led-los {
+		 *	color = <LED_COLOR_ID_RED>;
+		 *	function = LED_FUNCTION_WAN;
+		 *	gpios = <&en7581_pinctrl 19 GPIO_ACTIVE_LOW>;
+		 *	linux,default-trigger = "pon0-los";
+		 * };
+		 *
+		 * led_usb: led-usb {
+		 *	color = <LED_COLOR_ID_GREEN>;
+		 *	function = LED_FUNCTION_USB;
+		 *	gpios = <&en7581_pinctrl 34 GPIO_ACTIVE_LOW>;
+		 * };
+		 */
 	};
 
+	/* PON LED: stock FDT
+	 *   pwmleds { lan4_green { label = "pon:green";
+	 *                         pwms = <&pwm 0xa 0x3d0900 0x1>; }; };
+	 * i.e. PWM channel 10 (0xa), period 0x3d0900 = 4 ms, polarity 1
+	 * (= PWM_POLARITY_INVERTED), max-brightness 0xff. The node name
+	 * "lan4_green" in the vendor DTB is a copy-paste leftover; the label is
+	 * what matters.
+	 *
+	 * NOTE: the vendor PWM driver supports inverted polarity, the mainline
+	 * airoha PWM driver does NOT (pwm_apply_state() rejects it, which made
+	 * leds_pwm probe fail with -22). Flags are therefore 0 (normal) here.
+	 * If the LED is wired active-low, brightness semantics become inverted
+	 * vs. stock (0 = on, 255 = off). Verify visually after flashing.
+	 */
 	pwmleds {
 		compatible = "pwm-leds";
 		pinctrl-names = "default";
@@ -100,9 +194,70 @@
 
 		led_pon: led-pon {
 			label = "pon:green";
-			pwms = <&en7581_pwm 10 4000000 PWM_POLARITY_INVERTED>;
+			pwms = <&en7581_pwm 10 4000000 0>;
 			max-brightness = <255>;
 			linux,default-trigger = "pon0-registration";
+		};
+	};
+
+
+	/* PCA9555 LED expander, 7-bit address 0x20.
+	 *
+	 * Stock firmware reaches it through the vendor-private
+	 *   kdrv_debug i2c writeWord 2 0x20 6 0x0000
+	 *   kdrv_debug i2c writeWord 2 0x20 2 0xff3f
+	 * "channel 2" is NOT /dev/i2c-2 and NOT either mt7621 controller:
+	 * it is a GPIO bit-banged bus. Verified on the running board by
+	 * bit-banging every free GPIO pair (sysfs, open-drain emulation):
+	 *   SDA = GPIO 29 (pin 42), SCL = GPIO 28 (pin 41)
+	 * 5/5 repeated scans ACKed 0x20 only; full PCA9555 read/write
+	 * transactions ACKed all bytes, reg0 reads back 0xff3f (exactly the
+	 * value the vendor script writes), and writes to reg2/reg6 read back
+	 * correctly. GPIO 13/14 used as a negative control: all NACK.
+	 * Cross-check: stock `sys modifybit 1fa20218 16 1` touches bit16,
+	 * which maps to GPIO 29 (GPIO = bit + 13, confirmed by the
+	 * "set gpio 30 to force-gpio mode" comment at bit 17).
+	 *
+	 * Do NOT put this chip under &i2c1: the i2c1 group shares pin14/15
+	 * with mdio, which drives the 2.5G PHY. Requires kmod-i2c-gpio.
+	 */
+	i2c_gpio: i2c-gpio {
+		compatible = "i2c-gpio";
+		sda-gpios = <&en7581_pinctrl 29 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		scl-gpios = <&en7581_pinctrl 28 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		i2c-gpio,delay-us = <10>;	/* ~50 kHz, conservative */
+		i2c-gpio,timeout-ms = <100>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		pca9555: gpio@20 {
+			compatible = "nxp,pca9555";
+			reg = <0x20>;
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+	};
+
+	leds_expander: leds-expander {
+		compatible = "gpio-leds";
+
+		led_sys: led-sys {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_STATUS;
+			gpios = <&pca9555 6 GPIO_ACTIVE_LOW>;
+			default-state = "keep";
+		};
+
+		led_vpn: led-vpn {
+			label = "green:vpn";
+			gpios = <&pca9555 7 GPIO_ACTIVE_LOW>;
+		};
+
+		led_internet: led-internet {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_WAN_ONLINE;
+			gpios = <&pca9555 0 GPIO_ACTIVE_LOW>;
+			linux,default-trigger = "pon0-online";
 		};
 	};
 
@@ -116,22 +271,23 @@
 		regulator-name = "fixed-3.3V";
 	};
 
-	fmcs: fmcs {
-		compatible = "h3c,fmcs";
-		spi-controller = <&snfi>;
-		fpga-spi-int-gpios = <&en7581_pinctrl 23 GPIO_ACTIVE_HIGH>;
-		fpga-clk-gpios = <&en7581_pinctrl 29 GPIO_ACTIVE_HIGH>;
-		fpga-data-gpios = <&en7581_pinctrl 30 GPIO_ACTIVE_HIGH>;
-		nvmem-cell-names = "mac-address";
-		nvmem-cells = <&eth_base_mac 6>;
-		status = "disabled";
-	};
 };
 
 &en7581_pinctrl {
-	gpio-ranges = <&en7581_pinctrl 0 13 47>;
+	gpio-ranges = <&en7581_pinctrl 0 13 50>;
 
 	pon_pins: pon-pins {
+		mux {
+			function = "pon";
+			groups = "pon_tx_disable_gpio";
+		};
+	};
+
+	downstream_pon_spi_pins: downstream-pon-spi-pins {
+		mux {
+			function = "pcm_spi";
+			groups = "pcm_spi";
+		};
 	};
 
 	mdio_pins: mdio-pins {
@@ -172,34 +328,213 @@
 		};
 	};
 
-	tx_ben_hog: tx-ben-hog {
-		gpio-hog;
-		gpios = <41 GPIO_ACTIVE_HIGH>;
-		output-high;
-		line-name = "phy-tx-ben";
+	/* RESERVED - DO NOT reference from &i2c1 while &switch uses &mdio_pins.
+	 * The "mdio" and "i2c1" groups are the SAME two physical pins:
+	 *   pin 14 (gpio1) + pin 15 (gpio2)
+	 * airoha_pmxops.strict = true, and &switch already claims both pins for
+	 * the MDIO bus that drives ethernet-phy@7 (RTL8221B). Applying this
+	 * state from a second device makes that device's probe fail with -EBUSY,
+	 * or steals the pins away from MDIO. Kept here as documentation only.
+	 */
+	i2c1_pins: i2c1-pins {
+		mux {
+			function = "i2c";
+			groups = "i2c1";
+		};
 	};
 
+	/* ---- GPIO41 (pin 54)：不要在这里 hog ----------------------------
+	 * 原厂 DTB 把它写成 LED 节点 phy_tx_ben（default-state="on"），
+	 * 因为厂商平台没有 PON 的 pinmux，只能软件拉高当 TX burst enable。
+	 *
+	 * 我们走的是 &xpon_mac + pinctrl，而 pon 的 pin 组是：
+	 *   pon_pins                = { 49, 50, 51, 52, 53, 54 }
+	 *   pon_tx_disable_gpio_pins= { 49, 50, 52, 53, 54 }   <- 去掉 51
+	 * 54 号 pin 就是 GPIO41。也就是说只要启用 pon pinctrl，
+	 * 这根线的 TX_BEN 功能由 PON MAC 硬件接管，软件 GPIO 不再有效。
+	 *
+	 * 更要命的是 airoha_pmxops.strict = true，pinctrl core 的 pin_request()
+	 * 在 strict 下会发现 pin 的 gpio_owner 已被 hog 占着，直接返回 -EBUSY，
+	 * 导致 xpon_mac probe 时 default pinctrl 应用失败 —— 上行 PON 直接不启动。
+	 * 所以这里必须让出 GPIO41，原厂那套 "LED 常亮" 的写法不能照抄。
+	 * （原厂写法：leds/phy_tx_ben { gpios = <&pinctrl 41 0>;
+	 *   default-state = "on"; } —— 仅记录，不要加回来。）
+	 */
+
+	/* GPIO31 = 2.5G PHY（Airoha EN8811，profile.cfg: TCSUPPORT_ETHER_8811=y）
+	 * 的独立复位，低有效。原厂 DTB 用 LED 节点实现：
+	 *   an8811_reset { gpios = <&pinctrl 31 GPIO_ACTIVE_LOW>;
+	 *                  default-state = "off"; }
+	 * default-state="off" 是**逻辑** 0，ACTIVE_LOW 下即物理高 = 释放复位，
+	 * 也就是上电后必须把这颗 PHY 放开才能工作。
+	 *
+	 * 板子上电默认电平取决于外部上下拉，不能指望。用 hog 显式配一次：
+	 *   电口：output-low  -> 逻辑 0 -> 物理高 -> 释放（正常运行）
+	 *   光口：output-high -> 逻辑 1 -> 物理低 -> 保持复位（和 GPIO30 一起按住）
+	 *
+	 * 注意与 GPIO30 的分工：rcS 里 "cpu reset 2.5g phy" 打的是 GPIO30
+	 * （DTS 里作为 phy_2p5g 的 reset-gpios），GPIO31 是 PHY 侧的另一根复位，
+	 * 两根都在原厂 DTB/脚本里出现过，缺一不可。
+	 */
+	en8811_reset_hog: en8811-reset-hog {
+		gpio-hog;
+		gpios = <31 GPIO_ACTIVE_LOW>;
+#if AN4475_LAN1_MEDIA_FIBER
+		output-high;
+#else
+		output-low;
+#endif
+		line-name = "en8811-reset";
+	};
+
+	/* GPIO4 = 下行 PON ASIC（fsl）复位，低有效。
+	 * 原厂 rcS 对它做 0->1 脉冲：
+	 *   kdrv_debug gpio write 4 0   # cpu reset asic
+	 *   kdrv_debug gpio write 4 1
+	 *
+	 * 当前 DOWNSTREAM_PON=0，pcm_spi 是 disabled、fsl 不 probe，
+	 * 没有任何驱动会管这根线。上电默认电平不确定，所以按住复位：
+	 *   GPIO_ACTIVE_LOW + output-high -> 逻辑有效 -> 物理低 -> 保持复位
+	 *
+	 * 这也是 strict 模式的硬要求：一旦启用 pcm_spi，fsl 的 reset-gpios
+	 * 要自己控制 GPIO4，hog 先占住会让 pin_request 返回 -EBUSY，
+	 * fsl probe 直接失败。所以两者必须互斥，用同一个开关切。
+	 */
+#if AN4475_DOWNSTREAM_PON
+	/* 交给 fsl 的 reset-gpios，不在这里 hog。 */
+#else
+	fsl_reset_hog: fsl-reset-hog {
+		gpio-hog;
+		gpios = <4 GPIO_ACTIVE_LOW>;
+		output-high;
+		line-name = "fsl-reset";
+	};
+#endif
+
+	/* GPIO20：原厂 DTB/脚本里都查不到这根线的操作（rcS 只碰过
+	 * GPIO4 / 13 / 14 / 29 / 30 / 38 / 41 / 54），拉高是实测倒推的
+	 * PON 供电使能。若上机发现 pon0 无光功率，第一个怀疑对象就是它。
+	 */
 	gpon_power_hog: gpon-power-hog {
 		gpio-hog;
 		gpios = <20 GPIO_ACTIVE_HIGH>;
 		output-high;
 		line-name = "gpon-power";
 	};
+	/* ---- 2.5G 口光/电媒体选择 ----------------------------------------
+	 * 原厂电平：电口 22=0 / 23=1，光口 22=1 / 23=0。
+	 * 以前这里写死成电口，并把“驱动这两根线救不回 RX”归因于厂商还改了
+	 * SerDes 路由（/proc/tc3162/hsgmii_eth_mac_dbg "change mode"）。
+	 * 那个 /proc 只是厂商自己的封装：主线走 phylink，pcs_config() 会按
+	 * DT 的 phy-mode 直接把 eth_pcs 配成 2500base-x，等价于 mode 5，
+	 * 所以不需要再抄 /proc 那一套。
+	 */
+	combo_mux_sel0_hog: combo-mux-sel0-hog {
+		gpio-hog;
+		gpios = <22 GPIO_ACTIVE_HIGH>;
+#if AN4475_LAN1_MEDIA_FIBER
+		output-high;
+#else
+		output-low;
+#endif
+		line-name = "combo-mux-sel0";
+	};
 
-};
+	combo_mux_sel1_hog: combo-mux-sel1-hog {
+		gpio-hog;
+		gpios = <23 GPIO_ACTIVE_HIGH>;
+#if AN4475_LAN1_MEDIA_FIBER
+		output-low;
+#else
+		output-high;
+#endif
+		line-name = "combo-mux-sel1";
+	};
 
-&xpon_mac {
-	pinctrl-names = "default";
-	pinctrl-0 = <&pon_pins>;
-	optical-front-end = <&an4475_bosa>;
-	nvmem-cells = <&pon_serial>;
-	nvmem-cell-names = "pon-serial";
-	data-path = <&gdm2>;
-	status = "okay";
+#if AN4475_LAN1_MEDIA_FIBER
+	/* 光口模式下必须把 RTL8221B 按在复位里。
+	 * 它与光模块共用同一对 SerDes 差分，若 PHY 仍上电，两边会同时驱动。
+	 * 注意 gpio-hog 的 output-* 是“逻辑值”，会按 ACTIVE_LOW 反相：
+	 *   GPIO_ACTIVE_LOW + output-high -> 逻辑有效 -> 物理低 -> 复位拉低（assert）
+	 * 写成 output-low 反而会释放复位，这里不要照抄普通 led 的写法。
+	 * 同时 phy@7 一并 disabled，MDIO 上扫不到它，不会误绑定。
+	 */
+	phy_2p5g_reset_hog: phy-2p5g-reset-hog {
+		gpio-hog;
+		gpios = <30 GPIO_ACTIVE_LOW>;
+		output-high;
+		line-name = "phy-2p5g-reset";
+	};
+#endif
+
 };
 
 &snfi {
 	status = "okay";
+};
+
+&{/soc} {
+	/* 下行 PON 的 SPI 主控（PCM-SPI）。
+	 *
+	 * 原厂 DTB 是同一份地址：compatible = "airoha,spi"，status = "okay"，
+	 * spi-num-chipselects = <2>，下面挂两个通用 spidev 从设备
+	 * （CS0 20 MHz / CS1 50 MHz）。也就是说厂商根本没走 SPI 框架：
+	 * fsl_core_fttr_chip.ko 直接 ioremap 0x1fbd4000 操作寄存器，
+	 * 对外只暴露 /dev/fsl_crane_driver。
+	 *
+	 * 主线/ponwrt 目前都没有这颗控制器的驱动：
+	 *   - spi-airoha-snfi.c 只 match "airoha,en7581-snand"（挂在 0x1fa10000）；
+	 *   - patches-6.18 里的 SPI 补丁全部是 SNAND 那条；
+	 *   - 所以这里即便写 okay 也没有任何 driver 会 probe，
+	 *     下面的 fsl 子节点不会实例化、pinctrl 也不会被应用。
+	 *
+	 * 因此默认保持 disabled，由文件顶部的 AN4475_DOWNSTREAM_PON 统一控制
+	 * （status 与 GPIO4 的 hog 互斥，改一个数就够，不会漏改另一半）。
+	 *
+	 * 注意 fsl 的 compatible 必须是 "fiberhome,an4475-g2-fsl"：
+	 * fiberhome-fsl/src/fsl.c 的 of_match_table 只有这一个（带 -g2），
+	 * 写成 "fiberhome,an4475-fsl" 会静默匹配不上 —— 编译、刷机全绿，
+	 * 但 /dev/fsl-* 永远不出现。
+	 */
+	pcm_spi: spi@1fbd4000 {
+		compatible = "airoha,en7581-spi", "airoha,spi";
+		reg = <0x0 0x1fbd4000 0x0 0x140>;
+
+		clocks = <&scuclk EN7523_CLK_SPI>;
+		clock-names = "spi";
+		resets = <&scuclk EN7581_SFC2_PCM_RST>;
+		reset-names = "pcm";
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+		spi-num-chipselects = <2>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&downstream_pon_spi_pins>;
+
+#if AN4475_DOWNSTREAM_PON
+		status = "okay";
+#else
+		status = "disabled";
+#endif
+
+		fsl: fsl@0 {
+			compatible = "fiberhome,an4475-g2-fsl";
+			reg = <0>;
+			spi-max-frequency = <20000000>;
+			/* 原厂 DTB 里控制器带 spi-cpol + spi-cpha（mode 3）。
+			 * fsl_probe() 会无条件改写成 SPI_MODE_0 并把频率压到 10 MHz
+			 * （源码注释：FSL 寄存器编码与 SPI 时序模式无关），
+			 * 所以这两行只是如实记录硬件，不会真正生效。 */
+			spi-cpol;
+			spi-cpha;
+			/* GPIO4 = fsl ASIC reset, low active.
+			 * stock rcS: "kdrv_debug gpio write 4 0" (assert)
+			 *             "kdrv_debug gpio write 4 1" (release)
+			 */
+			reset-gpios = <&en7581_pinctrl 4 GPIO_ACTIVE_LOW>;
+		};
+	};
 };
 
 &spi_nand {
@@ -264,8 +599,8 @@
 			reg = <0x000020 0x000018>;
 		};
 
-		pon_serial: pon-serial@38 {
-			reg = <0x000038 0x000008>;
+		pon_serial: pon-serial@a2 {
+			reg = <0x0000a2 0x00000c>;
 		};
 
 		base_mac: base-mac@40 {
@@ -387,17 +722,21 @@
 
 &usb1 {
 	status = "okay";
-	mediatek,u3p-dis-msk = <0x3>;
-	phys = <&usb1_phy PHY_TYPE_USB2>;
 	vusb33-supply = <&reg_3p3v>;
 	#address-cells = <1>;
 	#size-cells = <0>;
 	usb_port2: port@1 { reg = <1>; #trigger-source-cells = <0>; };
 };
 
-
 &npu {
 	status = "okay";
+	/* Without this property airoha_npu_run_firmware() falls back to the
+	 * generic en7581_npu_{rv32,data}.bin instead of the MT7996 pair.
+	 * Both files exist so probe still succeeds, but WiFi offload firmware
+	 * silently changes. Keep the MT7996 pair explicitly.
+	 */
+	firmware-name = "airoha/en7581_MT7996_npu_rv32.bin",
+			"airoha/en7581_MT7996_npu_data.bin";
 };
 
 &eth {
@@ -422,47 +761,67 @@
 &mdio {
 
 	phy_2p5g: ethernet-phy@7 {
-		compatible = "ethernet-phy-id001c.c849";
+		/* 二选一 BOM：RTL8221B(0x001cc849) 或 YT8821(0x4f51..)。
+		 * 原厂 rcS 自己就在做检测：
+		 *   tce miir 7 2  ->  value=001C (RTL8221B) / value=4F51 (YT8821)
+		 *
+		 * 所以这里**不能**写死 "ethernet-phy-id001c.c849"：
+		 * 那会把 realtek 驱动强行绑到 YT8821 上（fwnode 给的 ID 优先于
+		 * MDIO 读回值），比不写还糟。
+		 *
+		 * 留 C22，让 of_mdiobus 按 reg2/reg3 读真实 ID 再选驱动。
+		 * 不写 compatible 也能被识别（旧式：有 reg 即视为 PHY），
+		 * 但显式写出来与 dtsi 的 gsw_phy1..4 一致。
+		 * 代价是读 ID 发生在复位释放之后，所以下面 68 ms 的
+		 * reset-deassert-us 是硬前提，不能再压小。
+		 */
+		compatible = "ethernet-phy-ieee802.3-c22";
 		reg = <7>;
 		reset-gpios = <&en7581_pinctrl 30 GPIO_ACTIVE_LOW>;
-		reset-assert-us = <10000>;
-		reset-deassert-us = <50000>;
+		reset-assert-us = <15000>;
+		reset-deassert-us = <68000>;
+#if AN4475_LAN1_MEDIA_FIBER
+		/* 光口模式：这颗 PHY 不参与链路，且必须保持复位，
+		 * 否则它的 2500base-x 会与光模块抢同一对差分。 */
+		status = "disabled";
+#endif
+
+		/* Restores the 2.5G-port LED node (mt7530-0:07:green:lan-1).
+		 * Delete this block if the PHY LED is intentionally disabled. */
+		leds {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			led@0 {
+				reg = <0>;
+				color = <LED_COLOR_ID_GREEN>;
+				function = LED_FUNCTION_LAN;
+				function-enumerator = <1>;
+			};
+		};
 	};
 };
 
 &gdm4 {
-	/delete-property/ pcs-handle;
-	#address-cells = <1>;
-	#size-cells = <0>;
+#if AN4475_LAN1_MEDIA_FIBER
+	/* 光口：没有 PHY，链路状态完全由 eth_pcs 的 2500BASE-X 带内同步给出。
+	 * 这里不能出现 phy-handle —— phylink 在 MLO_AN_INBAND 下只要 phydev
+	 * 存在就只认 PHY 状态，会把带内状态整段丢掉，光口永远 link down。
+	 * （不能写 /delete-property/ phy-handle：an7581.dtsi 里 gdm4 本来
+	 *   就没有这个属性，dtc 对“删不存在的属性”会直接报错。）
+	 * pcs-handle 继承自 an7581.dtsi，不用重复。 */
+	phy-mode = AN4475_LAN1_FIBER_PHYMODE;
+	managed = "in-band-status";
+#else
+	phy-handle = <&phy_2p5g>;
+	phy-mode = "2500base-x";
+#endif
+	openwrt,netdev-name = "lan1";
+	nvmem-cell-names = "mac-address";
+	nvmem-cells = <&eth_base_mac 0>;
 	status = "okay";
-
-	lan_2p5g: ethernet-port@0 {
-		compatible = "airoha,eth-port";
-		reg = <0>;
-		pcs-handle = <&eth_pcs>;
-		phy-handle = <&phy_2p5g>;
-		phy-mode = "2500base-x";
-		openwrt,netdev-name = "lan1";
-		nvmem-cell-names = "mac-address";
-		nvmem-cells = <&eth_base_mac 0>;
-	};
-
-	ethernet-port@1 {
-		compatible = "airoha,eth-port";
-		reg = <1>;
-		pcs-handle = <&usb_pcs>;
-		phy-mode = "2500base-x";
-		openwrt,netdev-name = "fttr0";
-		/* No factory MAC for this link; use the LAN block, not voipmac. */
-		nvmem-cell-names = "mac-address";
-		nvmem-cells = <&eth_base_mac 5>;
-
-		fixed-link {
-			speed = <2500>;
-			full-duplex;
-		};
-	};
 };
+
 
 &switch {
 	pinctrl-names = "default";
@@ -502,7 +861,6 @@
 	status = "okay";
 };
 
-
 &gsw_phy1 {
 	interrupts = <1>;
 	status = "okay";
@@ -526,25 +884,59 @@
 
 &i2c0 {
 	status = "okay";
-
 	an4475_bosa: optical-front-end@51 {
-		
 		compatible = "fiberhome,hg5x-bosa", "airoha,paged-bosa";
 		reg = <0x51>;
 		fiberhome,ben-active-high;
 		tx-disable-gpios = <&en7581_pinctrl 38 GPIO_ACTIVE_HIGH>;
+		nvmem-cells = <&pon_calibration>;
+		nvmem-cell-names = "calibration";
 		status = "okay";
 	};
+
+	/* 下行 BOSA（UX3326S）。
+	 *
+	 * 原厂并不是从主机 i2c0 访问它：fsl_core_fttr_chip.ko 里有一套
+	 * 自带的 I2C 桥（寄存器 I2C_BRG_CTRL / I2C_BRG_WDATA / I2C_BRG_RDATA），
+	 * 光模块是挂在那条内部总线后面的，主机侧只能通过 /dev/fsl_crane_driver
+	 * 间接读写。所以这个节点放在 &i2c0 下只是**拓扑描述**：
+	 * 目前没有任何驱动匹配 "fiberhome,ux3326s"，不会产生真实 I2C 事务，
+	 * 因此不会在 i2c0 上打出 NACK。
+	 *
+	 * 如果将来有人给 ux3326s 写了 i2c 驱动，它会在这里 probe 并失败 ——
+	 * 正确做法是把节点挪到 fsl 下面（由 fsl 驱动当 i2c 适配器注册），
+	 * 而不是给 i2c0 加 clock-frequency 硬试。
+	 */
+	downstream_bosa: optical-front-end@63 {
+		compatible = "fiberhome,ux3326s";
+		reg = <0x63>;
+	};
+};
+
+/* Hardware i2c1 controller: no devices attached.
+ * The LED expander is on the i2c-gpio bus (GPIO 28/29) defined in the
+ * root node above. Keep this controller WITHOUT a pinctrl state - the
+ * "i2c1" pin group shares pin14/15 with mdio (2.5G PHY, airoha_pmxops
+ * strict), so claiming it here would break the PHY or fail probe.
+ * It is harmless to leave enabled; expect an empty i2c-1 bus.
+ */
+&i2c1 {
+	status = "okay";
+	clock-frequency = <400000>;
 };
 
 &pon_pcs {
 	status = "okay";
 };
 
-
-&an4475_bosa {
-	nvmem-cell-names = "calibration";
-	nvmem-cells = <&pon_calibration>;
+&xpon_mac {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pon_pins>;
+	optical-front-end = <&an4475_bosa>;
+	nvmem-cells = <&pon_serial>;
+	nvmem-cell-names = "pon-serial";
+	data-path = <&gdm2>;
+	status = "okay";
 };
 
 &gdm2 {
@@ -562,34 +954,11 @@
 	pinctrl-0 = <&pcie0_rst_pins>;
 
 	pcie@0,0 {
-		device_type = "pci";
 		reg = <0x0000 0 0 0 0>;
-		#address-cells = <3>;
-		#size-cells = <2>;
 
-		wifi_main: wifi@0,0 {
+		wifi@0,0 {
 			compatible = "mediatek,mt76";
 			reg = <0x0000 0 0 0 0>;
-			#address-cells = <1>;
-			#size-cells = <0>;
-
-			airoha,npu = <&npu>;
-			airoha,eth = <&eth>;
-			nvmem-cells = <&wifi_eeprom>;
-			nvmem-cell-names = "eeprom";
-			band@0 {
-				/* 2.4 GHz */
-				reg = <0>;
-				nvmem-cells = <&wifi_mac_2g4>;
-				nvmem-cell-names = "mac-address";
-			};
-
-			band@1 {
-				/* 5 GHz */
-				reg = <1>;
-				nvmem-cells = <&wifi_mac_5g>;
-				nvmem-cell-names = "mac-address";
-			};
 		};
 	};
 };
@@ -601,17 +970,27 @@
 	pinctrl-0 = <&pcie1_rst_pins>;
 
 	pcie@0,0 {
-		device_type = "pci";
 		reg = <0x0000 0 0 0 0>;
-		#address-cells = <3>;
-		#size-cells = <2>;
-		wifi_companion: wifi@0,0 {
+
+		wifi@0,0 {
 			compatible = "mediatek,mt76";
 			reg = <0x0000 0 0 0 0>;
-			#address-cells = <1>;
-			#size-cells = <0>;
+			nvmem-cells = <&wifi_eeprom>;
+			nvmem-cell-names = "eeprom";
+			mediatek,eeprom-merge-otp;
 			airoha,npu = <&npu>;
 			airoha,eth = <&eth>;
+			band@0 {
+				reg = <0>;
+				nvmem-cells = <&wifi_mac_2g4>;
+				nvmem-cell-names = "mac-address";
+			};
+
+			band@1 {
+				reg = <1>;
+				nvmem-cells = <&wifi_mac_5g>;
+				nvmem-cell-names = "mac-address";
+			};
 		};
 	};
 };
