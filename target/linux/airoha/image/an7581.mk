@@ -474,9 +474,8 @@ define Device/fiberhome_an4475-g2
   # modules the bus is described but never registered and the expander
   # LEDs stay dark.
   DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio \
-	kmod-leds-pwm kmod-pwm-airoha \
 	kmod-i2c-gpio kmod-i2c-algo-bit kmod-gpio-pca953x \
-	kmod-phy-realtek kmod-usb3 \
+	kmod-phy-realtek kmod-phy-motorcomm kmod-usb3 \
 	kmod-airoha-paged-bosa kmod-airoha-xpon airoha-ponctl airoha-pond \
 	wpad-openssl \
 	fitblk nand-utils ubi-utils
