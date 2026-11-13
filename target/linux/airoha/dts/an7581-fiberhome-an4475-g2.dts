@@ -545,7 +545,7 @@
 
 &gdm1 {
 	nvmem-cell-names = "mac-address";
-	nvmem-cells = <&eth_base_mac 7>;
+	nvmem-cells = <&eth_base_mac 0>;
 	status = "okay";
 };
 
@@ -558,12 +558,16 @@
 };
 
 &mdio {
+	reset-gpios = <&en7581_pinctrl 30 GPIO_ACTIVE_LOW>;
+	reset-delay-us = <15000>;
+	reset-post-delay-us = <68000>;
 
 	phy_2p5g: ethernet-phy@7 {
 		compatible = "ethernet-phy-ieee802.3-c22";
-		reg = <7>;;
+		reg = <7>;
 	};
 };
+
 
 &gdm4 {
 	/delete-property/ pcs-handle;
@@ -577,7 +581,7 @@
 		managed = "in-band-status";
 		pcs-handle = <&eth_pcs>;
 		phy-mode = "2500base-x";
-		nvmem-cells = <&fiberhome_base_mac 2>;
+		nvmem-cells = <&eth_base_mac 1>;
 		nvmem-cell-names = "mac-address";
 		openwrt,netdev-name = "sfp0";
 		status = "okay";
@@ -589,7 +593,7 @@
 		pcs-handle = <&usb_pcs>;
 		phy-handle = <&phy_2p5g>;
 		phy-mode = "2500base-x";
-		nvmem-cells = <&eth_base_mac 0>;
+		nvmem-cells = <&eth_base_mac 2>;
 		nvmem-cell-names = "mac-address";
 		openwrt,netdev-name = "lan1";
 		status = "okay";
@@ -606,7 +610,7 @@
 &gsw_port1 {
 	label = "lan2";
 	nvmem-cell-names = "mac-address";
-	nvmem-cells = <&eth_base_mac 1>;
+	nvmem-cells = <&eth_base_mac 3>;
 	status = "okay";
 };
 
@@ -614,7 +618,7 @@
 	label = "lan3";
 	/* eth3mac */
 	nvmem-cell-names = "mac-address";
-	nvmem-cells = <&eth_base_mac 2>;
+	nvmem-cells = <&eth_base_mac 4>;
 	status = "okay";
 };
 
@@ -622,7 +626,7 @@
 	label = "lan4";
 	/* eth4mac */
 	nvmem-cell-names = "mac-address";
-	nvmem-cells = <&eth_base_mac 3>;
+	nvmem-cells = <&eth_base_mac 5>;
 	status = "okay";
 };
 
@@ -630,7 +634,7 @@
 	label = "lan5";
 	/* eth5mac */
 	nvmem-cell-names = "mac-address";
-	nvmem-cells = <&eth_base_mac 4>;
+	nvmem-cells = <&eth_base_mac 6>;
 	status = "okay";
 };
 
