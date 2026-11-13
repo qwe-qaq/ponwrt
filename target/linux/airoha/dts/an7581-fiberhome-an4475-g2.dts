@@ -749,20 +749,6 @@
 		reset-gpios = <&en7581_pinctrl 30 GPIO_ACTIVE_LOW>;
 		reset-assert-us = <15000>;
 		reset-deassert-us = <68000>;
-
-		/* Restores the 2.5G-port LED node (mt7530-0:07:green:lan-1).
-		 * Delete this block if the PHY LED is intentionally disabled. */
-		leds {
-			#address-cells = <1>;
-			#size-cells = <0>;
-
-			led@0 {
-				reg = <0>;
-				color = <LED_COLOR_ID_GREEN>;
-				function = LED_FUNCTION_LAN;
-				function-enumerator = <1>;
-			};
-		};
 	};
 };
 
