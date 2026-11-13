@@ -590,7 +590,7 @@
 	port_2p5g: ethernet-port@1 {
 		compatible = "airoha,eth-port";
 		reg = <1>;
-		pcs-handle = <&&usb_pcs>;
+		pcs-handle = <&usb_pcs>;
 		phy-handle = <&phy_2p5g>;
 		phy-mode = "2500base-x";
 		nvmem-cells = <&eth_base_mac 2>;
