@@ -127,7 +127,7 @@
 		led_los: led-los {
 			label = "red:los";
 			gpios = <&pca9555 1 GPIO_ACTIVE_LOW>;
-			default-state = "on";
+			linux,default-trigger = "pon0-los";
 		};
 
 		/* P0.2 - 面板丝印"下行PON"（绿色，FTTR 下联口状态） */
