@@ -469,8 +469,13 @@ define Device/fiberhome_an4475-g2
   # MT7990AN uses the mt7990 firmware set (WA/DSP are empty for 7993/799b).
   # Both 2.5G PHY drivers are kept until the combo port copper PHY ID is
   # confirmed on hardware; the DTS currently describes 001c.c849.
+  # The board LED expander is a PCA9555 on a bit-banged I2C bus
+  # (GPIO28/GPIO29, see the i2c-gpio node in the DTS); without these three
+  # modules the bus is described but never registered and the expander
+  # LEDs stay dark.
   DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio \
 	kmod-leds-pwm kmod-pwm-airoha \
+	kmod-i2c-gpio kmod-i2c-algo-bit kmod-gpio-pca953x \
 	kmod-phy-realtek kmod-usb3 \
 	kmod-airoha-paged-bosa kmod-airoha-xpon airoha-ponctl airoha-pond \
 	wpad-openssl \
