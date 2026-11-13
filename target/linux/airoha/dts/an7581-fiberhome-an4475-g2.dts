@@ -67,12 +67,6 @@
 			panic-indicator;
 		};
 
-		led_wlan: led-wlan {
-			color = <LED_COLOR_ID_GREEN>;
-			function = LED_FUNCTION_WLAN;
-			gpios = <&en7581_pinctrl 15 GPIO_ACTIVE_LOW>;
-		};
-
 		led_lan2: led-lan2 {
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_LAN;
@@ -102,19 +96,6 @@
 		};
 	};
 
-	pwmleds {
-		compatible = "pwm-leds";
-		pinctrl-names = "default";
-		pinctrl-0 = <&pwm_gpio18_idx10_pins>;
-
-		led_pon: led-pon {
-			label = "pon:green";
-			pwms = <&en7581_pwm 10 4000000 0>;
-			max-brightness = <255>;
-			linux,default-trigger = "pon0-registration";
-		};
-	};
-
 	i2c_gpio: i2c-gpio {
 		compatible = "i2c-gpio";
 		sda-gpios = <&en7581_pinctrl 29 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
@@ -135,23 +116,98 @@
 	leds_expander: leds-expander {
 		compatible = "gpio-leds";
 
+		/* P0.0 - 面板丝印"光纤" */
+		led_internet: led-internet {
+			label = "green:wan-online";
+			gpios = <&pca9555 0 GPIO_ACTIVE_LOW>;
+			linux,default-trigger = "pon0-online";
+		};
+
+		/* P0.1 - 面板丝印"光信号"（LOS 告警，红色）*/
+		led_los: led-los {
+			label = "red:los";
+			gpios = <&pca9555 1 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		/* P0.2 - 面板丝印"下行PON"（绿色，FTTR 下联口状态） */
+		led_pon_downlink: led-pon-downlink {
+			label = "green:pon-downlink";
+			gpios = <&pca9555 2 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		/*
+		 * P0.3 / P0.4 - 面板丝印"系统"，一颗双色灯
+		 * 拉低 P0.3 得绿、拉低 P0.4 得红（同时拉低呈偏黄）。
+		 */
 		led_sys: led-sys {
-			color = <LED_COLOR_ID_GREEN>;
-			function = LED_FUNCTION_STATUS;
+			label = "green:sys";
+			gpios = <&pca9555 3 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		led_sys_red: led-sys-red {
+			label = "red:sys";
+			gpios = <&pca9555 4 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		/* P0.5 - 面板丝印"VPN" */
+		led_vpn: led-vpn {
+			label = "green:vpn";
+			gpios = <&pca9555 5 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		/* P0.6 - 面板丝印"WLAN" */
+		led_wlan_panel: led-wlan-panel {
+			label = "green:wlan";
 			gpios = <&pca9555 6 GPIO_ACTIVE_LOW>;
 			default-state = "keep";
 		};
 
-		led_vpn: led-vpn {
-			label = "green:vpn";
-			gpios = <&pca9555 7 GPIO_ACTIVE_LOW>;
+		led-usb2: led-usb2 {
+			label = "green:usb2";
+			gpios = <&pca9555 6 GPIO_ACTIVE_LOW>;
+			default-state = "keep";
 		};
 
-		led_internet: led-internet {
-			color = <LED_COLOR_ID_GREEN>;
-			function = LED_FUNCTION_WAN_ONLINE;
-			gpios = <&pca9555 0 GPIO_ACTIVE_LOW>;
-			linux,default-trigger = "pon0-online";
+		led_usb: led-usb {
+			label = "green:usb";
+			gpios = <&pca9555 8 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		/* 2.5G 光电复用口的光口（SFP 笼）指示，与 PHY 侧无关 */
+		led_2g5_fiber: led-2g5-fiber {
+			label = "green:2g5-fiber";
+			gpios = <&pca9555 9 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		led_voice1: led-voice-1 {
+			label = "green:voice1";
+			gpios = <&pca9555 10 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		led_voice2: led-voice-2 {
+			label = "green:voice2";
+			gpios = <&pca9555 11 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		led_voice3: led-voice-3 {
+			label = "green:voice3";
+			gpios = <&pca9555 12 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		led_voice4: led-voice-4 {
+			label = "green:voice4";
+			gpios = <&pca9555 13 GPIO_ACTIVE_LOW>;
+			default-state = "off";
 		};
 	};
 
