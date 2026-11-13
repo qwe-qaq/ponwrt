@@ -575,41 +575,27 @@
 	#size-cells = <0>;
 	status = "okay";
 
-	/*
-	 * The combo port is split into two airoha,eth-port children because
-	 * the copper half and the SFP cage sit on two different SerDes lanes.
-	 * "reg" is the nbq id (see airoha_alloc_gdm_port(), it errors out
-	 * with "missing nbq id" without it) and it has to match the lane,
-	 * since the RX path demuxes packets with get_sport(port, dev->nbq):
-	 * nbq 0 is the eth_pcs lane, nbq 1 is the usb_pcs lane.
-	 *
-	 * Before the split gdm4 inherited pcs-handle = <&eth_pcs> from the
-	 * SoC dtsi and the RTL8221B/YT8821 came up at 2500 Mb/s, so the
-	 * copper PHY is on eth_pcs (nbq 0) and the SFP cage is on usb_pcs
-	 * (nbq 1) -- the same layout the HG5585F CT usb-sfp variant uses.
-	 * usb_pcs is free here because the SS lane is masked out in &usb1.
-	 */
-	port_2p5g: ethernet-port@0 {
+	sfp_port: ethernet-port@0 {
 		compatible = "airoha,eth-port";
 		reg = <0>;
+		managed = "in-band-status";
 		pcs-handle = <&eth_pcs>;
+		phy-mode = "2500base-x";
+		nvmem-cells = <&eth_base_mac 1>;
+		nvmem-cell-names = "mac-address";
+		openwrt,netdev-name = "sfp0";
+		status = "okay";
+	};
+
+	port_2p5g: ethernet-port@1 {
+		compatible = "airoha,eth-port";
+		reg = <1>;
+		pcs-handle = <&&usb_pcs>;
 		phy-handle = <&phy_2p5g>;
 		phy-mode = "2500base-x";
 		nvmem-cells = <&eth_base_mac 2>;
 		nvmem-cell-names = "mac-address";
 		openwrt,netdev-name = "lan1";
-		status = "okay";
-	};
-
-	sfp_port: ethernet-port@1 {
-		compatible = "airoha,eth-port";
-		reg = <1>;
-		managed = "in-band-status";
-		pcs-handle = <&usb_pcs>;
-		phy-mode = "2500base-x";
-		nvmem-cells = <&eth_base_mac 1>;
-		nvmem-cell-names = "mac-address";
-		openwrt,netdev-name = "sfp0";
 		status = "okay";
 	};
 };
