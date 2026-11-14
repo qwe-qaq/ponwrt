@@ -594,7 +594,7 @@
 		compatible = "airoha,eth-port";
 		reg = <1>;
 		managed = "in-band-status";
-		pcs-handle = <&usb_pcs>;
+		pcs-handle = <&eth_pcs>;
 		phy-mode = "2500base-x";
 		nvmem-cells = <&eth_base_mac 1>;
 		nvmem-cell-names = "mac-address";
