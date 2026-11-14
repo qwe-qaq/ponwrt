@@ -116,31 +116,24 @@
 	leds_expander: leds-expander {
 		compatible = "gpio-leds";
 
-		/* P0.0 - 面板丝印"光纤" */
-		led_online: pon0-online {
+		led_internet: led-internet {
 			label = "green:wan-online";
 			gpios = <&pca9555 0 GPIO_ACTIVE_LOW>;
 			default-state = "off";
 		};
 
-		/* P0.1 - 面板丝印"光信号"（LOS 告警，红色）*/
-		led_los: pon0-los {
+		led_los: led-los {
 			label = "red:los";
 			gpios = <&pca9555 1 GPIO_ACTIVE_LOW>;
 			default-state = "off";
 		};
 
-		/* P0.2 - 面板丝印"下行PON"（绿色，FTTR 下联口状态） */
 		led_pon_downlink: led-pon-downlink {
 			label = "green:pon-downlink";
 			gpios = <&pca9555 2 GPIO_ACTIVE_LOW>;
 			default-state = "off";
 		};
 
-		/*
-		 * P0.3 / P0.4 - 面板丝印"系统"，一颗双色灯
-		 * 拉低 P0.3 得绿、拉低 P0.4 得红（同时拉低呈偏黄）。
-		 */
 		led_sys: led-sys {
 			label = "green:sys";
 			gpios = <&pca9555 3 GPIO_ACTIVE_LOW>;
@@ -174,7 +167,7 @@
 		};
 
 		led_usb1: led-usb1 {
-			label = "green:usb";
+			label = "green:usb1";
 			gpios = <&pca9555 8 GPIO_ACTIVE_LOW>;
 			default-state = "off";
 		};
