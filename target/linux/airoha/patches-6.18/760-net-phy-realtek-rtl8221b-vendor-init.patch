@@ -27,6 +27,13 @@ Mainline writes 0x697a/0x6a04/0x6f10/0x6f11 but none of the above, and in
 particular never the 0xa442 line patch nor the reset that latches the SerDes
 mode.  Apply the missing vendor sequence after the option mode is programmed.
 
+It also never raises the HiSGMII enable, VEND2 0xa468 bit 1.  Selecting the
+SerDes option mode alone leaves the lane on standard SGMII framing; the
+Realtek HiSGMII driver for the same PHY (lyq1996/rtl9617c-openwrt,
+realtek_hisgmii.c) sets that bit right before its BMCR reset, and doing so is
+what makes the host PCS see a signal.  Programming both, in that order, is
+what this patch does.
+
 Gated behind rtl8221b_vendor_patch (default on) so the sequence can be
 A/B tested on a live system without rebuilding:
   modprobe -r realtek && modprobe realtek rtl8221b_vendor_patch=0
@@ -35,7 +42,7 @@ Signed-off-by: local
 
 --- a/drivers/net/phy/realtek/realtek_main.c
 +++ b/drivers/net/phy/realtek/realtek_main.c
-@@ -2040,9 +2040,71 @@
+@@ -2040,9 +2040,99 @@
  	return rtl822x_set_serdes_option_mode(phydev, true);
  }
  
@@ -56,7 +63,7 @@ Signed-off-by: local
 + */
 +static int rtl8221b_vendor_serdes_init(struct phy_device *phydev)
 +{
-+	int ret;
++	int ret, val;
 +
 +	if (!rtl8221b_vendor_patch)
 +		return 0;
@@ -65,6 +72,18 @@ Signed-off-by: local
 +	if (phydev->interface != PHY_INTERFACE_MODE_2500BASEX &&
 +	    !test_bit(PHY_INTERFACE_MODE_2500BASEX, phydev->host_interfaces))
 +		return 0;
++
++	/*
++	 * The PHY drops VEND2 writes while its state machine is still
++	 * booting; the vendor driver polls 0xa420[1:0] == 3 first and so
++	 * must we.  A timeout is not fatal: the writes below still get
++	 * latched by the reset, they just have less chance of sticking.
++	 */
++	ret = phy_read_mmd_poll_timeout(phydev, MDIO_MMD_VEND2, 0xa420, val,
++					(val & GENMASK(1, 0)) == 3,
++					2000, 1500000, false);
++	if (ret < 0)
++		phydev_warn(phydev, "PHY not ready before SerDes init: %d\n", ret);
 +
 +	/* EEE off */
 +	ret = phy_write_mmd(phydev, MDIO_MMD_AN, 0x003c, 0x0000);
@@ -77,6 +96,22 @@ Signed-off-by: local
 +
 +	/* "4 line patch" */
 +	ret = phy_modify_mmd(phydev, MDIO_MMD_VEND2, 0xa442, 0xffff, 0x0438);
++	if (ret < 0)
++		return ret;
++
++	/*
++	 * VEND2 0xa468 bit 1 is the HiSGMII enable.  0x697a only selects the
++	 * SerDes option mode; without this bit the lane keeps standard SGMII
++	 * framing, and the EN7581 ETH PCS - which the PCS driver hard-wires
++	 * to AIROHA_PCS_TBI_10B_MODE, i.e. HiSGMII 8B/10B - reports
++	 * RX_SIGDET = 0 even though the lane is electrically alive and the
++	 * copper side is linked at 2.5G.
++	 *
++	 * The vendor driver raises this bit right before its BMCR reset, so
++	 * the same ordering is used here: reset below latches both the bit
++	 * and the option mode.
++	 */
++	ret = phy_set_bits_mmd(phydev, MDIO_MMD_VEND2, 0xa468, BIT(1));
 +	if (ret < 0)
 +		return ret;
 +
