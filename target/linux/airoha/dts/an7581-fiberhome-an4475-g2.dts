@@ -117,14 +117,14 @@
 		compatible = "gpio-leds";
 
 		/* P0.0 - 面板丝印"光纤" */
-		led_internet: led-internet {
+		led_online: pon0-online {
 			label = "green:wan-online";
 			gpios = <&pca9555 0 GPIO_ACTIVE_LOW>;
 			linux,default-trigger = "pon0-online";
 		};
 
 		/* P0.1 - 面板丝印"光信号"（LOS 告警，红色）*/
-		led_los: led-los {
+		led_los: pon0-los {
 			label = "red:los";
 			gpios = <&pca9555 1 GPIO_ACTIVE_LOW>;
 			linux,default-trigger = "pon0-los";
@@ -161,7 +161,7 @@
 		};
 
 		/* P0.6 - 面板丝印"WLAN" */
-		led_wlan_panel: led-wlan-panel {
+		led_wlan: led-wlan {
 			label = "green:wlan";
 			gpios = <&pca9555 6 GPIO_ACTIVE_LOW>;
 			default-state = "keep";
@@ -173,11 +173,10 @@
 			default-state = "off";
 		};
 
-		led_usb: led-usb {
+		led_usb1: led-usb1 {
 			label = "green:usb";
 			gpios = <&pca9555 8 GPIO_ACTIVE_LOW>;
-			linux,default-trigger = "usbport";
-			trigger-sources = <&usb_port2>;
+			default-state = "off";
 		};
 
 		/* 2.5G 光电复用口的光口（SFP 笼）指示，与 PHY 侧无关 */
@@ -523,10 +522,10 @@
 	};
 };
 
-&usb1 {
+&usb0 {
 	status = "okay";
 	mediatek,u3p-dis-msk = <0x1>;
-	phys = <&usb1_phy PHY_TYPE_USB2>;
+	phys = <&usb0_phy PHY_TYPE_USB2>;
 	vusb33-supply = <&reg_3p3v>;
 	#address-cells = <1>;
 	#size-cells = <0>;
