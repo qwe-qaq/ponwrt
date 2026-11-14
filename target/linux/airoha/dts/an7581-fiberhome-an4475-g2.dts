@@ -578,27 +578,27 @@
 	#size-cells = <0>;
 	status = "okay";
 
-	sfp_port: ethernet-port@0 {
+	port_2p5g: ethernet-port@0 {
 		compatible = "airoha,eth-port";
 		reg = <0>;
-		managed = "in-band-status";
 		pcs-handle = <&eth_pcs>;
-		phy-mode = "2500base-x";
-		nvmem-cells = <&eth_base_mac 1>;
-		nvmem-cell-names = "mac-address";
-		openwrt,netdev-name = "sfp0";
-		status = "okay";
-	};
-
-	port_2p5g: ethernet-port@1 {
-		compatible = "airoha,eth-port";
-		reg = <1>;
-		pcs-handle = <&usb_pcs>;
 		phy-handle = <&phy_2p5g>;
 		phy-mode = "2500base-x";
 		nvmem-cells = <&eth_base_mac 2>;
 		nvmem-cell-names = "mac-address";
 		openwrt,netdev-name = "lan1";
+		status = "okay";
+	};
+
+	sfp_port: ethernet-port@1 {
+		compatible = "airoha,eth-port";
+		reg = <1>;
+		managed = "in-band-status";
+		pcs-handle = <&usb_pcs>;
+		phy-mode = "2500base-x";
+		nvmem-cells = <&eth_base_mac 1>;
+		nvmem-cell-names = "mac-address";
+		openwrt,netdev-name = "sfp0";
 		status = "okay";
 	};
 };
