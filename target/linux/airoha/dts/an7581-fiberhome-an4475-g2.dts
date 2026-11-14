@@ -120,14 +120,14 @@
 		led_online: pon0-online {
 			label = "green:wan-online";
 			gpios = <&pca9555 0 GPIO_ACTIVE_LOW>;
-			linux,default-trigger = "pon0-online";
+			default-state = "off";
 		};
 
 		/* P0.1 - 面板丝印"光信号"（LOS 告警，红色）*/
 		led_los: pon0-los {
 			label = "red:los";
 			gpios = <&pca9555 1 GPIO_ACTIVE_LOW>;
-			linux,default-trigger = "pon0-los";
+			default-state = "off";
 		};
 
 		/* P0.2 - 面板丝印"下行PON"（绿色，FTTR 下联口状态） */
