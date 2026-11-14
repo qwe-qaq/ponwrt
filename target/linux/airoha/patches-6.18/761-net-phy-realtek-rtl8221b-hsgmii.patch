@@ -2,11 +2,12 @@ Subject: [PATCH] net: phy: realtek: honour realtek,hsgmii on RTL8221B SerDes
 
 The FiberHome AN4475-G2 wires the RTL8221B to the Airoha EN7581 ETH PCS and
 describes the link as phy-mode = "2500base-x".  Mainline then programs
-MMD 30.0x697a[5:0] = 2, i.e. standard 2500BASE-X, while the EN7581 PCS
-driver selects AIROHA_SCU_ETH_XSI_HSGMII for PHY_INTERFACE_MODE_2500BASEX
-and calls airoha_pcs_init_hsgmii(); it never enables standard 2500BASE-X.
+MMD 30.0x697a[5:0] = 2, i.e. standard 2500BASE-X (64B/66B), while the EN7581
+PCS driver selects AIROHA_SCU_ETH_XSI_HSGMII and sets AIROHA_PCS_TBI_10B_MODE
+for PHY_INTERFACE_MODE_2500BASEX, i.e. it speaks Realtek HiSGMII (8B/10B).
+It never enables standard 2500BASE-X.
 
-The two ends therefore speak different protocols on the same 3.125G lane:
+The two ends therefore speak different line codes on the same 3.125G lane:
 the PHY's copper side links normally, but the host PCS receives nothing.
 
   pcs_pma DIG_RO_RESERVE_2 RX_SIGDET = 0/6     (PON PCS, same method: 6/6)
@@ -20,10 +21,11 @@ Add the missing mode and honour an explicit realtek,hsgmii devicetree
 property, the same way other Realtek-based boards do.  Boards that do not
 set the property keep the existing behaviour.
 
-Note 30.0x6a04[10:8] is already programmed to 3'b101 (HiSGMII/2500BASE-X)
-by the existing magic-number sequence, and rtl822xb_get_rate_matching()
-returns RATE_MATCH_NONE for any mode other than 2, which is what HiSGMII
-wants.
+HiSGMII keeps the lane at a fixed 3.125G and only carries 2.5G
+(datasheet 7.20.2), so a copper link negotiated at 1G needs the same pause
+based rate matching that 2500BASE-X already gets - report RATE_MATCH_PAUSE
+for this mode in both config_init and get_rate_matching, otherwise the link
+comes up but no frame survives.
 
 Signed-off-by: local
 
@@ -37,7 +39,7 @@ Signed-off-by: local
  
  #define RTL822X_VND1_SERDES_CTRL3			0x7580
  #define RTL822X_VND1_SERDES_CTRL3_MODE_MASK		GENMASK(5, 0)
-@@ -1999,6 +2000,17 @@
+@@ -1999,6 +2000,20 @@
  		phydev->rate_matching = RATE_MATCH_NONE;
  	}
  
@@ -49,9 +51,26 @@ Signed-off-by: local
 +	 */
 +	if (device_property_read_bool(&phydev->mdio.dev, "realtek,hsgmii")) {
 +		mode = RTL822X_VND1_SERDES_OPTION_MODE_HSGMII;
-+		phydev->rate_matching = RATE_MATCH_NONE;
++		/* HiSGMII keeps the lane at 3.125G, so a copper link below
++		 * 2.5G still needs pause based rate matching from the MAC.
++		 */
++		phydev->rate_matching = RATE_MATCH_PAUSE;
 +	}
 +
  	/* the following sequence with magic numbers sets up the SerDes
  	 * option mode
  	 */
+@@ -2145,6 +2160,13 @@
+ 	    RTL822X_VND1_SERDES_OPTION_MODE_2500BASEX)
+ 		return RATE_MATCH_PAUSE;
+ 
++	/* HiSGMII also runs the lane at a fixed 3.125G, so it needs the same
++	 * pause based rate matching as 2500BASE-X.
++	 */
++	if ((val & RTL822X_VND1_SERDES_OPTION_MODE_MASK) ==
++	    RTL822X_VND1_SERDES_OPTION_MODE_HSGMII)
++		return RATE_MATCH_PAUSE;
++
+ 	/* RTL822X_VND1_SERDES_OPTION_MODE_2500BASEX_SGMII */
+ 	return RATE_MATCH_NONE;
+ }
