@@ -27,12 +27,13 @@ Mainline writes 0x697a/0x6a04/0x6f10/0x6f11 but none of the above, and in
 particular never the 0xa442 line patch nor the reset that latches the SerDes
 mode.  Apply the missing vendor sequence after the option mode is programmed.
 
-It also never raises the HiSGMII enable, VEND2 0xa468 bit 1.  Selecting the
-SerDes option mode alone leaves the lane on standard SGMII framing; the
-Realtek HiSGMII driver for the same PHY (lyq1996/rtl9617c-openwrt,
-realtek_hisgmii.c) sets that bit right before its BMCR reset, and doing so is
-what makes the host PCS see a signal.  Programming both, in that order, is
-what this patch does.
+Mainline never touches VEND2 0xa468 bit 1 either.  That bit selects HiSGMII
+framing on the line side and must agree with the option mode in 0x697a: modes
+1 and 3 are HiSGMII (8B/10B), modes 0 and 2 are standard 2500BASE-X or SGMII
+(64B/66B).  Driving a standard mode with the bit still set leaves a
+framing mismatch that neither side reports as an error - both links come up
+and every frame is dropped.  This patch therefore derives the bit from 0x697a
+instead of forcing it on, right before the BMCR reset that latches both.
 
 Gated behind rtl8221b_vendor_patch (default on) so the sequence can be
 A/B tested on a live system without rebuilding:
@@ -42,7 +43,7 @@ Signed-off-by: local
 
 --- a/drivers/net/phy/realtek/realtek_main.c
 +++ b/drivers/net/phy/realtek/realtek_main.c
-@@ -2040,9 +2040,154 @@
+@@ -2040,9 +2040,160 @@
  	return rtl822x_set_serdes_option_mode(phydev, true);
  }
  
@@ -142,18 +143,24 @@ Signed-off-by: local
 +	}
 +
 +	/*
-+	 * VEND2 0xa468 bit 1 is the HiSGMII enable.  0x697a only selects the
-+	 * SerDes option mode; without this bit the lane keeps standard SGMII
-+	 * framing, and the EN7581 ETH PCS - which the PCS driver hard-wires
-+	 * to AIROHA_PCS_TBI_10B_MODE, i.e. HiSGMII 8B/10B - reports
-+	 * RX_SIGDET = 0 even though the lane is electrically alive and the
-+	 * copper side is linked at 2.5G.
++	 * VEND2 0xa468 bit 1 selects HiSGMII framing on the line side and
++	 * has to agree with the option mode programmed in 0x697a: modes 1
++	 * and 3 are HiSGMII (8B/10B), modes 0 and 2 are standard 2500BASE-X
++	 * or SGMII (64B/66B).  Keeping the bit set for a standard mode
++	 * leaves the lane on HiSGMII framing while the host PCS decodes
++	 * 64B/66B, so every frame is lost even though the lane is
++	 * electrically alive and both ends report link up.
 +	 *
-+	 * The vendor driver raises this bit right before its BMCR reset, so
-+	 * the same ordering is used here: reset below latches both the bit
-+	 * and the option mode.
++	 * The reset below latches both this bit and the option mode.
 +	 */
-+	ret = phy_set_bits_mmd(phydev, MDIO_MMD_VEND2, 0xa468, BIT(1));
++	val = phy_read_mmd(phydev, MDIO_MMD_VEND1, 0x697a);
++	if (val < 0)
++		return val;
++
++	if ((val & GENMASK(5, 0)) == 1 || (val & GENMASK(5, 0)) == 3)
++		ret = phy_set_bits_mmd(phydev, MDIO_MMD_VEND2, 0xa468, BIT(1));
++	else
++		ret = phy_clear_bits_mmd(phydev, MDIO_MMD_VEND2, 0xa468, BIT(1));
 +	if (ret < 0)
 +		return ret;
 +
