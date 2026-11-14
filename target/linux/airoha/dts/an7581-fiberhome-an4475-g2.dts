@@ -561,17 +561,13 @@
 };
 
 &mdio {
-	/* 2.5G PHY 硬复位：手册要求拉低 ≥10ms；SerDes PLL 锁定额外留 300ms */
 	reset-gpios = <&en7581_pinctrl 30 GPIO_ACTIVE_LOW>;
 	reset-delay-us = <30000>;
 	reset-post-delay-us = <300000>;
 
 	phy_2p5g: ethernet-phy@7 {
-		/* 走 mt7530 的 MDIO，该主控只保证 C22；C45 留给能直连的板子 */
 		compatible = "ethernet-phy-ieee802.3-c22";
 		reg = <7>;
-		/* 本 SoC 的 2500base-x 实际跑 Realtek HiSGMII，不写这条
-		 * PHY 会按标准 2500BASE-X 配置，主机 PCS 收不到任何信号 */
 		realtek,hsgmii;
 	};
 };
@@ -589,7 +585,6 @@
 		pcs-handle = <&eth_pcs>;
 		phy-handle = <&phy_2p5g>;
 		phy-mode = "2500base-x";
-		managed = "in-band-status";
 		nvmem-cells = <&eth_base_mac 2>;
 		nvmem-cell-names = "mac-address";
 		openwrt,netdev-name = "lan1";
