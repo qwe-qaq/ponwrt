@@ -1,0 +1,73 @@
+Subject: [PATCH] net: phy: realtek: read RTL8221B SerDes option mode from DT
+
+phy-mode alone cannot express the RTL8221B SerDes option mode
+(MMD 30 0x697a[5:0]).  Add the HiSGMII mode constant and let a board
+select the mode with realtek,serdes-option-mode, falling back to
+realtek,hisgmii / realtek,hsgmii; boards without any of them keep the
+current behaviour.
+
+DT cells are big-endian u32.  Reading one with device_property_read_u16()
+succeeds but returns the high half (0) and short-circuits the boolean
+fallback, so always use device_property_read_u32().
+
+HiSGMII and 2500BASE-X keep the lane at a fixed 3.125G, so copper links
+below 2.5G need pause-based rate matching from both config_init and
+get_rate_matching().
+
+Signed-off-by: local
+
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -132,6 +132,7 @@
+ #define RTL822X_VND1_SERDES_OPTION_MODE_MASK		GENMASK(5, 0)
+ #define RTL822X_VND1_SERDES_OPTION_MODE_2500BASEX_SGMII		0
+ #define RTL822X_VND1_SERDES_OPTION_MODE_2500BASEX		2
++#define RTL822X_VND1_SERDES_OPTION_MODE_HSGMII			3
+ 
+ #define RTL822X_VND1_SERDES_CTRL3			0x7580
+ #define RTL822X_VND1_SERDES_CTRL3_MODE_MASK		GENMASK(5, 0)
+@@ -1999,6 +2000,32 @@
+ 		phydev->rate_matching = RATE_MATCH_NONE;
+ 	}
+ 
++	/* A DT cell is u32: a u16 read silently returns its high half (0). */
++	{
++		u32 dt_mode;
++		bool override = true;
++
++		if (!device_property_read_u32(&phydev->mdio.dev,
++					      "realtek,serdes-option-mode",
++					      &dt_mode)) {
++			mode = dt_mode & RTL822X_VND1_SERDES_OPTION_MODE_MASK;
++		} else if (device_property_read_bool(&phydev->mdio.dev,
++						     "realtek,hisgmii") ||
++			   device_property_read_bool(&phydev->mdio.dev,
++						     "realtek,hsgmii")) {
++			mode = RTL822X_VND1_SERDES_OPTION_MODE_HSGMII;
++		} else {
++			override = false;
++		}
++
++		/* Fixed 3.125G lane: lower copper rates need pause frames. */
++		if (override)
++			phydev->rate_matching =
++				(mode == RTL822X_VND1_SERDES_OPTION_MODE_2500BASEX ||
++				 mode == RTL822X_VND1_SERDES_OPTION_MODE_HSGMII) ?
++				RATE_MATCH_PAUSE : RATE_MATCH_NONE;
++	}
++
+ 	/* the following sequence with magic numbers sets up the SerDes
+ 	 * option mode
+ 	 */
+@@ -2145,6 +2172,11 @@
+ 	    RTL822X_VND1_SERDES_OPTION_MODE_2500BASEX)
+ 		return RATE_MATCH_PAUSE;
+ 
++	/* HiSGMII also runs at a fixed 3.125G. */
++	if ((val & RTL822X_VND1_SERDES_OPTION_MODE_MASK) ==
++	    RTL822X_VND1_SERDES_OPTION_MODE_HSGMII)
++		return RATE_MATCH_PAUSE;
++
+ 	/* RTL822X_VND1_SERDES_OPTION_MODE_2500BASEX_SGMII */
+ 	return RATE_MATCH_NONE;
+ }

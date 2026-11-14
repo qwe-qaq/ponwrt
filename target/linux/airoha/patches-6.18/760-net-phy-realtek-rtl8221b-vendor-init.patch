@@ -1,0 +1,118 @@
+Subject: [PATCH] net: phy: realtek: apply vendor RTL8221B SerDes and LED init
+
+The stock firmware runs an init sequence on the RTL8221B that mainline
+does not: clear VEND1 0x75f3[0], disable SerDes in-band AN and EEE,
+apply the VEND2 0xa442 lane patch, align VEND2 0xa468[1] with the option
+mode in 0x697a, latch everything with a BMCR reset and then program the
+three VEND2 LED registers.
+
+Without it the option mode is not latched and the RJ45 LED keeps its
+power-on defaults, where it only lights for a 2500M link and stays dark
+at 1000M/100M.
+
+0xa468[1] selects HiSGMII (8b/10b) framing: it must be set for modes 1
+and 3 and clear for the standard 2500BASE-X/SGMII modes 0 and 2.  Forcing
+it on for a standard mode leaves both ends up while every frame is
+dropped.
+
+Signed-off-by: local
+
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -2040,9 +2040,95 @@
+ 	return rtl822x_set_serdes_option_mode(phydev, true);
+ }
+ 
++/* Stock firmware SerDes/LED init sequence for the RTL8221B. */
++static int rtl8221b_vendor_serdes_init(struct phy_device *phydev)
++{
++	int ret, val;
++
++	if (phydev->interface != PHY_INTERFACE_MODE_2500BASEX &&
++	    !test_bit(PHY_INTERFACE_MODE_2500BASEX, phydev->host_interfaces))
++		return 0;
++
++	/* VEND2 writes are ignored until the PHY state machine is ready. */
++	ret = phy_read_mmd_poll_timeout(phydev, MDIO_MMD_VEND2, 0xa420, val,
++					(val & GENMASK(1, 0)) == 3,
++					2000, 1500000, false);
++	if (ret < 0)
++		phydev_warn(phydev, "PHY not ready before SerDes init: %d\n", ret);
++
++	/* 0x75f3[0] must be clear for the option mode to be latched. */
++	ret = phy_clear_bits_mmd(phydev, MDIO_MMD_VEND1, 0x75f3, BIT(0));
++	if (ret < 0)
++		return ret;
++
++	/* SerDes in-band AN off. */
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x7588, 0x0002);
++	if (ret < 0)
++		return ret;
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x7589, 0x71d0);
++	if (ret < 0)
++		return ret;
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x7587, 0x0003);
++	if (ret < 0)
++		return ret;
++
++	/* EEE off. */
++	ret = phy_write_mmd(phydev, MDIO_MMD_AN, 0x003c, 0x0000);
++	if (ret < 0)
++		return ret;
++	ret = phy_write_mmd(phydev, MDIO_MMD_AN, 0x003e, 0x0000);
++	if (ret < 0)
++		return ret;
++
++	ret = phy_modify_mmd(phydev, MDIO_MMD_VEND2, 0xa442, 0xffff, 0x0438);
++	if (ret < 0)
++		return ret;
++
++	/* 0xa468[1] (HiSGMII framing) must follow 0x697a[5:0]. */
++	val = phy_read_mmd(phydev, MDIO_MMD_VEND1, 0x697a);
++	if (val < 0)
++		return val;
++	if ((val & GENMASK(5, 0)) == 1 || (val & GENMASK(5, 0)) == 3)
++		ret = phy_set_bits_mmd(phydev, MDIO_MMD_VEND2, 0xa468, BIT(1));
++	else
++		ret = phy_clear_bits_mmd(phydev, MDIO_MMD_VEND2, 0xa468, BIT(1));
++	if (ret < 0)
++		return ret;
++
++	/* Soft reset latches the option mode and the lane patch. */
++	ret = __phy_write(phydev, MII_BMCR, BMCR_RESET);
++	if (ret < 0)
++		return ret;
++	msleep(1000);
++
++	/* LED_CFG2 / LCR6 / LED_ACT, applied only after the reset. */
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND2, 0xd036, 0x0027);
++	if (ret < 0)
++		return ret;
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND2, 0xd040, 0x3914);
++	if (ret < 0)
++		return ret;
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND2, 0xd044, 0x0040);
++	if (ret < 0)
++		return ret;
++
++	/* Low temperature compensation. */
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x6a11, 0xb199);
++	if (ret < 0)
++		return ret;
++
++	return phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x6a12, 0xb317);
++}
++
+ static int rtl822xb_config_init(struct phy_device *phydev)
+ {
+-	return rtl822x_set_serdes_option_mode(phydev, false);
++	int ret;
++
++	ret = rtl822x_set_serdes_option_mode(phydev, false);
++	if (ret < 0)
++		return ret;
++
++	return rtl8221b_vendor_serdes_init(phydev);
+ }
+ 
+ static int rtl822x_config_inband(struct phy_device *phydev, unsigned int modes)
