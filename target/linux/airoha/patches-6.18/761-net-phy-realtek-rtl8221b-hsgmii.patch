@@ -62,13 +62,13 @@ Signed-off-by: local
 +	 *   3. realtek,hisgmii;  -> HiSGMII only (mode 3)
 +	 *   4. phy-mode alone, i.e. mainline's original decision
 +	 */
-+	{
-+		u16 dt_mode;
++	 	{
++		u32 dt_mode;
 +		bool override = true;
 +
 +		if (rtl8221b_serdes_mode >= 0) {
 +			mode = rtl8221b_serdes_mode;
-+		} else if (!device_property_read_u16(&phydev->mdio.dev,
++		} else if (!device_property_read_u32(&phydev->mdio.dev,
 +						     "realtek,serdes-option-mode",
 +						     &dt_mode)) {
 +			mode = dt_mode & RTL822X_VND1_SERDES_OPTION_MODE_MASK;
