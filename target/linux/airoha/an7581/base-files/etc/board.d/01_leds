@@ -47,6 +47,8 @@ fiberhome,an4475-g2)
 	ucidef_set_led_netdev "lan4" "lan4" "green:lan-4" "lan4" "link tx rx"
 	ucidef_set_led_netdev "lan5" "lan5" "green:lan-5" "lan5" "link tx rx"
 	ucidef_set_led_netdev "wlan" "wlan" "green:wlan" "phy0-ap0" "link"
+	ucidef_set_led_usbport "usb1" "USB 1" "blue:usb-1" "usb3-port1" "usb4-port1"
+	ucidef_set_led_usbport "usb2" "USB 2" "blue:usb-2" "usb1-port1" "usb2-port1"
 	;;
 fiberhome,hg5585f-ct)
 	# No GE port or USB3.0 LED on this panel.
