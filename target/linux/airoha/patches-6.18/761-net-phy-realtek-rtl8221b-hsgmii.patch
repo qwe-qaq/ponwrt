@@ -44,37 +44,59 @@ Signed-off-by: local
  
  #define RTL822X_VND1_SERDES_CTRL3			0x7580
  #define RTL822X_VND1_SERDES_CTRL3_MODE_MASK		GENMASK(5, 0)
-@@ -1999,6 +2005,29 @@
+@@ -1999,6 +2005,51 @@
  		phydev->rate_matching = RATE_MATCH_NONE;
  	}
  
-+	/* Some hosts call their 3.125G port "2500base-x" in DT but run
++	/*
++	 * Some hosts call their 3.125G port "2500base-x" in DT but run
 +	 * Realtek HiSGMII on the wire: Airoha EN7581 selects
 +	 * AIROHA_SCU_ETH_XSI_HSGMII for PHY_INTERFACE_MODE_2500BASEX and
-+	 * never enables standard 2500BASE-X. Programming mode 2 there
++	 * never enables standard 2500BASE-X.  Programming mode 2 there
 +	 * leaves the host PCS with no received signal at all.
 +	 *
-+	 * rtl8221b_serdes_mode overrides both DT and the default so the two
-+	 * candidates can be A/B tested on a live box:
-+	 *   modprobe -r realtek && modprobe realtek rtl8221b_serdes_mode=2
++	 * Four ways to reach the mode, in decreasing priority:
++	 *   1. rtl8221b_serdes_mode= module parameter, for live A/B
++	 *   2. realtek,serdes-option-mode = <n>, the binding used by the
++	 *      vendor HiSGMII driver (datasheet 8.6.1 code points)
++	 *   3. realtek,hisgmii;  -> HiSGMII only (mode 3)
++	 *   4. phy-mode alone, i.e. mainline's original decision
 +	 */
-+	if (rtl8221b_serdes_mode >= 0) {
-+		mode = rtl8221b_serdes_mode;
-+		phydev->rate_matching = (mode == RTL822X_VND1_SERDES_OPTION_MODE_2500BASEX ||
-+					 mode == RTL822X_VND1_SERDES_OPTION_MODE_HSGMII) ?
-+					RATE_MATCH_PAUSE : RATE_MATCH_NONE;
-+	} else if (device_property_read_bool(&phydev->mdio.dev, "realtek,hsgmii")) {
-+		mode = RTL822X_VND1_SERDES_OPTION_MODE_HSGMII;
-+		/* HiSGMII keeps the lane at 3.125G, so a copper link below
-+		 * 2.5G still needs pause based rate matching from the MAC.
++	{
++		u16 dt_mode;
++		bool override = true;
++
++		if (rtl8221b_serdes_mode >= 0) {
++			mode = rtl8221b_serdes_mode;
++		} else if (!device_property_read_u16(&phydev->mdio.dev,
++						     "realtek,serdes-option-mode",
++						     &dt_mode)) {
++			mode = dt_mode & RTL822X_VND1_SERDES_OPTION_MODE_MASK;
++		} else if (device_property_read_bool(&phydev->mdio.dev,
++						     "realtek,hisgmii") ||
++			   device_property_read_bool(&phydev->mdio.dev,
++						     "realtek,hsgmii")) {
++			mode = RTL822X_VND1_SERDES_OPTION_MODE_HSGMII;
++		} else {
++			override = false;
++		}
++
++		/* HiSGMII and 2500BASE-X both pin the lane to 3.125G, so a
++		 * copper link below 2.5G still needs pause based rate
++		 * matching from the MAC.  The dual modes may step the lane
++		 * down to 1.25G SGMII instead and must not ask for it.
 +		 */
-+		phydev->rate_matching = RATE_MATCH_PAUSE;
++		if (override)
++			phydev->rate_matching =
++				(mode == RTL822X_VND1_SERDES_OPTION_MODE_2500BASEX ||
++				 mode == RTL822X_VND1_SERDES_OPTION_MODE_HSGMII) ?
++				RATE_MATCH_PAUSE : RATE_MATCH_NONE;
 +	}
 +
  	/* the following sequence with magic numbers sets up the SerDes
  	 * option mode
  	 */
-@@ -2145,6 +2174,13 @@
+@@ -2145,6 +2196,13 @@
  	    RTL822X_VND1_SERDES_OPTION_MODE_2500BASEX)
  		return RATE_MATCH_PAUSE;
  

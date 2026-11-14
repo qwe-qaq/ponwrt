@@ -568,7 +568,10 @@
 	phy_2p5g: ethernet-phy@7 {
 		compatible = "ethernet-phy-ieee802.3-c22";
 		reg = <7>;
-		realtek,hsgmii;
+		/* 3 = 纯 HiSGMII；参考板的 1 会在降速时把 lane 切到 1.25G
+		 * SGMII，与本口固定 2500base-x 的 SoC 侧对不上 */
+		realtek,hisgmii;
+		realtek,serdes-option-mode = <3>;
 	};
 };
 
