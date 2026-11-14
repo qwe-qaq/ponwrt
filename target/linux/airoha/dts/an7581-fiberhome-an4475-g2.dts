@@ -526,9 +526,14 @@
 	status = "okay";
 	mediatek,u3p-dis-msk = <0x1>;
 	phys = <&usb0_phy PHY_TYPE_USB2>;
-	vusb33-supply = <&reg_3p3v>;
-	#address-cells = <1>;
-	#size-cells = <0>;
+	vusb33-supply = <&reg_usb_3p3v>;
+};
+
+&usb1 {
+	status = "okay";
+	mediatek,u3p-dis-msk = <0x1>;
+	phys = <&usb1_phy PHY_TYPE_USB2>;
+	vusb33-supply = <&reg_usb_3p3v>;
 };
 
 &npu {
