@@ -161,13 +161,13 @@
 		};
 
 		led_usb2: led-usb2 {
-			label = "green:usb2";
+			label = "green:usb-2";
 			gpios = <&pca9555 7 GPIO_ACTIVE_LOW>;
 			default-state = "off";
 		};
 
 		led_usb1: led-usb1 {
-			label = "green:usb1";
+			label = "green:usb-1";
 			gpios = <&pca9555 8 GPIO_ACTIVE_LOW>;
 			default-state = "off";
 		};
