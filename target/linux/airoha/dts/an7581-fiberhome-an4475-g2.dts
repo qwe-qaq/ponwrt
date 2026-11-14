@@ -116,24 +116,31 @@
 	leds_expander: leds-expander {
 		compatible = "gpio-leds";
 
+		/* P0.0 - 面板丝印"光纤" */
 		led_internet: led-internet {
 			label = "green:wan-online";
 			gpios = <&pca9555 0 GPIO_ACTIVE_LOW>;
 			default-state = "off";
 		};
 
+		/* P0.1 - 面板丝印"光信号"（LOS 告警，红色）*/
 		led_los: led-los {
 			label = "red:los";
 			gpios = <&pca9555 1 GPIO_ACTIVE_LOW>;
 			default-state = "off";
 		};
 
+		/* P0.2 - 面板丝印"下行PON"（绿色，FTTR 下联口状态） */
 		led_pon_downlink: led-pon-downlink {
 			label = "green:pon-downlink";
 			gpios = <&pca9555 2 GPIO_ACTIVE_LOW>;
 			default-state = "off";
 		};
 
+		/*
+		 * P0.3 / P0.4 - 面板丝印"系统"，一颗双色灯
+		 * 拉低 P0.3 得绿、拉低 P0.4 得红（同时拉低呈偏黄）。
+		 */
 		led_sys: led-sys {
 			label = "green:sys";
 			gpios = <&pca9555 3 GPIO_ACTIVE_LOW>;
@@ -153,19 +160,21 @@
 			default-state = "off";
 		};
 
-		/* P0.6 - 面板丝印"WLAN" */
+		/* P0.6 - 面板丝印"WLAN"，由 ledpaneld 按终端关联状态驱动 */
 		led_wlan: led-wlan {
 			label = "green:wlan";
 			gpios = <&pca9555 6 GPIO_ACTIVE_LOW>;
-			default-state = "keep";
+			default-state = "off";
 		};
 
+		/* P0.7 - 面板丝印"USB2"（SuperSpeed 侧） */
 		led_usb2: led-usb2 {
 			label = "green:usb-2";
 			gpios = <&pca9555 7 GPIO_ACTIVE_LOW>;
 			default-state = "off";
 		};
 
+		/* P1.0 - 面板丝印"USB"（USB2.0 侧） */
 		led_usb1: led-usb1 {
 			label = "green:usb-1";
 			gpios = <&pca9555 8 GPIO_ACTIVE_LOW>;
@@ -244,7 +253,7 @@
 			output-high;
 		};
 	};
-	
+
 	pcie0_rst_pins: pcie0-rst-pins {
 		conf {
 			pins = "pcie_reset0";
@@ -256,13 +265,6 @@
 		conf {
 			pins = "pcie_reset1";
 			drive-open-drain = <1>;
-		};
-	};
-
-	i2c1_pins: i2c1-pins {
-		mux {
-			function = "i2c";
-			groups = "i2c1";
 		};
 	};
 
@@ -328,7 +330,12 @@
 			spi-max-frequency = <20000000>;
 			spi-cpol;
 			spi-cpha;
-			reset-gpios = <&en7581_pinctrl 4 GPIO_ACTIVE_LOW>;
+			/*
+			 * 复位脚 gpio4 由 pinctrl 下的 fsl_reset_hog 以 output-high
+			 * （ACTIVE_LOW，即释放复位）常驻持有；这里再写 reset-gpios
+			 * 会让驱动 request 时 EBUSY。SPI 目前 disabled，真要启用
+			 * FSL 时须先删掉那个 hog，把复位权交回驱动。
+			 */
 		};
 	};
 };
@@ -519,14 +526,14 @@
 	status = "okay";
 	mediatek,u3p-dis-msk = <0x1>;
 	phys = <&usb0_phy PHY_TYPE_USB2>;
-	vusb33-supply = <&reg_usb_3p3v>;
+	vusb33-supply = <&reg_3p3v>;
 };
 
 &usb1 {
 	status = "okay";
 	mediatek,u3p-dis-msk = <0x1>;
 	phys = <&usb1_phy PHY_TYPE_USB2>;
-	vusb33-supply = <&reg_usb_3p3v>;
+	vusb33-supply = <&reg_3p3v>;
 };
 
 &npu {
@@ -672,9 +679,14 @@
 	};
 };
 
+/*
+ * i2c1 在本板没有任何器件：只写了 status = "okay"，却从未给 pinctrl-0
+ * （以前的 i2c1_pins 定义了却无人引用），实测 /sys/bus/i2c/devices/i2c-1
+ * 下 client 数为 0，i2c_scl / i2c_sda 两个 pin 也一直是 UNCLAIMED。
+ * 保留只会多注册一条没有引脚的空总线，所以关掉。
+ */
 &i2c1 {
-	status = "okay";
-	clock-frequency = <400000>;
+	status = "disabled";
 };
 
 &pon_pcs {
