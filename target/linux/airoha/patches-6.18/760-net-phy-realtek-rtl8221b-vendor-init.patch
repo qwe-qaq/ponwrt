@@ -1,0 +1,110 @@
+Subject: [PATCH] net: phy: realtek: apply vendor RTL8221B 2500BASE-X SerDes init
+
+The RTL8221B on the FiberHome AN4475-G2 2.5G combo port links on the copper
+side (2500BASE-T full duplex with a real link partner) but never brings up the
+SerDes lane towards the SoC: the Airoha EN7581 ETH PCS reports
+
+  pcs_pma DIG_RO_RESERVE_2 RX_SIGDET = 0/6
+
+while the same measurement on the PON PCS returns 6/6, i.e. the PCS side and
+the measurement method are both fine and simply no signal arrives.
+
+The stock firmware brings this PHY up with a sequence that mainline does not
+perform.  Taken verbatim from the stock boot script (tce emiiw 7 <mmd> <reg>
+<val>), for hwcfg 0x4000001B..0x4000002F:
+
+  tce emiiw 7 0x1e 0x7588 0x2        } SerDes in-band AN off
+  tce emiiw 7 0x1e 0x7589 0x71d0     }   (already done by config_inband)
+  tce emiiw 7 0x1e 0x7587 0x3        }
+  tce emiiw 7 0x7  0x003c 0x0        } EEE off
+  tce emiiw 7 0x7  0x003e 0x0        }
+  tce emiiw 7 0x1f 0xa442 0x0438     } "4 line patch" / SerDes lane config
+  tce emiiw 7 0x1  0x0000 0x8000     } soft reset, latches the above
+  tce emiiw 7 0x1e 0x6a11 0xb199     } low temperature compensation
+  tce emiiw 7 0x1e 0x6a12 0xb317     }
+
+Mainline writes 0x697a/0x6a04/0x6f10/0x6f11 but none of the above, and in
+particular never the 0xa442 line patch nor the reset that latches the SerDes
+mode.  Apply the missing vendor sequence after the option mode is programmed.
+
+Gated behind rtl8221b_vendor_patch (default on) so the sequence can be
+A/B tested on a live system without rebuilding:
+  modprobe -r realtek && modprobe realtek rtl8221b_vendor_patch=0
+
+Signed-off-by: local
+
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -2040,9 +2040,71 @@
+ 	return rtl822x_set_serdes_option_mode(phydev, true);
+ }
+ 
++static bool rtl8221b_vendor_patch = true;
++module_param_named(rtl8221b_vendor_patch, rtl8221b_vendor_patch, bool, 0644);
++MODULE_PARM_DESC(rtl8221b_vendor_patch,
++		 "Apply the vendor RTL8221B 2500BASE-X SerDes/line patch sequence");
++
++/*
++ * Vendor initialisation that mainline does not perform.  The register
++ * addresses below are MMD/offset pairs exactly as the stock firmware writes
++ * them; 0x1f is MDIO_MMD_VEND2 and 0x1e is MDIO_MMD_VEND1.
++ *
++ * The 0xa442 "4 line patch" is not documented in the public datasheet but is
++ * applied unconditionally by the stock firmware on every hwcfg that ships
++ * this PHY, and the following BMCR reset is what latches the SerDes option
++ * mode together with it.
++ */
++static int rtl8221b_vendor_serdes_init(struct phy_device *phydev)
++{
++	int ret;
++
++	if (!rtl8221b_vendor_patch)
++		return 0;
++
++	/* Only meaningful for a 2500BASE-X SerDes link */
++	if (phydev->interface != PHY_INTERFACE_MODE_2500BASEX &&
++	    !test_bit(PHY_INTERFACE_MODE_2500BASEX, phydev->host_interfaces))
++		return 0;
++
++	/* EEE off */
++	ret = phy_write_mmd(phydev, MDIO_MMD_AN, 0x003c, 0x0000);
++	if (ret < 0)
++		return ret;
++
++	ret = phy_write_mmd(phydev, MDIO_MMD_AN, 0x003e, 0x0000);
++	if (ret < 0)
++		return ret;
++
++	/* "4 line patch" */
++	ret = phy_modify_mmd(phydev, MDIO_MMD_VEND2, 0xa442, 0xffff, 0x0438);
++	if (ret < 0)
++		return ret;
++
++	/* Soft reset: latch SerDes option mode and line patch */
++	ret = __phy_write(phydev, MII_BMCR, BMCR_RESET);
++	if (ret < 0)
++		return ret;
++
++	msleep(1000);
++
++	/* Low temperature compensation */
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x6a11, 0xb199);
++	if (ret < 0)
++		return ret;
++
++	return phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x6a12, 0xb317);
++}
++
+ static int rtl822xb_config_init(struct phy_device *phydev)
+ {
+-	return rtl822x_set_serdes_option_mode(phydev, false);
++	int ret;
++
++	ret = rtl822x_set_serdes_option_mode(phydev, false);
++	if (ret < 0)
++		return ret;
++
++	return rtl8221b_vendor_serdes_init(phydev);
+ }
+ 
+ static int rtl822x_config_inband(struct phy_device *phydev, unsigned int modes)

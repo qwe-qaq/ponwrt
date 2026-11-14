@@ -1,0 +1,57 @@
+Subject: [PATCH] net: phy: realtek: honour realtek,hsgmii on RTL8221B SerDes
+
+The FiberHome AN4475-G2 wires the RTL8221B to the Airoha EN7581 ETH PCS and
+describes the link as phy-mode = "2500base-x".  Mainline then programs
+MMD 30.0x697a[5:0] = 2, i.e. standard 2500BASE-X, while the EN7581 PCS
+driver selects AIROHA_SCU_ETH_XSI_HSGMII for PHY_INTERFACE_MODE_2500BASEX
+and calls airoha_pcs_init_hsgmii(); it never enables standard 2500BASE-X.
+
+The two ends therefore speak different protocols on the same 3.125G lane:
+the PHY's copper side links normally, but the host PCS receives nothing.
+
+  pcs_pma DIG_RO_RESERVE_2 RX_SIGDET = 0/6     (PON PCS, same method: 6/6)
+
+Datasheet 8.6.1 defines 30.0x697a[5:0] as: 0 = 2500Base-X+SGMII,
+1 = HiSGMII+SGMII, 2 = 2500Base-X, 3 = HiSGMII.  Mainline has no HiSGMII
+constant at all, so a board in this situation cannot express the mode it
+needs through phy-mode alone.
+
+Add the missing mode and honour an explicit realtek,hsgmii devicetree
+property, the same way other Realtek-based boards do.  Boards that do not
+set the property keep the existing behaviour.
+
+Note 30.0x6a04[10:8] is already programmed to 3'b101 (HiSGMII/2500BASE-X)
+by the existing magic-number sequence, and rtl822xb_get_rate_matching()
+returns RATE_MATCH_NONE for any mode other than 2, which is what HiSGMII
+wants.
+
+Signed-off-by: local
+
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -132,6 +132,7 @@
+ #define RTL822X_VND1_SERDES_OPTION_MODE_MASK		GENMASK(5, 0)
+ #define RTL822X_VND1_SERDES_OPTION_MODE_2500BASEX_SGMII		0
+ #define RTL822X_VND1_SERDES_OPTION_MODE_2500BASEX		2
++#define RTL822X_VND1_SERDES_OPTION_MODE_HSGMII			3
+ 
+ #define RTL822X_VND1_SERDES_CTRL3			0x7580
+ #define RTL822X_VND1_SERDES_CTRL3_MODE_MASK		GENMASK(5, 0)
+@@ -1999,6 +2000,17 @@
+ 		phydev->rate_matching = RATE_MATCH_NONE;
+ 	}
+ 
++	/* Some hosts call their 3.125G port "2500base-x" in DT but run
++	 * Realtek HiSGMII on the wire: Airoha EN7581 selects
++	 * AIROHA_SCU_ETH_XSI_HSGMII for PHY_INTERFACE_MODE_2500BASEX and
++	 * never enables standard 2500BASE-X. Programming mode 2 there
++	 * leaves the host PCS with no received signal at all.
++	 */
++	if (device_property_read_bool(&phydev->mdio.dev, "realtek,hsgmii")) {
++		mode = RTL822X_VND1_SERDES_OPTION_MODE_HSGMII;
++		phydev->rate_matching = RATE_MATCH_NONE;
++	}
++
+ 	/* the following sequence with magic numbers sets up the SerDes
+ 	 * option mode
+ 	 */
