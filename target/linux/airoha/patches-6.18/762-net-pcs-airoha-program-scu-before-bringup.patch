@@ -1,15 +1,14 @@
 Subject: [PATCH] net: pcs: airoha: program the SCU XSI selection before bringup
 
-phylink only invokes ->pcs_pre_config() from phylink_major_config(), and
-phylink_major_config() is skipped whenever the link is driven by an
-attached PHY (MLO_AN_PHY) and the interface does not change.  On the
-AN4475-G2 the gdm4 combo port has a phy-handle, so the interface stays
-2500BASE-X for the whole uptime and airoha_pcs_setup_scu() is never
-executed.
+pcs_pre_config() is only reached through phylink_major_config(), which
+does not repeat once an MLO_AN_PHY link has settled: gdm4 has a
+phy-handle, the interface stays 2500BASE-X for the whole uptime, so
+airoha_pcs_setup_scu() runs at most once, at phylink start, before the
+PHY has brought the lane up.
 
 Consequence on hardware: AIROHA_SCU_SSR3 (0x1fa20094) keeps
-ETH_XSI_SEL = 0, the SerDes lane is not routed to the HSGMII PCS, and
-the PCS receiver sees no signal at all:
+ETH_XSI_SEL = 0, the SerDes lane is not routed to the HSGMII PCS and
+the receiver sees no signal at all:
 
   pcs_pma DIG_RO_RESERVE_2 (0x1fa7b380) RX_SIGDET = 0
 
@@ -17,27 +16,26 @@ Writing ETH_XSI_SEL = AIROHA_SCU_ETH_XSI_HSGMII (0x4000) by hand flips
 RX_SIGDET to 1 immediately, which proves the SCU selection is the
 missing piece and that the lane itself is healthy.
 
-->pcs_config() does run (it is called on every link up), so program the
-SCU there as well.  It must happen before the analog bringup, because
-the PLL/CDR calibration depends on the lane actually being routed.
+pcs_config() runs on every phylink start, so program the SCU there as
+well, ahead of the analog bringup: the PLL/CDR calibration depends on
+the lane actually being routed.
 
 Signed-off-by: local
 
---- a/drivers/net/pcs/pcs-airoha.c
-+++ b/drivers/net/pcs/pcs-airoha.c
-@@ -465,9 +465,20 @@ static int airoha_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -467,9 +467,19 @@ static int airoha_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
  	maps = &priv->maps[port->index];
  	port->interface = interface;
  	data = priv->data;
  
 +	/*
 +	 * phylink only runs ->pcs_pre_config() from phylink_major_config(),
-+	 * which is skipped when a PHY is attached and the interface never
-+	 * changes.  ETH_XSI_SEL then stays 0, the SerDes lane is never
-+	 * routed to this PCS, RX_SIGDET reads 0 and nothing is received
-+	 * even though the copper side reports link up.  Program the SCU
-+	 * here too, and before the analog bringup so that the PLL/CDR
-+	 * calibration runs with the lane already routed.
++	 * which does not repeat for a settled MLO_AN_PHY link.  ETH_XSI_SEL
++	 * then stays 0, the SerDes lane is never routed to this PCS,
++	 * RX_SIGDET reads 0 and nothing is received even though the copper
++	 * side reports link up.  Program the SCU here too, and before the
++	 * analog bringup so the PLL/CDR calibration runs already routed.
 +	 */
 +	airoha_pcs_setup_scu(priv, port->index, interface);
 +
