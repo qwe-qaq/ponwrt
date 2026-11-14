@@ -589,6 +589,7 @@
 		pcs-handle = <&eth_pcs>;
 		phy-handle = <&phy_2p5g>;
 		phy-mode = "2500base-x";
+		managed = "in-band-status";
 		nvmem-cells = <&eth_base_mac 2>;
 		nvmem-cell-names = "mac-address";
 		openwrt,netdev-name = "lan1";
