@@ -42,7 +42,7 @@ Signed-off-by: local
 
 --- a/drivers/net/phy/realtek/realtek_main.c
 +++ b/drivers/net/phy/realtek/realtek_main.c
-@@ -2040,9 +2040,122 @@
+@@ -2040,9 +2040,154 @@
  	return rtl822x_set_serdes_option_mode(phydev, true);
  }
  
@@ -97,7 +97,34 @@ Signed-off-by: local
 +	if (ret < 0)
 +		phydev_warn(phydev, "PHY not ready before SerDes init: %d\n", ret);
 +
++	/*
++	 * VEND1 0x75f3 bit 0 (SERDES_CTRL_OPTION) selects where the SerDes
++	 * lane configuration is taken from.  The Realtek HiSGMII driver for
++	 * this PHY clears it before programming 0x697a; leaving it set makes
++	 * the option mode a read-only illusion - 0x697a reads back the value
++	 * that was written while the lane keeps its previous framing.
++	 */
++	ret = phy_clear_bits_mmd(phydev, MDIO_MMD_VEND1, 0x75f3, BIT(0));
++	if (ret < 0)
++		return ret;
++
 +	if (rtl8221b_stock_extra) {
++		/*
++		 * SerDes in-band AN off, as the stock firmware writes it for
++		 * this hwcfg (tce emiiw 7 0x1e 0x7588/0x7589/0x7587).
++		 */
++		ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x7588, 0x0002);
++		if (ret < 0)
++			return ret;
++
++		ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x7589, 0x71d0);
++		if (ret < 0)
++			return ret;
++
++		ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x7587, 0x0003);
++		if (ret < 0)
++			return ret;
++
 +		/* EEE off */
 +		ret = phy_write_mmd(phydev, MDIO_MMD_AN, 0x003c, 0x0000);
 +		if (ret < 0)
@@ -137,9 +164,14 @@ Signed-off-by: local
 +
 +	msleep(1000);
 +
-+	phydev_info(phydev, "SerDes latched: 697a=%#06x 7580=%#06x a468=%#06x\n",
++	phydev_info(phydev,
++		    "SerDes latched: 75f3=%#06x 697a=%#06x 7580=%#06x 7587=%#06x 7588=%#06x 7589=%#06x a468=%#06x\n",
++		    phy_read_mmd(phydev, MDIO_MMD_VEND1, 0x75f3),
 +		    phy_read_mmd(phydev, MDIO_MMD_VEND1, 0x697a),
 +		    phy_read_mmd(phydev, MDIO_MMD_VEND1, 0x7580),
++		    phy_read_mmd(phydev, MDIO_MMD_VEND1, 0x7587),
++		    phy_read_mmd(phydev, MDIO_MMD_VEND1, 0x7588),
++		    phy_read_mmd(phydev, MDIO_MMD_VEND1, 0x7589),
 +		    phy_read_mmd(phydev, MDIO_MMD_VEND2, 0xa468));
 +
 +	if (!rtl8221b_stock_extra)
