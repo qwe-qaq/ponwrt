@@ -1,0 +1,102 @@
+From: FTTR maintainers
+Subject: [PATCH] net: airoha: reject unresolved FTTR bridge master paths
+
+When routed port admission is withdrawn, flow path discovery can fall back
+to the bridge master instead of fttr0. Such rules bypass the physical-device
+direction classifier and can immediately rebind an upstream PPE entry.
+
+Reject bridge-master aliases containing FTTR ports. They lack a resolved
+transport port, so they cannot safely implement FTTR direction policy. This
+also leaves ambiguous non-FTTR traffic on the same bridge in software;
+properly resolved physical-device paths remain eligible. Drain those bridge
+aliases when changing direction policy as well as the physical/logical ports.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -56,8 +56,14 @@ static int airoha_fttr_directions_set(const char *val,
+ 	for (i = 0; cleanup && i <= 16; i++) {
+ 		snprintf(name, sizeof(name), "fttr%d", i);
+ 		lower = __dev_get_by_name(&init_net, name);
+-		if (lower)
++		if (lower) {
++			struct net_device *master;
++
+ 			cleanup(lower);
++			master = netdev_master_upper_dev_get(lower);
++			if (master && netif_is_bridge_master(master))
++				cleanup(master);
++		}
+ 	}
+ 	if (cleanup)
+ 		symbol_put(nf_flow_table_cleanup);
+@@ -78,5 +84,29 @@ MODULE_PARM_DESC(fttr_offload_directions,
+                 "FTTR PPE directions: bit0=upstream bit1=downstream bit2=ONU pair");
+ 
++static bool airoha_fttr_bridge_alias(struct net_device *dev)
++{
++	struct net_device *port;
++	char name[IFNAMSIZ];
++	bool alias = false;
++	int i;
++
++	if (!dev || !netif_is_bridge_master(dev))
++		return false;
++	for (i = 1; i <= 16; i++) {
++		snprintf(name, sizeof(name), "fttr%d", i);
++		port = dev_get_by_name(dev_net(dev), name);
++		if (!port)
++			continue;
++		rcu_read_lock();
++		alias = netdev_master_upper_dev_get_rcu(port) == dev;
++		rcu_read_unlock();
++		dev_put(port);
++		if (alias)
++			break;
++	}
++	return alias;
++}
++
+ static bool airoha_fttr_direction_allowed(struct airoha_eth *eth,
+                                          struct flow_cls_offload *f)
+ {
+@@ -85,7 +115,7 @@ static bool airoha_fttr_direction_allowed(struct airoha_eth *eth,
+ 	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+-	struct net_device *lower;
++	struct net_device *lower, *ingress;
+ 	struct flow_match_meta meta;
+ 	struct flow_action_entry *act;
+ 	bool in, out = false;
+ 	unsigned int bit;
+ 	int i;
+@@ -98,10 +128,28 @@ static bool airoha_fttr_direction_allowed(struct airoha_eth *eth,
+ 		return true;
+ 	flow_rule_match_meta(rule, &meta);
++	if (meta.mask->ingress_ifindex != U32_MAX) {
++		dev_put(lower);
++		return false;
++	}
++	ingress = dev_get_by_index(dev_net(lower), meta.key->ingress_ifindex);
++	if (airoha_fttr_bridge_alias(ingress)) {
++		dev_put(ingress);
++		dev_put(lower);
++		return false;
++	}
++	if (ingress)
++		dev_put(ingress);
+ 	in = meta.mask->ingress_ifindex == U32_MAX &&
+ 	     meta.key->ingress_ifindex == lower->ifindex;
+-	flow_action_for_each(i, act, &rule->action)
+-		if (act->id == FLOW_ACTION_REDIRECT && act->dev == lower)
+-			out = true;
++	flow_action_for_each(i, act, &rule->action) {
++		if (act->id != FLOW_ACTION_REDIRECT)
++			continue;
++		if (airoha_fttr_bridge_alias(act->dev)) {
++			dev_put(lower);
++			return false;
++		}
++		out |= act->dev == lower;
++	}
+ 	dev_put(lower);
+ 	if (!in && !out)
+ 		return true;
