@@ -284,6 +284,11 @@
 		line-name = "gpon-power";
 	};
 
+	/*
+	 * 2.5G 光电复用（Combo）Mux：GPIO22 / GPIO23 互斥选通 usb_pcs 去向。
+	 *   GPIO22=0, GPIO23=1：铜口 PHY（MDIO addr 7，当前默认）
+	 *   GPIO22=1, GPIO23=0：LAN 2.5G SFP 光口笼（RX/LOS 检测 GPIO25）
+	 */
 	combo_mux_sel0_hog: combo-mux-sel0-hog {
 		gpio-hog;
 		gpios = <22 GPIO_ACTIVE_HIGH>;
@@ -586,21 +591,24 @@
 	 * GDM4 经硬件仲裁器同时接 ETH SerDes 与 USB SerDes，两边各是一个
 	 * netdev。驱动把 ethernet-port 的 reg 直接当作 nbq，并用它把收到
 	 * 的帧分派给对应 netdev（airoha_en7581_get_dev_from_sport）：
-	 *   nbq 0 <- HSGMII_LAN_7581_ETH_SRCPORT -> eth_pcs -> SFP 笼
-	 *   nbq 1 <- HSGMII_LAN_7581_USB_SRCPORT -> usb_pcs -> RTL8221B
-	 * 所以 2.5G 铜口必须挂在 ethernet-port@1，否则它的帧会被投递到
-	 * 另一个 netdev 上。
+	 *   nbq 0 <- HSGMII_LAN_7581_ETH_SRCPORT -> eth_pcs -> FSL FTTR 下行 NNI（原厂 eth5）
+	 *   nbq 1 <- HSGMII_LAN_7581_USB_SRCPORT -> usb_pcs -> 2.5G Combo（原厂 eth4，默认铜口）
+	 * 所以 2.5G 铜口必须挂在 ethernet-port@1，FTTR 下行 NNI 挂在 ethernet-port@0。
 	 */
-	sfp_port: ethernet-port@0 {
+	fttr_port: ethernet-port@0 {
 		compatible = "airoha,eth-port";
 		reg = <0>;
-		managed = "in-band-status";
 		pcs-handle = <&eth_pcs>;
 		phy-mode = "2500base-x";
 		nvmem-cells = <&eth_base_mac 1>;
 		nvmem-cell-names = "mac-address";
-		openwrt,netdev-name = "sfp0";
+		openwrt,netdev-name = "fttr0";
 		status = "okay";
+
+		fixed-link {
+			speed = <2500>;
+			full-duplex;
+		};
 	};
 
 	port_2p5g: ethernet-port@1 {
@@ -681,8 +689,8 @@
 		reg = <0x51>;
 		fiberhome,ben-active-high;
 		tx-disable-gpios = <&en7581_pinctrl 38 GPIO_ACTIVE_HIGH>;
-		nvmem-cells = <&pon_calibration>;
-		nvmem-cell-names = "calibration";
+		nvmem-cells = <&pon_cal_xg>;
+		nvmem-cell-names = "calibration-xg";	
 		status = "okay";
 	};
 
