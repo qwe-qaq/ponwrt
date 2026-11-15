@@ -689,8 +689,8 @@
 		reg = <0x51>;
 		fiberhome,ben-active-high;
 		tx-disable-gpios = <&en7581_pinctrl 38 GPIO_ACTIVE_HIGH>;
-		nvmem-cells = <&pon_cal_xg>;
-		nvmem-cell-names = "calibration-xg";	
+		nvmem-cells = <&pon_calibration>;
+		nvmem-cell-names = "calibration";	
 		status = "okay";
 	};
 
