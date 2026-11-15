@@ -469,7 +469,7 @@
 		 *   0x1a1000  10ge_sym_table  | 10G-EPON 对称（与 0x1a4000 逐字节相同）
 		 *   0x1a2000  xg_table        | XG-PON(10G下/2.5G上)
 		 *   0x1a3000  xgs_table       | XGS-PON 10G 对称（与 0x1a4000 逐字节相同）
-		 *   0x1a4000  table           | 通用/XGS/10G-EPON 对称复用  ★ 当前生效
+		 *   0x1a4000  table           | 通用/XGS/10G-EPON 对称复用 
 		 * 【启用哪一个】只改下面节点的 reg 起始地址，并把节点名 @地址
 		 * 改成同一个值（两者不一致 dtc 会报 unit address 与 reg 不匹配）。
 		 * label 与 &an4475_bosa 都不用动；其 nvmem-cell-names 必须恒为
