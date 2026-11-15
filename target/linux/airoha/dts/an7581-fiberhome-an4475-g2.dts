@@ -718,7 +718,7 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&pon_pins>;
 	optical-front-end = <&an4475_bosa>;
-	nvmem-cells = <&fiberhome_pon_serial>;
+	nvmem-cells = <&pon_serial>;
 	nvmem-cell-names = "pon-serial";
 	data-path = <&gdm2>;
 	status = "okay";
