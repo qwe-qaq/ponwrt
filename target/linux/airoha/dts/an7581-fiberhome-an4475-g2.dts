@@ -113,6 +113,12 @@
 		};
 	};
 
+	sfp0: sfp0 {
+		compatible = "sff,sfp";
+		i2c-bus = <&i2c_gpio>;
+		maximum-power-milliwatt = <2500>;
+	};
+
 	leds_expander: leds-expander {
 		compatible = "gpio-leds";
 
@@ -347,6 +353,8 @@
 
 &spi_nand {
 	nand-ecc-engine = <&spi_nand>;
+	#address-cells = <1>;
+	#size-cells = <1>;
 
 	partitions: partitions {
 		compatible = "fixed-partitions";
@@ -596,16 +604,12 @@
 		compatible = "airoha,eth-port";
 		reg = <0>;
 		pcs-handle = <&eth_pcs>;
-		phy-mode = "2500base-x";
+		phy-mode = "10gbase-r";
+		sfp = <&sfp0>;
 		nvmem-cells = <&eth_base_mac 1>;
 		nvmem-cell-names = "mac-address";
 		openwrt,netdev-name = "fttr0";
 		status = "okay";
-
-		fixed-link {
-			speed = <2500>;
-			full-duplex;
-		};
 	};
 
 	port_2p5g: ethernet-port@1 {
