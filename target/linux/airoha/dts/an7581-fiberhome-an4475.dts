@@ -113,6 +113,12 @@
 		};
 	};
 
+	sfp0: sfp0 {
+		compatible = "sff,sfp";
+		i2c-bus = <&i2c_gpio>;
+		maximum-power-milliwatt = <2500>;
+	};
+
 	leds_expander: leds-expander {
 		compatible = "gpio-leds";
 
@@ -564,12 +570,6 @@
 	status = "okay";
 };
 
-sfp0: sfp0 {
-		compatible = "sff,sfp";
-		i2c-bus = <&i2c_gpio>;
-		maximum-power-milliwatt = <2500>;
-};
-
 &mdio {
 	reset-gpios = <&en7581_pinctrl 30 GPIO_ACTIVE_LOW>;
 	reset-delay-us = <30000>;
@@ -607,7 +607,7 @@ sfp0: sfp0 {
 		phy-mode = "10gbase-r";
 		sfp = <&sfp0>;
 		managed = "in-band-status";
-		nvmem-cells = <&fiberhome_base_mac 2>;
+		nvmem-cells = <&eth_base_mac 1>;
 		nvmem-cell-names = "mac-address";
 		openwrt,netdev-name = "fttr0";
 		status = "okay";
