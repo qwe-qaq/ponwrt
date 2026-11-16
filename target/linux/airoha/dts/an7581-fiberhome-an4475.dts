@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /dts-v1/;
 
-												
 /memreserve/ 0x80000000 0x200000;
 
 #include <dt-bindings/gpio/gpio.h>
@@ -28,7 +27,6 @@
 	};
 
 	chosen {
-																			 
 		rootdisk = <&ubi_fit>;
 		bootargs = "console=ttyS0,115200 earlycon";
 		stdout-path = "serial0:115200n8";
@@ -38,16 +36,6 @@
 		device_type = "memory";
 		reg = <0x0 0x80000000 0x0 0x20000000>;
 	};
-
-													  
-						   
-								 
-					  
-					
-									  
-									  
-								
-   
 
 	keys {
 		compatible = "gpio-keys";
@@ -125,12 +113,6 @@
 		};
 	};
 
-			 
-						 
-						
-								   
-   
-
 	leds_expander: leds-expander {
 		compatible = "gpio-leds";
 
@@ -138,7 +120,6 @@
 		led_internet: led-internet {
 			label = "green:wan-online";
 			gpios = <&pca9555 0 GPIO_ACTIVE_LOW>;
-										 
 			default-state = "off";
 		};
 
@@ -146,7 +127,6 @@
 		led_los: led-los {
 			label = "red:los";
 			gpios = <&pca9555 1 GPIO_ACTIVE_LOW>;
-									  
 			default-state = "off";
 		};
 
@@ -429,8 +409,6 @@
 
 		pon_serial: pon-serial@a2 {
 			reg = <0x0000a2 0x00000c>;
-								 
-							   
 		};
 
 		base_mac: base-mac@40 {
@@ -471,8 +449,6 @@
 
 		priprotocol_mac: priprotocol-mac@72 {
 			reg = <0x000072 0x000006>;
-							 
-							   
 		};
 
 		wifi_mac_2g4: wifi-mac-2g4@96 {
@@ -517,8 +493,6 @@
 		apd_ys01: apd-ys01@1a7000 {
 			reg = <0x1a7000 0x00012c>;
 		};
-	   
-	  
 
 		bosa_info: bosa-info@1a8000 {
 			reg = <0x1a8000 0x0000e6>;
@@ -552,26 +526,7 @@
 	};
 };
 
-	  
-				 
-  
-
 &usb0 {
-				 
-  
-
-	   
-									   
-								  
-				 
-  
-
-		 
-				 
-  
-
-			
-				
 	status = "okay";
 	mediatek,u3p-dis-msk = <0x1>;
 	phys = <&usb0_phy PHY_TYPE_USB2>;
@@ -586,7 +541,6 @@
 };
 
 &npu {
-				
 	status = "okay";
 	firmware-name = "airoha/en7581_MT7996_npu_rv32.bin",
 			"airoha/en7581_MT7996_npu_data.bin";
@@ -607,7 +561,6 @@
 };
 
 &usb_pcs {
-				
 	status = "okay";
 };
 
@@ -621,8 +574,6 @@ sfp0: sfp0 {
 	reset-gpios = <&en7581_pinctrl 30 GPIO_ACTIVE_LOW>;
 	reset-delay-us = <30000>;
 	reset-post-delay-us = <300000>;
-   
-  
 
 	phy_2p5g: ethernet-phy@7 {
 		compatible = "ethernet-phy-ieee802.3-c22";
@@ -634,9 +585,6 @@ sfp0: sfp0 {
 	};
 };
 
-		  
-				 
-  
 
 &gdm4 {
 	/delete-property/ pcs-handle;
@@ -811,9 +759,6 @@ sfp0: sfp0 {
 			airoha,npu = <&npu>;
 			airoha,eth = <&eth>;
 
-						
-					 
-
 			band@0 {
 				reg = <0>;
 				nvmem-cells = <&wifi_mac_2g4>;
@@ -846,24 +791,3 @@ sfp0: sfp0 {
 		};
 	};
 };
-
-	   
-				 
-							  
-								  
-							 
-  
-
-	   
-				 
-							  
-								  
-							 
-  
-
-					 
-							
-		 
-									  
-   
-  
