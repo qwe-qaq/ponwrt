@@ -606,7 +606,6 @@
 		pcs-handle = <&eth_pcs>;
 		phy-mode = "10gbase-r";
 		sfp = <&sfp0>;
-		managed = "in-band-status";
 		nvmem-cells = <&eth_base_mac 1>;
 		nvmem-cell-names = "mac-address";
 		openwrt,netdev-name = "fttr0";
