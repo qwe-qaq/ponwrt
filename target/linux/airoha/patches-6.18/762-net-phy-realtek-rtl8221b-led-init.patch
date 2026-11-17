@@ -1,0 +1,57 @@
+Subject: [PATCH] net: phy: realtek: init RTL8221B RJ45 LED for all link speeds
+
+The RTL8221B drives the RJ45 LEDs itself.  Its power-on LED configuration
+only indicates a 2500M link, so at 1000M/100M the jack looks dead even
+though the link is up and passing traffic.  Program the vendor LED
+registers (LED_CFG2 / LCR6 / LED_ACT) in config_init().
+
+Signed-off-by: qwe666 <64239822+qwe-qaq@users.noreply.github.com>
+
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -2040,9 +2040,44 @@
+ 	return rtl822x_set_serdes_option_mode(phydev, true);
+ }
+ 
++/* Power-on defaults leave the LED pins idle below 2.5 Gbps. */
++static int rtl8221b_vb_led_init(struct phy_device *phydev)
++{
++	int ret, val;
++
++	if (phydev->phy_id != RTL_8221B_VB_CG)
++		return 0;
++
++	if (phydev->interface != PHY_INTERFACE_MODE_2500BASEX &&
++	    !test_bit(PHY_INTERFACE_MODE_2500BASEX, phydev->host_interfaces))
++		return 0;
++
++	/* VEND2 writes are ignored until the PHY state machine is ready. */
++	ret = phy_read_mmd_poll_timeout(phydev, MDIO_MMD_VEND2, 0xa420, val,
++					(val & GENMASK(1, 0)) == 3,
++					2000, 1500000, false);
++	if (ret < 0)
++		phydev_warn(phydev, "PHY not ready before LED init: %d\n", ret);
++
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND2, 0xd036, 0x0027);
++	if (ret < 0)
++		return ret;
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND2, 0xd040, 0x3914);
++	if (ret < 0)
++		return ret;
++
++	return phy_write_mmd(phydev, MDIO_MMD_VEND2, 0xd044, 0x0040);
++}
++
+ static int rtl822xb_config_init(struct phy_device *phydev)
+ {
+-	return rtl822x_set_serdes_option_mode(phydev, false);
++	int ret;
++
++	ret = rtl822x_set_serdes_option_mode(phydev, false);
++	if (ret < 0)
++		return ret;
++
++	return rtl8221b_vb_led_init(phydev);
+ }
+ 
+ static int rtl822x_config_inband(struct phy_device *phydev, unsigned int modes)

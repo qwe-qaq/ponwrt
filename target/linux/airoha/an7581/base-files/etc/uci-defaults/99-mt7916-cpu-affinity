@@ -1,0 +1,19 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+case "$(board_name)" in
+fiberhome,hg5585f-ct|\
+fiberhome,hg5585f-ct-usb-sfp|\
+fiberhome,hg5585f-cu|\
+fiberhome,hg5585f-cu-usb-sfp)
+	uci -q batch <<-EOF
+		set network.globals.packet_steering='0'
+		commit network
+	EOF
+	/etc/init.d/packet_steering disable
+	/etc/init.d/packet_steering stop
+	;;
+esac
+
+exit 0
