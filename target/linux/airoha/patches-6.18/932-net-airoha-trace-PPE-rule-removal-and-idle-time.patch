@@ -1,0 +1,38 @@
+Subject: [PATCH] net: airoha: diagnose PPE removal and idle-time reporting
+
+Extend the opt-in ppe_debug diagnostics to distinguish flower destroy,
+egress mapping invalidation and statistics polling. Do not retain stale
+rules or change idle-time calculation to conceal a removal bug.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1007,6 +1007,9 @@ void airoha_ppe_remove_egress_flows(struct airoha_gdm_dev *dev)
+ 	 */
+ 	list_for_each_entry_safe(e, tmp, &remove_list, gc_node) {
+ 		list_del_init(&e->gc_node);
++		ppe_diag(eth, "egress-remove cookie=%lx hash=%u type=%u caller=%pS\n",
++			 e->cookie, e->hash, e->type,
++			 (void *)_RET_IP_);
+ 		airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
+ 		rhashtable_remove_fast(&eth->flow_table, &e->node,
+ 				       airoha_flow_table_params);
+@@ -1553,6 +1556,8 @@ static int airoha_ppe_flow_offload_destroy(struct airoha_eth *eth,
+ 	if (!e)
+ 		return -ENOENT;
+ 
++	ppe_diag(eth, "destroy cookie=%lx hash=%u type=%u ib1=%08x\n",
++		 f->cookie, e->hash, e->type, e->data.ib1);
+ 	airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
+ 	rhashtable_remove_fast(&eth->flow_table, &e->node,
+ 			       airoha_flow_table_params);
+@@ -1639,6 +1644,10 @@ static int airoha_ppe_flow_offload_stats(struct airoha_eth *eth,
+ 	idle = airoha_ppe_entry_idle_time(eth->ppe, e);
+ 	f->stats.lastused = jiffies - idle * HZ;
+ 
++	ppe_diag(eth, "stats cookie=%lx hash=%u ib1=%08x idle=%u now=%u lastused=%llu\n",
++		 f->cookie, e->hash, e->data.ib1, idle,
++		 airoha_ppe_get_timestamp(eth->ppe),
++		 (unsigned long long)f->stats.lastused);
+ 	if (e->hash != 0xffff) {
+ 		struct airoha_foe_stats64 stats = {};
+ 
