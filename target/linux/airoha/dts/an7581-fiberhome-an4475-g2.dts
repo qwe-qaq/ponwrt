@@ -113,10 +113,15 @@
 		};
 	};
 
-	sfp0: sfp0 {
+	sfp0: sfp {
 		compatible = "sff,sfp";
 		i2c-bus = <&i2c_gpio>;
 		maximum-power-milliwatt = <2500>;
+		/* NOTE: verify which port the SFP cage belongs to. The combo-mux
+		 * comment describes a 2.5G optical cage (RX/LOS = GPIO25), but
+		 * sfp is currently referenced by fttr_port (10G NNI). If the cage
+		 * is the 2.5G one, move `sfp = <&sfp0>` to port_2p5g and add
+		 * los-gpios = <&en7581_pinctrl 25 GPIO_ACTIVE_HIGH> here. */
 	};
 
 	leds_expander: leds-expander {
@@ -260,16 +265,20 @@
 		};
 	};
 
+	/* pcie0 owns both lanes (pcie-mac + sec-pcie-mac) and drives both
+	 * PERST outputs, so both reset pins belong to one open-drain state.
+	 * The old pcie1_rst_pins became dead code once pcie1 was folded in. */
 	pcie0_rst_pins: pcie0-rst-pins {
 		conf {
-			pins = "pcie_reset0";
+			pins = "pcie_reset0", "pcie_reset1";
 			drive-open-drain = <1>;
 		};
 	};
 
-	pcie1_rst_pins: pcie1-rst-pins {
+	/* pcie2 reset pin; label was referenced by &pcie2 but never defined. */
+	pcie2_rst_pins: pcie2-rst-pins {
 		conf {
-			pins = "pcie_reset1";
+			pins = "pcie_reset2";
 			drive-open-drain = <1>;
 		};
 	};
@@ -547,6 +556,7 @@
 };
 
 &npu {
+	status = "okay";
 	firmware-name = "airoha/en7581_MT7996_npu_rv32.bin",
                         "airoha/en7581_MT7996_npu_data.bin";
 };
@@ -758,7 +768,8 @@
 		#address-cells = <3>;
 		#size-cells = <2>;
 
-		mt7990@0,0 {
+		wifi@0,0 {
+			compatible = "mediatek,mt76";
 			reg = <0x0000 0 0 0 0>;
 			#address-cells = <1>;
 			#size-cells = <0>;
