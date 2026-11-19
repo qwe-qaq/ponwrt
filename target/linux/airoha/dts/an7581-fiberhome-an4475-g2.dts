@@ -730,39 +730,51 @@
 	status = "okay";
 };
 
-
 &pcie0 {
 	status = "okay";
 	max-link-speed = <2>;
+
+	reg = <0x0 0x1fc00000 0x0 0x1670>,
+	      <0x0 0x1fc20000 0x0 0x1670>;
+	reg-names = "pcie-mac", "sec-pcie-mac";
+
+	resets = <&scuclk EN7581_PCIE0_RST>,
+		 <&scuclk EN7581_PCIE1_RST>,
+		 <&scuclk EN7581_PCIC_PERSTOUT0_RST>,
+		 <&scuclk EN7581_PCIC_PERSTOUT1_RST>;
+	reset-names = "phy-lane0", "phy-lane1",
+		      "perstout", "sec-perstout";
+
+	num-lanes = <2>;
+
+	airoha,scu = <&scuclk>;
+
 	pinctrl-names = "default";
 	pinctrl-0 = <&pcie0_rst_pins>;
-
 	pcie@0,0 {
 		reg = <0x0000 0 0 0 0>;
+		device_type = "pci";
 		#address-cells = <3>;
 		#size-cells = <2>;
 
-		wifi@0,0 {
-			compatible = "mediatek,mt76";
+		mt7996@0,0 {
 			reg = <0x0000 0 0 0 0>;
-
 			#address-cells = <1>;
 			#size-cells = <0>;
-
 			nvmem-cells = <&wifi_eeprom>;
 			nvmem-cell-names = "eeprom";
-			mediatek,eeprom-merge-otp;
-
 			airoha,npu = <&npu>;
 			airoha,eth = <&eth>;
 
 			band@0 {
+				/* 2.4 GHz */
 				reg = <0>;
 				nvmem-cells = <&wifi_mac_2g4>;
 				nvmem-cell-names = "mac-address";
 			};
 
 			band@1 {
+				/* 5 GHz */
 				reg = <1>;
 				nvmem-cells = <&wifi_mac_5g>;
 				nvmem-cell-names = "mac-address";
@@ -772,19 +784,12 @@
 };
 
 &pcie1 {
+	status = "disabled";
+};
+
+&pcie2 {
 	status = "okay";
-	max-link-speed = <2>;
+
 	pinctrl-names = "default";
-	pinctrl-0 = <&pcie1_rst_pins>;
-
-	pcie@0,0 {
-		reg = <0x0000 0 0 0 0>;
-		#address-cells = <3>;
-		#size-cells = <2>;
-
-		wifi@0,0 {
-			compatible = "mediatek,mt76";
-			reg = <0x0000 0 0 0 0>;
-		};
-	};
+	pinctrl-0 = <&pcie2_rst_pins>;
 };
