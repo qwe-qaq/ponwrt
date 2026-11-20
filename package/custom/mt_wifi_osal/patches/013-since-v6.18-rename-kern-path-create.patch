@@ -1,0 +1,43 @@
+From: local private research
+Subject: [PATCH] mt_wifi_osal: Use start_creating_path()/end_creating_path()
+
+6.18 replaced the kern_path_create()/done_path_create() pair with
+start_creating_path()/end_creating_path() and dropped the old names from
+include/linux/namei.h, so mt_diag_create_directory() no longer sees any
+declaration of them:
+
+  mt_osal_diag.c:594:10: error: implicit declaration of function
+  'kern_path_create' [-Wimplicit-function-declaration]
+
+The new functions are exported and keep the same contract: the returned
+dentry holds the parent lock and a write reference on the mount, which
+end_creating_path() releases. Keep the old names for older kernels.
+
+Signed-off-by: local private research
+---
+--- a/mt_osal_diag.c
++++ b/mt_osal_diag.c
+@@ -591,7 +591,11 @@
+ 	struct path path;
+ 	int err;
+ 
++#if (KERNEL_VERSION(6, 18, 0) <= LINUX_VERSION_CODE)
++	dentry = start_creating_path(AT_FDCWD, name, &path, LOOKUP_DIRECTORY);
++#else
+ 	dentry = kern_path_create(AT_FDCWD, name, &path, LOOKUP_DIRECTORY);
++#endif
+ 	if (IS_ERR(dentry)) {
+ 		MT_DEBUG_TRACE("Error create!\n");
+ 		return PTR_ERR(dentry);
+@@ -606,7 +610,11 @@
+ #endif
+ 	if (!err)
+ 		MT_DEBUG_TRACE("create %s OK!\n", name);
++#if (KERNEL_VERSION(6, 18, 0) <= LINUX_VERSION_CODE)
++	end_creating_path(&path, dentry);
++#else
+ 	done_path_create(&path, dentry);
++#endif
+ 	return err;
+ }
+ 

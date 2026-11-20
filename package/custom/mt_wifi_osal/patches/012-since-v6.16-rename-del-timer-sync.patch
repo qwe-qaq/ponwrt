@@ -1,0 +1,38 @@
+From: local private research
+Subject: [PATCH] mt_wifi_osal: Use timer_delete_sync() on Linux 6.16+
+
+v6.16 removed the del_timer_sync() wrapper (commit "timers: Remove
+del_timer_sync()"), keeping only timer_delete_sync(). With 6.18 the call
+is no longer declared anywhere, so GCC 14 reports:
+
+  mt_osal_timer.c:98:31: error: implicit declaration of function
+  'del_timer_sync'; did you mean 'dev_mc_sync'?
+  [-Wimplicit-function-declaration]
+
+Keep the old name behind a version gate: both functions are identical,
+the rename happened in 6.16.
+
+Signed-off-by: local private research
+---
+--- a/mt_osal_timer.c
++++ b/mt_osal_timer.c
+@@ -94,10 +94,16 @@
+ 	OS_TIMER *pTimer,
+ 	unsigned char *pCancelled)
+ {
+-	if (timer_pending(pTimer))
+-		*pCancelled = del_timer_sync(pTimer);
+-	else
++	if (!timer_pending(pTimer)) {
+ 		*pCancelled = true;
++		return;
++	}
++
++#if (KERNEL_VERSION(6, 16, 0) <= LINUX_VERSION_CODE)
++	*pCancelled = timer_delete_sync(pTimer);
++#else
++	*pCancelled = del_timer_sync(pTimer);
++#endif
+ }
+ EXPORT_SYMBOL(mt_os_del_timer);
+ 
