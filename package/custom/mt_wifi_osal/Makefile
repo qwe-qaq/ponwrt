@@ -24,7 +24,11 @@ endef
 BACKPORT_VERSION:=$(lastword $(subst /, , $(shell find $(KERNEL_BUILD_DIR) -type 'd' -name 'backports*')))
 EXTRA_KCONFIG += CFG_CFG80211_VERSION:=$(word 2,$(subst -, ,$(BACKPORT_VERSION)))
 
-PKG_EXTRA_CFLAGS:= $(addprefix -Wno-error=,missing-prototypes missing-declarations) \
+# Linux 6.18 的 kbuild 已移除 EXTRA_CFLAGS（传了也会被静默丢弃），必须改用
+# CFLAGS_MODULE 下发：它在 scripts/Makefile.lib 的 c_flags 中排在 ccflags-y 之后，
+# 可压过 vendor Kbuild 自带的 -Werror。6.18 默认打开 -Wextra、-Wmissing-prototypes、
+# -Wmissing-declarations，原厂代码在这三类上不可能清零，故整体降级为 warning。
+PKG_EXTRA_CFLAGS:= -Wno-error -Wno-missing-prototypes -Wno-missing-declarations \
 		$(if $(CONFIG_MTK_WIFI_OSAL_CFG80211_SUPPORT), -DCFG80211_SUPPORT) \
 		$(if $(CONFIG_MTK_WIFI_OSAL_DEBUG), -DMT_DEBUG) \
 		$(if $(CONFIG_MTK_WIFI_OSAL_CUSTOM_VPRINTK), -DCUSTOM_FACILITY=$(CONFIG_MTK_WIFI_OSAL_CUSTOM_VPRINTK_FACILITY)) \
@@ -53,7 +57,7 @@ define Build/Compile
 	+$(KERNEL_MAKE) $(PKG_JOBS) \
 		M="$(PKG_BUILD_DIR)" \
 		NOSTDINC_FLAGS="$(NOSTDINC_FLAGS)" \
-		EXTRA_CFLAGS="$(PKG_EXTRA_CFLAGS) $(EXTRA_CFLAGS)" \
+		CFLAGS_MODULE="$(PKG_EXTRA_CFLAGS)" \
 		$(EXTRA_KCONFIG) \
 		KBUILD_EXTRA_SYMBOLS="$(wildcard $(PKG_SYMVERS_DIR)/*.symvers)" \
 		modules

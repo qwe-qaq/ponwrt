@@ -374,6 +374,10 @@ endif
 endif
 
 KCFLAGS += $(addprefix -Wno-error=,missing-prototypes missing-declarations)
+# 6.18 默认启用 -Wextra/-Wmissing-prototypes/-Wmissing-declarations，而原厂 Kbuild
+# 自带的 -Werror 写在 ccflags-y 里，位置晚于 KCFLAGS；只有 CFLAGS_MODULE 在
+# c_flags 中最靠后，能稳定把这批 vendor 风格的告警降级（错误仍为错误）。
+PKG_EXTRA_MODULE_CFLAGS := -Wno-error -Wno-missing-prototypes -Wno-missing-declarations
 KCFLAGS += $(if $(CONFIG_MTK_WIFI7_OSAL_SUPPORT), -DMT_WIFI_COMMON_SUPPORT -DMT_WIFI_OSAL_SUPPORT -I$(STAGING_DIR)/usr/include/mt_wifi -I$(STAGING_DIR)/usr/include/mt_wifi/os)
 
 define collect_module_symvers
@@ -393,6 +397,7 @@ define Build/Compile
 		$(foreach c, $(PKG_KCONFIG),$(if $(CONFIG_MTK_WIFI7_$c),CONFIG_$(c)=$(CONFIG_MTK_WIFI7_$(c)))) \
 		NOSTDINC_FLAGS="$(NOSTDINC_FLAGS)" \
 	 	KCFLAGS="$(KCFLAGS)" \
+		CFLAGS_MODULE="$(PKG_EXTRA_MODULE_CFLAGS)" \
 		CFG_CFG80211_VERSION:=$(word 2,$(subst -, ,$(BACKPORT_VERSION))) \
 		KBUILD_EXTRA_SYMBOLS="$(wildcard $(PKG_SYMVERS_DIR)/*.symvers)" \
 		modules
