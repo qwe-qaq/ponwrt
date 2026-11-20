@@ -1,0 +1,75 @@
+From: local private research
+Subject: [PATCH] mt_osal_timer: Stop depending on the RTC library
+
+rtc_ktime_to_tm() and rtc_time64_to_tm() are implemented in
+drivers/rtc/lib.c, which is built only when CONFIG_RTC_LIB is enabled. The
+AN7581 kernel config has no RTC support, so the helper is missing from the
+kernel and modpost rejects the module:
+
+  ERROR: modpost: "rtc_ktime_to_tm" [mt_wifi_osal.ko] undefined!
+
+The conversion is pure calendar arithmetic and needs nothing from the RTC
+subsystem, so call the core time64_to_tm() helper (always built, always
+exported) and copy the result into struct rtc_time.
+
+While at it, mt_get_time_info() passed a seconds value where a ktime_t in
+nanoseconds was expected, which pinned the reported date to 1970-01-01; the
+new helper takes the seconds value directly.
+
+Signed-off-by: local private research
+---
+--- a/mt_osal_timer.c
++++ b/mt_osal_timer.c
+@@ -7,6 +7,7 @@
+ #include <linux/errno.h>
+ #include <linux/rcupdate.h>
+ #include <linux/types.h>
++#include <linux/time.h>
+ #include <linux/timekeeping.h>
+ #include <net/cfg80211.h>
+ #include <linux/skbuff.h>
+@@ -184,9 +185,34 @@
+ }
+ EXPORT_SYMBOL(mt_os_get_boottime64_ns);
+ 
++/*
++ * rtc_ktime_to_tm()/rtc_time64_to_tm() live in drivers/rtc/lib.c, which is
++ * only compiled when CONFIG_RTC_LIB is enabled; with RTC support turned off
++ * modpost fails on the undefined symbol. The conversion itself needs nothing
++ * from the RTC subsystem, so use the core helper instead.
++ */
++static void mt_time64_to_rtc_tm(time64_t secs, struct rtc_time *tm)
++{
++	struct tm t;
++
++	time64_to_tm(secs, 0, &t);
++	tm->tm_sec = t.tm_sec;
++	tm->tm_min = t.tm_min;
++	tm->tm_hour = t.tm_hour;
++	tm->tm_mday = t.tm_mday;
++	tm->tm_mon = t.tm_mon;
++	tm->tm_year = t.tm_year;
++	tm->tm_wday = t.tm_wday;
++	tm->tm_yday = t.tm_yday;
++	tm->tm_isdst = t.tm_isdst;
++}
++
+ struct rtc_time mt_rtc_ktime_to_tm(ktime_t ktime)
+ {
+-	return rtc_ktime_to_tm(ktime);
++	struct rtc_time tm;
++
++	mt_time64_to_rtc_tm(ktime_to_timespec64(ktime).tv_sec, &tm);
++	return tm;
+ }
+ EXPORT_SYMBOL(mt_rtc_ktime_to_tm); /* to-do: remove after logan change merged.@2024/12/13 */
+ 
+@@ -201,7 +227,7 @@
+ 		return;
+ 	}
+ 	ktime_get_real_ts64(&txc);
+-	tm = rtc_ktime_to_tm(txc.tv_sec);
++	mt_time64_to_rtc_tm(txc.tv_sec, &tm);
+ 	tm_info->year = tm.tm_year + 1900;
+ 	tm_info->month = tm.tm_mon + 1;
+ 	tm_info->day = tm.tm_hour;
