@@ -24,19 +24,20 @@ endef
 BACKPORT_VERSION:=$(lastword $(subst /, , $(shell find $(KERNEL_BUILD_DIR) -type 'd' -name 'backports*')))
 EXTRA_KCONFIG += CFG_CFG80211_VERSION:=$(word 2,$(subst -, ,$(BACKPORT_VERSION)))
 
-# vendor 的 Kbuild 用相对路径 -Iinclude/uapi/linux/mtk_nl80211_inc 找 mtk_vendor_nl80211.h，
-# 该文件由 target/linux/*/files-<ver>/ 在 Kernel/Prepare 时拷进内核树。CI 的 build_dir
-# 缓存若来自更早的提交，Kernel/Prepare 不会重跑，内核树里就没有这个头 —— 此时退回仓库内
-# 的原始目录（内容同源，只是不依赖内核树是否被刷新过）。
-MTK_NL80211_INC_DIR := $(if $(wildcard $(LINUX_DIR)/include/uapi/linux/mtk_nl80211_inc/mtk_vendor_nl80211.h),,\
-	$(firstword $(wildcard $(TOPDIR)/target/linux/*/files-*/include/uapi/linux/mtk_nl80211_inc)))
+# vendor Kbuild 用相对路径 -Iinclude/uapi/linux/mtk_nl80211_inc 找 mtk_vendor_nl80211.h
+# （该头由 target/linux/*/files-<ver>/ 在 Kernel/Prepare 时拷进内核树）。相对 -I 依赖
+# 编译期 CWD 恰为内核树，且内核树必须真的被 prepare 过；为了不依赖这两件事，这里显式给
+# 两个绝对路径：内核树内的规范位置 + 仓库内原始目录（内容同源，缺一方由另一方兜住；
+# -I 指向不存在的目录时 gcc 静默忽略）。
+MTK_NL80211_INC_DIR := $(LINUX_DIR)/include/uapi/linux/mtk_nl80211_inc \
+	$(firstword $(wildcard $(TOPDIR)/target/linux/*/files-*/include/uapi/linux/mtk_nl80211_inc))
 
 # Linux 6.18 的 kbuild 已移除 EXTRA_CFLAGS（传了也会被静默丢弃），必须改用
 # CFLAGS_MODULE 下发：它在 scripts/Makefile.lib 的 c_flags 中排在 ccflags-y 之后，
 # 可压过 vendor Kbuild 自带的 -Werror。6.18 默认打开 -Wextra、-Wmissing-prototypes、
 # -Wmissing-declarations，原厂代码在这三类上不可能清零，故整体降级为 warning。
 PKG_EXTRA_CFLAGS:= -Wno-error -Wno-missing-prototypes -Wno-missing-declarations \
-		$(if $(MTK_NL80211_INC_DIR),-I$(MTK_NL80211_INC_DIR)) \
+		$(addprefix -I,$(MTK_NL80211_INC_DIR)) \
 		$(if $(CONFIG_MTK_WIFI_OSAL_CFG80211_SUPPORT), -DCFG80211_SUPPORT) \
 		$(if $(CONFIG_MTK_WIFI_OSAL_DEBUG), -DMT_DEBUG) \
 		$(if $(CONFIG_MTK_WIFI_OSAL_CUSTOM_VPRINTK), -DCUSTOM_FACILITY=$(CONFIG_MTK_WIFI_OSAL_CUSTOM_VPRINTK_FACILITY)) \
