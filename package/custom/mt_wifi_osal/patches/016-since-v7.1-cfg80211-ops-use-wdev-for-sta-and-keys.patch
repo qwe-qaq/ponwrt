@@ -1,0 +1,235 @@
+From: local private research
+Subject: [PATCH] mt_wifi_osal: Take wireless_dev in station/key cfg80211 ops
+
+Linux 7.1 converted the station and key cfg80211_ops callbacks from
+struct net_device to struct wireless_dev (7.0 still used net_device).
+backports 7.2, which this tree builds cfg80211 from, has the new
+signatures, so the mtk_cfg80211_ops initializer no longer type-checks:
+
+  mt_osal_cfg80211.c:3578:35: error: initialization of
+  'int (*)(struct wiphy *, struct wireless_dev *, const u8 *,
+  struct station_info *)' from incompatible pointer type
+  'int (*)(struct wiphy *, struct net_device *, ...)'
+  [-Wincompatible-pointer-types]
+
+Affected: add/get/del_key, set_default_beacon_key,
+set_default_mgmt_key, add/del/change_station, get/dump_station.
+The earlier wdev conversions (del_virtual_intf, get_channel,
+abort_scan, mgmt_tx, ...) are already handled in this file, so only
+these ten remain.
+
+Keep the old signatures for cfg80211 < 7.1 and derive the net_device
+from wdev->netdev on 7.1+, leaving the function bodies untouched.
+
+Signed-off-by: local private research
+---
+--- a/mt_osal_cfg80211.c
++++ b/mt_osal_cfg80211.c
+@@ -38,6 +38,16 @@
+ 
+ #define MSEC_TO_SEC(_msec)		((_msec) / MSEC_PER_SEC)
+ 
++/*
++ * Linux 7.1 把 station/key 这一批 cfg80211_ops 的第二个参数从
++ * struct net_device 换成 struct wireless_dev（upstream 7.0 还是 netdev，
++ * 7.1 全部改完）。backports 7.2 已包含该变更，故按 7.1 做版本分支。
++ */
++#if (KERNEL_VERSION(7, 1, 0) <= LINUX_VERSION_CODE) || \
++	(defined(CFG_CFG80211_VERSION) && (KERNEL_VERSION(7, 1, 0) <= CFG_CFG80211_VERSION))
++#define MT_CFG80211_USE_WDEV	1
++#endif
++
+ unsigned char mt_zero_mac_addr[MT_MAC_ADDR_LEN]  = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+ 
+ static u16 mtk_vht_high_rate_bw80[3][4] = {
+@@ -2399,10 +2409,17 @@
+ 
+ static int mt_cfg80211_ops_sta_get(
+ 	struct wiphy *wiphy,
++#if defined(MT_CFG80211_USE_WDEV)
++	struct wireless_dev *wdev,
++#else
+ 	struct net_device *netdev,
++#endif
+ 	const u8 *mac_addr,
+ 	struct station_info *pSinfo)
+ {
++#if defined(MT_CFG80211_USE_WDEV)
++	struct net_device *netdev = wdev ? wdev->netdev : NULL;
++#endif
+ 	struct mt_priv_ops_sta_info mtk_sta_info;
+ 	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
+ 
+@@ -2437,11 +2454,18 @@
+ 
+ static int mt_cfg80211_ops_sta_dump(
+ 	struct wiphy *wiphy,
++#if defined(MT_CFG80211_USE_WDEV)
++	struct wireless_dev *wdev,
++#else
+ 	struct net_device *pNdev,
++#endif
+ 	int Idx,
+ 	u8 *pMac,
+ 	struct station_info *pSinfo)
+ {
++#if defined(MT_CFG80211_USE_WDEV)
++	struct net_device *pNdev = wdev ? wdev->netdev : NULL;
++#endif
+ 	struct mt_priv_ops_sta_info mtk_sta_info;
+ 	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
+ 
+@@ -2539,7 +2563,11 @@
+ 
+ static int mt_cfg80211_ops_add_key(
+ 	struct wiphy *pWiphy,
++#if defined(MT_CFG80211_USE_WDEV)
++	struct wireless_dev *wdev,
++#else
+ 	struct net_device *pNdev,
++#endif
+ #if (KERNEL_VERSION(6, 1, 0) <= LINUX_VERSION_CODE) || defined(BACKPORT_NOSTDINC)
+ 	int link_id,
+ #endif
+@@ -2548,6 +2576,9 @@
+ 	const u8 *pMacAddr,
+ 	struct key_params *pParams)
+ {
++#if defined(MT_CFG80211_USE_WDEV)
++	struct net_device *pNdev = wdev ? wdev->netdev : NULL;
++#endif
+ 	struct mt_priv_ops_key_info KeyInfo;
+ 	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
+ 
+@@ -2592,7 +2623,11 @@
+ 
+ static int mt_cfg80211_ops_get_key(
+ 	struct wiphy *pWiphy,
++#if defined(MT_CFG80211_USE_WDEV)
++	struct wireless_dev *wdev,
++#else
+ 	struct net_device *pNdev,
++#endif
+ #if (KERNEL_VERSION(6, 1, 0) <= LINUX_VERSION_CODE) || defined(BACKPORT_NOSTDINC)
+ 	int link_id,
+ #endif /* CFG_CFG80211_VERSION */
+@@ -2603,6 +2638,9 @@
+ 	void (*pCallback)(void *pCookie,
+ 	struct key_params *key_params))
+ {
++#if defined(MT_CFG80211_USE_WDEV)
++	struct net_device *pNdev = wdev ? wdev->netdev : NULL;
++#endif
+ 	struct key_params key_params;
+ 	u8 tx_tsc[MTK_MAX_TSC_SIZE] = {0};
+ 	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
+@@ -2640,7 +2678,11 @@
+ 
+ static int mt_cfg80211_ops_del_key(
+ 	struct wiphy *pWiphy,
++#if defined(MT_CFG80211_USE_WDEV)
++	struct wireless_dev *wdev,
++#else
+ 	struct net_device *pNdev,
++#endif
+ #if (KERNEL_VERSION(6, 1, 0) <= LINUX_VERSION_CODE) || defined(BACKPORT_NOSTDINC)
+ 	int link_id,
+ #endif
+@@ -2648,6 +2690,9 @@
+ 	bool Pairwise,
+ 	const u8 *pMacAddr)
+ {
++#if defined(MT_CFG80211_USE_WDEV)
++	struct net_device *pNdev = wdev ? wdev->netdev : NULL;
++#endif
+ 	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
+ 	struct mt_priv_ops_key_info KeyInfo;
+ 
+@@ -2700,12 +2745,19 @@
+ #if (KERNEL_VERSION(5, 7, 0) <= LINUX_VERSION_CODE) || defined(BACKPORT_NOSTDINC)
+ static int mt_cfg80211_ops_set_default_beacon_key(
+ 	struct wiphy *pWiphy,
++#if defined(MT_CFG80211_USE_WDEV)
++	struct wireless_dev *wdev,
++#else
+ 	struct net_device *pNdev,
++#endif
+ #if (KERNEL_VERSION(6, 1, 0) <= LINUX_VERSION_CODE) || defined(BACKPORT_NOSTDINC)
+ 	int link_id,
+ #endif
+ 	u8 KeyIdx)
+ {
++#if defined(MT_CFG80211_USE_WDEV)
++	struct net_device *pNdev = wdev ? wdev->netdev : NULL;
++#endif
+ 	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
+ 	struct mt_priv_ops_key_info KeyInfo;
+ 
+@@ -2725,13 +2777,20 @@
+ 
+ static int mt_cfg80211_ops_set_default_mgmt_key(
+ 	struct wiphy *pWiphy,
++#if defined(MT_CFG80211_USE_WDEV)
++	struct wireless_dev *wdev,
++#else
+ 	struct net_device *pNdev,
++#endif
+ #if (KERNEL_VERSION(6, 1, 0) <= LINUX_VERSION_CODE) || defined(BACKPORT_NOSTDINC)
+ 	int link_id,
+ #endif /* CFG_CFG80211_VERSION */
+ 	u8 KeyIdx)
+ 
+ {
++#if defined(MT_CFG80211_USE_WDEV)
++	struct net_device *pNdev = wdev ? wdev->netdev : NULL;
++#endif
+ 	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
+ 	struct mt_priv_ops_key_info KeyInfo;
+ 
+@@ -3340,9 +3399,16 @@
+ 
+ static int mt_cfg80211_ops_sta_del(
+ 	struct wiphy *pWiphy,
++#if defined(MT_CFG80211_USE_WDEV)
++	struct wireless_dev *wdev,
++#else
+ 	struct net_device *dev,
++#endif
+ 	struct station_del_parameters *params)
+ {
++#if defined(MT_CFG80211_USE_WDEV)
++	struct net_device *dev = wdev ? wdev->netdev : NULL;
++#endif
+ 	const u8 *pMacAddr = params->mac;
+ 	struct mt_priv_ops_sta_del_info mt_priv_info;
+ 	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
+@@ -3366,7 +3432,11 @@
+ 
+ static int mt_cfg80211_ops_sta_add(
+ 	struct wiphy *wiphy,
++#if defined(MT_CFG80211_USE_WDEV)
++	struct wireless_dev *wdev,
++#else
+ 	struct net_device *dev,
++#endif
+ 	const u8 *mac,
+ 	struct station_parameters *params)
+ {
+@@ -3441,10 +3511,17 @@
+ 
+ static int mt_cfg80211_ops_sta_chg(
+ 	struct wiphy *pWiphy,
++#if defined(MT_CFG80211_USE_WDEV)
++	struct wireless_dev *wdev,
++#else
+ 	struct net_device *pNdev,
++#endif
+ 	const u8 *pMacAddr,
+ 	struct station_parameters *params)
+ {
++#if defined(MT_CFG80211_USE_WDEV)
++	struct net_device *pNdev = wdev ? wdev->netdev : NULL;
++#endif
+ 	struct mt_cfg80211_vndr_ctrl ctrl_data, *ctrl_data_ptr = &ctrl_data;
+ 	struct mt_priv_ops_change_sta_info mt_priv_info;
+ 
