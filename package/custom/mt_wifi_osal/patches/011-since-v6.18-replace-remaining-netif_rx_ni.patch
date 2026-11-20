@@ -8,11 +8,15 @@ behind CONFIG_NETIF_RX_DISPATCH and one in the radiotap helper.
 
 Replace them with netif_rx(), matching upstream kernel API.
 
+The previous revision had incorrect hunk line counts: patch(1) treated
+the second hunk as trailing garbage and only applied the first one with
+fuzz, leaving one netif_rx_ni() call in the source. Use exact context
+generated from the patched source so both hunks apply cleanly.
+
 Signed-off-by: local private research
 --- a/mt_osal_packet.c
 +++ b/mt_osal_packet.c
-@@ -418,7 +418,7 @@ void mt_os_pkt_send_dispatch(void *pkt, void *napi)
- #ifdef CONFIG_NETIF_RX_DISPATCH
+@@ -421,7 +421,7 @@
  		if (in_interrupt())
  			netif_rx(skb);
  		else
@@ -21,7 +25,7 @@ Signed-off-by: local private research
  #else
  		netif_rx(skb);
  #endif /* CONFIG_NETIF_RX_DISPATCH */
-@@ -449,7 +449,7 @@ void mt_os_802_11_radiotap_packet(void *pOSPkt)
+@@ -452,7 +452,7 @@
  #if (KERNEL_VERSION(5, 18, 0) <= LINUX_VERSION_CODE)
  	netif_receive_skb(pOSPkt);
  #else

@@ -473,12 +473,19 @@ define Device/fiberhome_an4475-g2
   # (GPIO28/GPIO29, see the i2c-gpio node in the DTS); without these three
   # modules the bus is described but never registered and the expander
   # LEDs stay dark.
+  # The vendor firmware loads connac_if, mt7993 and mt799b after mtk_pci;
+  # the chip packages are gated by MTK_HWIFI_MT7993/MT799B in config.in, so
+  # Kconfig symbols for them must be set in configs/an7581.config as well.
+  # The DTS points &npu at en7581_MT7996_npu_*.bin; ship the matching
+  # firmware package (same convention as w1700k-ubi / nokia_valyrian).
   DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio \
 	kmod-i2c-gpio kmod-i2c-algo-bit kmod-gpio-pca953x \
 	kmod-phy-realtek kmod-phy-motorcomm kmod-usb3 \
 	kmod-airoha-paged-bosa kmod-airoha-xpon airoha-ponctl airoha-pond \
 	wpad-openssl \
 	kmod-mt_wifi7 kmod-mt_wifi_osal kmod-mtk_pci kmod-mt_hwifi \
+	kmod-connac_if kmod-mt7993 kmod-mt799b \
+	airoha-en7581-mt7996-npu-firmware \
 	wifi-profile mtwifi-cfg-ucode mwctl \
 	fitblk nand-utils ubi-utils
 endef
