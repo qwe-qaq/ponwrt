@@ -15,6 +15,22 @@ PKG_SOURCE_URL:=https://github.com/chasey-dev/objs/releases/download/v1
 PKG_HASH:=e2900a672a5151aed85f6711240db1ddcf5eed317fd620485a0ee6aee060cfb4
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(PKG_NAME)
 
+# 构建目录来自 CI 缓存时，可能残留上一轮（或旧配置下）的 .built 戳：Build/Compile
+# 末尾 touch 的 .no_autorebuild 会把 OpenWrt 的依赖检查整个关掉（package.mk 里
+# STAMP_NO_AUTOREBUILD 命中后 CONFIG_AUTOREBUILD 被清空），于是 compile 被判定为
+# 已完成、Build/Compile 一行都不执行，直到 install 阶段才发现 .ko 根本不存在：
+#   ERROR: module '.../mt_wifi_ap/mt_wifi.ko' is missing.
+# 这里显式判断戳是否可信：.ko 必须在，且 patches/ 与 Makefile 都不能比 .built 新
+# （否则新加的补丁会被 .no_autorebuild 一起吃掉）。不可信就清掉三层戳，让
+# Prepare 重新解包、Compile 真正跑一遍。
+MT7_STALE:=$(if $(wildcard $(PKG_BUILD_DIR)/mt_wifi_ap/mt_wifi.ko),\
+	$(shell find $(CURDIR)/patches $(CURDIR)/Makefile \
+		-newer $(PKG_BUILD_DIR)/.built -print -quit 2>/dev/null),stale)
+ifneq ($(strip $(MT7_STALE)),)
+  $(shell rm -rf $(PKG_BUILD_DIR)/.built $(PKG_BUILD_DIR)/.no_autorebuild \
+	$(PKG_BUILD_DIR)/.configured $(PKG_BUILD_DIR)/.prepared*)
+endif
+
 PKG_KCONFIG:= \
 	AP_SUPPORT \
 	RT_FIRST_CARD \
