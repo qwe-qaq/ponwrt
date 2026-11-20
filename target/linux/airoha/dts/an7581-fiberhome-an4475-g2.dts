@@ -749,32 +749,15 @@
 
 	pcie@0,0 {
 		reg = <0x0000 0 0 0 0>;
+		device_type = "pci";
+		#address-cells = <3>;
+		#size-cells = <2>;
 
-		mt7990@0,0 {
-			compatible = "mediatek,mt76";
-			reg = <0x0000 0 0 0 0>;
-			#address-cells = <1>;
-			#size-cells = <0>;
-
-			device_type = "pci";
-
-			ieee80211-freq-limit = <2400000 2500000>,
-					       <5170000 5835000>;
-
-			nvmem-cells = <&wifi_eeprom>;
-			nvmem-cell-names = "eeprom";
-
-			band@0 {
-				reg = <0>;
-				nvmem-cells = <&wifi_mac_2g4>;
-				nvmem-cell-names = "mac-address";
-			};
-
-			band@1 {
-				reg = <1>;
-				nvmem-cells = <&wifi_mac_5g>;
-				nvmem-cell-names = "mac-address";
-			};
-		};
+		/*
+		 * PRIVATE RESEARCH: MediaTek mt_wifi7 (full-MAC) binds by PCI ID
+		 * 14c3:7993 / 14c3:799b.  No "mediatek,mt76" child node here: the
+		 * driver owns EEPROM/MAC/calibration via wifi-profile + l1profile,
+		 * and a stale mt76 node would only claim the endpoint first.
+		 */
 	};
 };

@@ -478,6 +478,8 @@ define Device/fiberhome_an4475-g2
 	kmod-phy-realtek kmod-phy-motorcomm kmod-usb3 \
 	kmod-airoha-paged-bosa kmod-airoha-xpon airoha-ponctl airoha-pond \
 	wpad-openssl \
+	kmod-mt_wifi7 kmod-mt_wifi_osal kmod-mtk_pci kmod-mt_hwifi \
+	wifi-profile mtwifi-cfg-ucode mwctl \
 	fitblk nand-utils ubi-utils
 endef
 TARGET_DEVICES += fiberhome_an4475-g2
