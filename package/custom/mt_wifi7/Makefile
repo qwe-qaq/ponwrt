@@ -377,7 +377,12 @@ KCFLAGS += $(addprefix -Wno-error=,missing-prototypes missing-declarations)
 # 6.18 默认启用 -Wextra/-Wmissing-prototypes/-Wmissing-declarations，而原厂 Kbuild
 # 自带的 -Werror 写在 ccflags-y 里，位置晚于 KCFLAGS；只有 CFLAGS_MODULE 在
 # c_flags 中最靠后，能稳定把这批 vendor 风格的告警降级（错误仍为错误）。
-PKG_EXTRA_MODULE_CFLAGS := -Wno-error -Wno-missing-prototypes -Wno-missing-declarations
+# 同 mt_wifi_osal：内核树若来自 CI 缓存、Kernel/Prepare 没重跑，files-<ver> 里的
+# mtk_vendor_nl80211.h 就不在树内，退回仓库内原始目录。
+MTK_NL80211_INC_DIR := $(if $(wildcard $(LINUX_DIR)/include/uapi/linux/mtk_nl80211_inc/mtk_vendor_nl80211.h),,\
+	$(firstword $(wildcard $(TOPDIR)/target/linux/*/files-*/include/uapi/linux/mtk_nl80211_inc)))
+PKG_EXTRA_MODULE_CFLAGS := -Wno-error -Wno-missing-prototypes -Wno-missing-declarations \
+	$(if $(MTK_NL80211_INC_DIR),-I$(MTK_NL80211_INC_DIR))
 KCFLAGS += $(if $(CONFIG_MTK_WIFI7_OSAL_SUPPORT), -DMT_WIFI_COMMON_SUPPORT -DMT_WIFI_OSAL_SUPPORT -I$(STAGING_DIR)/usr/include/mt_wifi -I$(STAGING_DIR)/usr/include/mt_wifi/os)
 
 define collect_module_symvers
