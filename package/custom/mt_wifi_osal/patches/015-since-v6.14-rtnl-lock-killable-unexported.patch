@@ -1,0 +1,35 @@
+From: local private research
+Subject: [PATCH] mt_wifi_osal: Use rtnl_lock() where rtnl_lock_killable() is unexported
+
+rtnl_lock_killable() lost its EXPORT_SYMBOL in 6.14 while the prototype
+stayed in include/linux/rtnetlink.h. The call therefore compiles but
+leaves an undefined symbol in mt_wifi_osal.ko, which only shows up when
+modpost links the module (or worse, at insmod time on the target):
+
+  mt_osal_net.c:639: undefined reference to `rtnl_lock_killable'
+
+rtnl_lock() is exported on every kernel in range, so fall back to it for
+6.14+. The only behavioural difference is that registering the netdevice
+can no longer be interrupted by a signal; the rtnl_locked != false path is
+unchanged.
+
+Signed-off-by: local private research
+---
+--- a/mt_osal_net.c
++++ b/mt_osal_net.c
+@@ -636,8 +636,15 @@
+ 		if (rtnl_locked) {
+ 			ret = cfg80211_register_netdevice(net_dev);
+ 		} else {
++#if (KERNEL_VERSION(6, 14, 0) <= LINUX_VERSION_CODE)
++			/* 6.14 起 rtnl_lock_killable() 不再导出（头文件里仍留着声明），
++			 * 模块会以未定义符号的形式链接失败。rtnl_lock() 一直导出，
++			 * 差别只是注册网卡期间不能被信号打断。 */
++			rtnl_lock();
++#else
+ 			if (rtnl_lock_killable())
+ 				return -EINTR;
++#endif
+ 			wiphy_lock(wdev->wiphy);
+ 			ret = cfg80211_register_netdevice(net_dev);
+ 			wiphy_unlock(wdev->wiphy);
