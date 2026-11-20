@@ -1,0 +1,53 @@
+From: local private research
+Subject: [PATCH] mt_osal_diag: Handle vfs_mkdir() returning a dentry
+
+Since 6.15 vfs_mkdir() returns struct dentry * instead of int: on success it
+hands back the dentry it used (which may differ from the one passed in) and on
+failure it dput()s the dentry and returns an ERR_PTR(). Assigning that to the
+int err makes the file fail to compile:
+
+  mt_osal_diag.c:605:13: error: assignment to 'int' from 'struct dentry *'
+  makes integer from pointer without a cast [-Wint-conversion]
+
+Take the returned dentry, turn the error pointer into an errno, and make sure
+the reference handed to done_path_create()/end_creating_path() is the one we
+actually own: NULL when vfs_mkdir() has already dropped it, otherwise the
+dentry it returned.
+
+Signed-off-by: local private research
+---
+--- a/mt_osal_diag.c
++++ b/mt_osal_diag.c
+@@ -601,7 +601,31 @@
+ 		return PTR_ERR(dentry);
+ 	}
+ 
+-#if (KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE)
++#if (KERNEL_VERSION(6, 15, 0) <= LINUX_VERSION_CODE)
++	{
++		struct dentry *created;
++
++		created = vfs_mkdir(&nop_mnt_idmap, d_inode(path.dentry),
++			dentry, mode);
++		if (IS_ERR(created)) {
++			/*
++			 * vfs_mkdir() already dput() the dentry on failure and
++			 * hands back an ERR_PTR; clear it so the cleanup below
++			 * does not touch it twice.
++			 */
++			err = PTR_ERR(created);
++			dentry = NULL;
++		} else {
++			/*
++			 * On success vfs_mkdir() returns the dentry it used,
++			 * which may differ from the one we passed in; the
++			 * caller owns the reference.
++			 */
++			err = 0;
++			dentry = created;
++		}
++	}
++#elif (KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE)
+ 	err = vfs_mkdir(&nop_mnt_idmap, d_inode(path.dentry), dentry, mode);
+ #elif KERNEL_VERSION(5, 12, 0) <= LINUX_VERSION_CODE
+ 	err = vfs_mkdir(current_user_ns(), d_inode(path.dentry), dentry, mode);
