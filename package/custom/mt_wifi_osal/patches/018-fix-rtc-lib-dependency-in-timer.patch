@@ -10,7 +10,9 @@ kernel and modpost rejects the module:
 
 The conversion is pure calendar arithmetic and needs nothing from the RTC
 subsystem, so call the core time64_to_tm() helper (always built, always
-exported) and copy the result into struct rtc_time.
+exported) and copy the result into struct rtc_time. Note that the kernel's
+struct tm has no tm_isdst member, unlike struct rtc_time, so the flag is
+cleared explicitly to keep the result identical to rtc_time64_to_tm().
 
 While at it, mt_get_time_info() passed a seconds value where a ktime_t in
 nanoseconds was expected, which pinned the reported date to 1970-01-01; the
@@ -51,7 +53,7 @@ Signed-off-by: local private research
 +	tm->tm_year = t.tm_year;
 +	tm->tm_wday = t.tm_wday;
 +	tm->tm_yday = t.tm_yday;
-+	tm->tm_isdst = t.tm_isdst;
++	tm->tm_isdst = 0;
 +}
 +
  struct rtc_time mt_rtc_ktime_to_tm(ktime_t ktime)
