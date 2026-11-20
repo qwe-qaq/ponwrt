@@ -1,0 +1,32 @@
+From: local private research
+Subject: [PATCH] mt_wifi_osal: Replace remaining netif_rx_ni() calls
+
+netif_rx_ni() was removed from the kernel before 6.18. The existing
+006 patch only replaced the GARP path in mt_osal_cfg80211.c. The
+packet dispatch path in mt_osal_packet.c still has two calls: one
+behind CONFIG_NETIF_RX_DISPATCH and one in the radiotap helper.
+
+Replace them with netif_rx(), matching upstream kernel API.
+
+Signed-off-by: local private research
+--- a/mt_osal_packet.c
++++ b/mt_osal_packet.c
+@@ -418,7 +418,7 @@ void mt_os_pkt_send_dispatch(void *pkt, void *napi)
+ #ifdef CONFIG_NETIF_RX_DISPATCH
+ 		if (in_interrupt())
+ 			netif_rx(skb);
+ 		else
+-			netif_rx_ni(skb);
++			netif_rx(skb);
+ #else
+ 		netif_rx(skb);
+ #endif /* CONFIG_NETIF_RX_DISPATCH */
+@@ -449,7 +449,7 @@ void mt_os_802_11_radiotap_packet(void *pOSPkt)
+ #if (KERNEL_VERSION(5, 18, 0) <= LINUX_VERSION_CODE)
+ 	netif_receive_skb(pOSPkt);
+ #else
+-	netif_rx_ni(pOSPkt);
++	netif_rx(pOSPkt);
+ #endif
+ }
+ EXPORT_SYMBOL(mt_os_802_11_radiotap_packet);
