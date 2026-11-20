@@ -1,7 +1,7 @@
 From: local private research
-Subject: [PATCH] mt_wifi_osal: Inline init_dummy_netdev() setup on 6.18+
+Subject: [PATCH] mt_wifi_osal: Inline init_dummy_netdev() setup on 6.16+
 
-6.18 turned init_dummy_netdev() into a static helper in net/core/dev.c and
+6.16 turned init_dummy_netdev() into a static helper in net/core/dev.c and
 removed the export, so the call in mt_init_dummy_netdev() has neither a
 prototype nor a symbol to link against:
 
@@ -9,7 +9,7 @@ prototype nor a symbol to link against:
   'init_dummy_netdev' [-Wimplicit-function-declaration]
 
 It only performs three setup steps, so do them here instead. Kernels
-before 6.18 keep using the helper (void return since 6.9).
+before 6.16 keep using the helper (void return since 6.9).
 
 Signed-off-by: local private research
 ---
@@ -20,9 +20,9 @@ Signed-off-by: local private research
  int mt_init_dummy_netdev(struct net_device *dev)
  {
 -#if KERNEL_VERSION(6, 9, 0) <= LINUX_VERSION_CODE
-+#if (KERNEL_VERSION(6, 18, 0) <= LINUX_VERSION_CODE)
-+	/* 6.18 把 init_dummy_netdev() 收成 net/core/dev.c 里的 static 函数，
-+	 * 并撤掉了导出。这里按它的实现做同样三步，语义完全一致。 */
++#if (KERNEL_VERSION(6, 16, 0) <= LINUX_VERSION_CODE)
++	/* 6.16 起 init_dummy_netdev() 收成了 net/core/dev.c 里的 static 函数，
++	 * 不再导出，模块既没有原型也没有符号可链。这里按它的实现做同样三步。 */
 +	dev->reg_state = NETREG_DUMMY;
 +	set_bit(__LINK_STATE_PRESENT, &dev->state);
 +	set_bit(__LINK_STATE_START, &dev->state);
