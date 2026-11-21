@@ -1,0 +1,37 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi: follow the v6.16 rename of from_timer()
+
+v6.16 replaced from_timer() with timer_container_of() and removed the old
+name. BUILD_TIMER_FUNCTION() expands to a timer callback that is emitted into
+every translation unit including rt_linux.h, so the whole driver failed with
+"implicit declaration of function 'from_timer'" as soon as the first object
+was built. Alias the helper once and keep the 4.19+ branch unchanged.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/mt_wifi/include/os/rt_linux.h
++++ b/mt_wifi/include/os/rt_linux.h
+@@ -487,11 +487,22 @@
+ typedef void (*TIMER_FUNCTION)(unsigned long);
+ #endif
+ 
++/*
++ * v6.16 renamed from_timer() to timer_container_of(); the old name is gone and
++ * the timer callback below is expanded in every translation unit that includes
++ * this header, so the alias has to be resolved before BUILD_TIMER_FUNCTION().
++ */
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0))
++#define MT_FROM_TIMER(_ptr, _timer, _field)	timer_container_of(_ptr, _timer, _field)
++#else
++#define MT_FROM_TIMER(_ptr, _timer, _field)	from_timer(_ptr, _timer, _field)
++#endif
++
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4,19,0))
+ #define BUILD_TIMER_FUNCTION(_func) \
+ void rtmp_timer_##_func(struct timer_list *_timer) \
+ { \
+-	PRALINK_TIMER_STRUCT	pTimer = from_timer(pTimer,_timer,TimerObj); \
++	PRALINK_TIMER_STRUCT	pTimer = MT_FROM_TIMER(pTimer,_timer,TimerObj); \
+  \
+ 	_func(NULL, (PVOID) pTimer->cookie, NULL, pTimer); \
+ 	if (pTimer->Repeat) \
