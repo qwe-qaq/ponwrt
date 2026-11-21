@@ -1,0 +1,134 @@
+From: FTTR maintainers
+Subject: [PATCH] net: netfilter: flowtable: support 802.1ad VLAN and VLAN bridge ports
+
+AN4475-G2 demultiplexes FTTR ONUs onto IEEE 802.1ad (0x88a8) VLAN
+subinterfaces (fttr1..fttr16) over fttr0 and bridges them into br-lan.
+Extend netfilter flowtable matching, software encap lookup/pop, and
+hardware TC VLAN push/pop rule generation to handle ETH_P_8021AD in
+addition to ETH_P_8021Q.
+
+For bridged flows between VLAN subinterfaces, keep the software bridge
+tuple on the logical VLAN bridge port (dst_dev) when dev_fill_bridge_path()
+walks one VLAN layer down to its physical parent, so bridge ingress
+lookup and hardware TC redirect both observe the bridge port cleanly.
+
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -120,17 +120,19 @@ static int nf_flow_rule_match(struct nf_flow_match *match,
+ 	mask->meta.ingress_ifindex = 0xffffffff;
+ 
+ 	if (tuple->encap_num > 0 && !(tuple->in_vlan_ingress & BIT(0)) &&
+-	    tuple->encap[0].proto == htons(ETH_P_8021Q)) {
++	    (tuple->encap[0].proto == htons(ETH_P_8021Q) ||
++	     tuple->encap[0].proto == htons(ETH_P_8021AD))) {
+ 		NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_VLAN, vlan);
+ 		nf_flow_rule_vlan_match(&key->vlan, &mask->vlan,
+ 					tuple->encap[0].id,
+ 					tuple->encap[0].proto);
+ 		match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_VLAN);
+ 		vlan_encap = true;
+ 	}
+ 
+ 	if (tuple->encap_num > 1 && !(tuple->in_vlan_ingress & BIT(1)) &&
+-	    tuple->encap[1].proto == htons(ETH_P_8021Q)) {
++	    (tuple->encap[1].proto == htons(ETH_P_8021Q) ||
++	     tuple->encap[1].proto == htons(ETH_P_8021AD))) {
+ 		if (vlan_encap) {
+ 			NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_CVLAN,
+ 					  cvlan);
+@@ -723,7 +725,8 @@ nf_flow_rule_route_common(struct net *net, const struct flow_offload *flow,
+ 		if (tuple->in_vlan_ingress & BIT(i))
+ 			continue;
+ 
+-		if (tuple->encap[i].proto == htons(ETH_P_8021Q)) {
++		if (tuple->encap[i].proto == htons(ETH_P_8021Q) ||
++		    tuple->encap[i].proto == htons(ETH_P_8021AD)) {
+ 			entry = flow_action_entry_next(flow_rule);
+ 			if (!entry)
+ 				return -1;
+@@ -749,6 +752,7 @@ nf_flow_rule_route_common(struct net *net, const struct flow_offload *flow,
+ 			entry->pppoe.sid = other_tuple->encap[i].id;
+ 			break;
+ 		case htons(ETH_P_8021Q):
++		case htons(ETH_P_8021AD):
+ 			entry->id = FLOW_ACTION_VLAN_PUSH;
+ 			entry->vlan.vid = other_tuple->encap[i].id;
+ 			entry->vlan.proto = other_tuple->encap[i].proto;
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -156,6 +156,7 @@ static void nf_flow_tuple_encap(struct sk_buff *skb,
+ 	}
+ 	switch (skb->protocol) {
+ 	case htons(ETH_P_8021Q):
++	case htons(ETH_P_8021AD):
+ 		veth = (struct vlan_ethhdr *)skb_mac_header(skb);
+ 		tuple->encap[i].id = ntohs(veth->h_vlan_TCI) & VLAN_VID_MASK;
+ 		tuple->encap[i].proto = skb->protocol;
+@@ -286,6 +287,7 @@ static bool nf_flow_skb_encap_protocol(struct sk_buff *skb, __be16 proto,
+ 
+ 	switch (skb->protocol) {
+ 	case htons(ETH_P_8021Q):
++	case htons(ETH_P_8021AD):
+ 		if (!pskb_may_pull(skb, skb_mac_offset(skb) + sizeof(*veth)))
+ 			return false;
+ 
+@@ -320,6 +322,7 @@ static void nf_flow_encap_pop(struct sk_buff *skb,
+ 		}
+ 		switch (skb->protocol) {
+ 		case htons(ETH_P_8021Q):
++		case htons(ETH_P_8021AD):
+ 			vlan_hdr = (struct vlan_hdr *)skb->data;
+ 			__skb_pull(skb, VLAN_HLEN);
+ 			vlan_set_encap_proto(skb, vlan_hdr);
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -343,7 +343,7 @@ static int nft_dev_fill_bridge_path(struct flow_offload *flow,
+ 	struct net_device_path_ctx ctx = {};
+ 	struct net_device_path_stack stack;
+ 	struct nft_forward_info info = {};
+-	int i, j = 0;
++	int i, j = 0, base_encaps;
+ 
+ 	for (i = th[dir].tuple.encap_num - 1; i >= 0 ; i--) {
+ 		if (info.num_encaps >= NF_FLOW_TABLE_ENCAP_MAX)
+@@ -365,6 +365,7 @@ static int nft_dev_fill_bridge_path(struct flow_offload *flow,
+ 		ctx.vlan[ctx.num_vlans].proto = th[dir].tuple.encap[i].proto;
+ 		ctx.num_vlans++;
+ 	}
++	base_encaps = info.num_encaps;
+ 	ctx.dev = src_dev;
+ 	ether_addr_copy(ctx.daddr, dst_ha);
+ 
+@@ -373,6 +374,17 @@ static int nft_dev_fill_bridge_path(struct flow_offload *flow,
+ 
+ 	nft_dev_path_info(&stack, &info, dst_ha, &ft->data);
+ 
++	/* Keep VLAN bridge ports (e.g. 802.1ad fttrN) anchored on dst_dev
++	 * for software bridge lookup while leaving hardware offload to unwrap.
++	 */
++	if (info.indev != dst_dev && is_vlan_dev(dst_dev) &&
++	    info.outdev == dst_dev && info.port_vlans == 1 &&
++	    info.indev == vlan_dev_real_dev(dst_dev)) {
++		info.indev = dst_dev;
++		info.hw_outdev = dst_dev;
++		info.num_encaps = base_encaps;
++	}
++
+ 	if (!info.indev || info.indev != dst_dev)
+ 		return -1;
+ 
+@@ -424,11 +434,12 @@ int flow_offload_bridge_init(struct flow_offload *flow,
+ 	}
+ 
+ 	switch (eth_hdr(pkt->skb)->h_proto) {
+-	case htons(ETH_P_8021Q): {
++	case htons(ETH_P_8021Q):
++	case htons(ETH_P_8021AD): {
+ 		struct vlan_hdr *vhdr = (struct vlan_hdr *)(skb_mac_header(pkt->skb)
+ 					 + sizeof(struct ethhdr));
+ 		tuple->encap[i].id = ntohs(vhdr->h_vlan_TCI);
+-		tuple->encap[i].proto = htons(ETH_P_8021Q);
++		tuple->encap[i].proto = eth_hdr(pkt->skb)->h_proto;
+ 		i++;
+ 		break;
+ 	}

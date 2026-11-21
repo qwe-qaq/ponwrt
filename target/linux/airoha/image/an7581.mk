@@ -477,6 +477,7 @@ define Device/fiberhome_an4475-g2
 	kmod-i2c-gpio kmod-i2c-algo-bit kmod-gpio-pca953x \
 	kmod-phy-realtek kmod-phy-motorcomm kmod-usb3 \
 	kmod-airoha-paged-bosa kmod-airoha-xpon airoha-ponctl airoha-pond \
+	airoha-en7581-mt7996-npu-firmware \
 	wpad-openssl \
 	fitblk nand-utils ubi-utils
 endef
