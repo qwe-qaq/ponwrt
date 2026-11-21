@@ -1,0 +1,55 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi: guard the APCLI-only scan path and vendor attributes
+
+Two places call into AP-client support without a matching feature guard, which
+breaks an AP-only build:
+
+  - cfg80211drv.c reaches RTMP_DRIVER_80211_APCLI_SCAN and RT_CMD_STA_IOCTL_SCAN
+    .StaIndex, both only present with APCLI_CFG80211_SUPPORT. Keep the error
+    handling consistent with the other failure paths in the same function.
+  - cfg80211_vndr_cmm.c puts cfg80211_drv_vndr_set_mac_addr/set_seq_num in the
+    vendor attribute table, but they are declared only for
+    APCLI_CFG80211_SUPPORT && SUPP_RANDOM_MAC_IN_DRIVER_SUPPORT.
+
+Both are dead code on an AP-only build, so guarding them changes no behaviour.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/mt_wifi/os/linux/cfg80211/cfg80211drv.c
++++ b/mt_wifi/os/linux/cfg80211/cfg80211drv.c
+@@ -3644,10 +3644,22 @@
+ 	scan_cmd.duration = pCfg80211_CB->pCfg80211_ScanReq->duration;
+ 	scan_cmd.ScanType = SCAN_ACTIVE;
+ 	if (iftype == NL80211_IFTYPE_STATION) {
++#ifdef APCLI_CFG80211_SUPPORT
+ 		scan_cmd.StaIndex = staIndex;
+ 		RTMP_DRIVER_80211_APCLI_SCAN(pAd, &scan_cmd);
+ 		MTWF_DBG(NULL, DBG_CAT_CHN, CATCHN_SCAN, DBG_LVL_DEBUG,
+ 			"Into RTMP_DRIVER_80211_APCLI_SCAN\n");
++#else
++		/* APCLI_CFG80211_SUPPORT is off, so the driver never registers a
++		 * station interface and this path cannot be reached; fail the scan
++		 * the same way the other error paths above do.
++		 */
++		MTWF_DBG(NULL, DBG_CAT_CHN, CATCHN_SCAN, DBG_LVL_ERROR,
++			"station scan needs APCLI_CFG80211_SUPPORT\n");
++		CFG80211OS_ScanEnd(pAd, TRUE);
++		ReleaseChannelOpChargeByBand(pAd, 0, CH_OP_OWNER_SCAN);
++		return 0;
++#endif
+ 	} else {
+ 		scan_cmd.ApIndex = apIndex;
+ 		MTWF_DBG(NULL, DBG_CAT_CHN, CATCHN_SCAN, DBG_LVL_DEBUG,
+--- a/mt_wifi/os/linux/cfg80211/cfg80211_vndr_cmm.c
++++ b/mt_wifi/os/linux/cfg80211/cfg80211_vndr_cmm.c
+@@ -7645,8 +7645,10 @@
+ 	{mt_cfg80211_vndr_attr_set_cosr_ie, cfg80211_drv_vndr_set_cosr_bcn_ie},
+ 	{mt_cfg80211_vndr_attr_wapp_cosr_info, cfg80211_drv_vndr_wapp_cosr_info},
+ 	{mt_cfg80211_vndr_attr_set_pmkid, cfg80211_drv_vndr_set_pmkid},
++#ifdef APCLI_CFG80211_SUPPORT
+ 	{mt_cfg80211_vndr_attr_set_mac_addr, cfg80211_drv_vndr_set_mac_addr},
+ 	{mt_cfg80211_vndr_attr_set_seq_num, cfg80211_drv_vndr_set_seq_num},
++#endif /* APCLI_CFG80211_SUPPORT */
+ 	{mt_cfg80211_vndr_attr_set_wmm, cfg80211_drv_vndr_set_wmm},
+ 	{mt_cfg80211_vndr_attr_set_monitor, cfg80211_drv_vndr_set_monitor},
+ 	{mt_cfg80211_vndr_attr_clean_sta, cfg80211_drv_vndr_clean_sta},
