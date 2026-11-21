@@ -1,0 +1,41 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mtk_hwifi: drain the RX page fragment through the v6.13 API
+
+v6.13 replaced the virtual address in struct page_frag_cache with an
+encoded_page word, so pci_rx_queue_page_drain() no longer builds:
+
+    bus/mtk_pci_dma.c:846:24: error: 'struct page_frag_cache' has no member named 'va'
+    bus/mtk_pci_dma.c:849:48: error: 'struct page_frag_cache' has no member named 'va'
+
+The same release added page_frag_cache_drain(struct page_frag_cache *),
+which decodes encoded_page and drops the pagecnt_bias reference count
+itself.  Call it on v6.13 and later, and keep the open-coded
+virt_to_page()/__page_frag_cache_drain() path for older kernels.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/wlan_hwifi/bus/mtk_pci_dma.c
++++ b/wlan_hwifi/bus/mtk_pci_dma.c
+@@ -843,6 +843,14 @@
+ static void
+ pci_rx_queue_page_drain(struct pci_rx_queue *rq)
+ {
++#if (KERNEL_VERSION(6, 13, 0) <= LINUX_VERSION_CODE)
++	/*
++	 * v6.13 stores the page address in an encoded_page word, so the
++	 * cache has to be drained through its own helper instead of
++	 * decoding page_frag_cache.va by hand.
++	 */
++	page_frag_cache_drain(&rq->rx_page);
++#else
+ 	if (rq->rx_page.va) {
+ 		struct page *page;
+ 
+@@ -854,6 +862,7 @@
+ 				rq->rx_page.pagecnt_bias);
+ #endif
+ 	}
++#endif
+ 
+ 	memset(&rq->rx_page, 0x00, sizeof(rq->rx_page));
+ }
