@@ -1,0 +1,27 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi: define an AC_NUM fallback in sr_cmd.h
+
+sr_cmd.h reaches rtmp.h's include chain through mcu/andes_core.h, which runs
+before rt_config.h includes dabs_qos.h, so AC_NUM is still undefined when
+struct SR_STA_INFO_T declares u2AvgMPDULength[AC_NUM]. Add the same guarded
+fallback dabs_qos.h, red.h and wapp_cmm_type.h already use.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/mt_wifi/include/sr_cmd.h
++++ b/mt_wifi/include/sr_cmd.h
+@@ -33,6 +33,14 @@
+ /*******************************************************************************
+  *    MACRO
+  ******************************************************************************/
++/*
++ * sr_cmd.h is reached through rtmp.h -> mcu/andes_core.h, before rt_config.h
++ * gets to include dabs_qos.h, so AC_NUM is not defined yet.  Keep the same
++ * guarded fallback the other three headers use.
++ */
++#ifndef AC_NUM
++#define AC_NUM							4
++#endif
+ 
+ /*******************************************************************************
+  *    TYPES
