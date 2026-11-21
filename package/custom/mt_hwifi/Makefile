@@ -15,6 +15,21 @@ PKG_SOURCE:=mt7993_20250613-415824.tar.xz
 PKG_SOURCE_URL:=https://github.com/chasey-dev/objs/releases/download/v1
 PKG_HASH:=e2900a672a5151aed85f6711240db1ddcf5eed317fd620485a0ee6aee060cfb4
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(WIFI_DRIVER_NAME)
+
+# 注意：本包和 mt_wifi7 共用同一个 PKG_BUILD_DIR 和同一个 tarball，而真正执行
+# 解包的是 mt_wifi7（它先构建）。mt_wifi7 的 Build/Compile 末尾会在该目录 touch
+# .no_autorebuild，package.mk 里 STAMP_NO_AUTOREBUILD 一旦命中就把本包的
+# .prepared* 直接复用，于是本包的 Prepare（解包 + 应用 patches/）根本不会跑。
+# 所以本包 patches/ 下的补丁永远不会生效，wlan_hwifi 的补丁必须放进
+# package/custom/mt_wifi7/patches/，由那边的 Prepare 一并应用。
+# 换句话说：不要在这里放补丁，也不要把这里改成自己的解包流程——那会 rm -rf
+# 掉 mt_wifi7 刚编好的 .ko。
+
+# 与 mt_wifi7 同理：缓存里可能留着 .built 却没有 .ko（上一轮就是在这里失败的），
+# 不清掉 .built 的话 compile 会被判定完成，直到 install 才发现产物不存在。
+ifeq ($(wildcard $(PKG_BUILD_DIR)/wlan_hwifi/mtk_hwifi.ko),)
+  $(shell rm -f $(PKG_BUILD_DIR)/.built)
+endif
 PKG_KCONFIG:= \
 	SUPPORT_OPENWRT \
 	CCN34_SPLIT_MAC_SUPPORT \

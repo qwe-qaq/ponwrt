@@ -23,12 +23,28 @@ PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(PKG_NAME)
 # 这里显式判断戳是否可信：.ko 必须在，且 patches/ 与 Makefile 都不能比 .built 新
 # （否则新加的补丁会被 .no_autorebuild 一起吃掉）。不可信就清掉三层戳，让
 # Prepare 重新解包、Compile 真正跑一遍。
-MT7_STALE:=$(if $(wildcard $(PKG_BUILD_DIR)/mt_wifi_ap/mt_wifi.ko),\
-	$(shell find $(CURDIR)/patches $(CURDIR)/Makefile \
-		-newer $(PKG_BUILD_DIR)/.built -print -quit 2>/dev/null),stale)
-ifneq ($(strip $(MT7_STALE)),)
+#
+# 判据用补丁集内容的 md5，不用 mtime：CI 缓存解包出来的时间戳不可控，源码是
+# 每次新 clone 的（mtime 永远是“现在”），拿时间比会把每一轮都判成过期；反过来
+# 缓存里 .built 比补丁新时又会漏判。内容变了才需要重新解包重放。
+#
+# 另外 mt_hwifi 与本包共用 PKG_BUILD_DIR，它自己从来不解包（看到的是本包留下的
+# .prepared* 和 .no_autorebuild），所以 wlan_hwifi 的补丁也只有放在本包 patches/
+# 里才会被应用 —— 这就是包内的 .patchset_<md5> 存在的原因。
+MT7_PATCHSET:=$(shell cat $(sort $(wildcard $(CURDIR)/patches/*.patch)) 2>/dev/null | md5sum | cut -d' ' -f1)
+MT7_PATCHSET_STAMP:=$(PKG_BUILD_DIR)/.patchset_$(MT7_PATCHSET)
+# CURDIR 不是本包目录时（顶层遍历包列表、package-metadata 之类）patches/ 为空，
+# 这时既算不出补丁集，也不该动构建目录。
+ifneq ($(wildcard $(CURDIR)/patches/*.patch),)
+ifeq ($(wildcard $(PKG_BUILD_DIR)/mt_wifi_ap/mt_wifi.ko),)
   $(shell rm -rf $(PKG_BUILD_DIR)/.built $(PKG_BUILD_DIR)/.no_autorebuild \
-	$(PKG_BUILD_DIR)/.configured $(PKG_BUILD_DIR)/.prepared*)
+	$(PKG_BUILD_DIR)/.configured $(PKG_BUILD_DIR)/.prepared* \
+	$(PKG_BUILD_DIR)/.patchset_*)
+else ifeq ($(wildcard $(MT7_PATCHSET_STAMP)),)
+  $(shell rm -rf $(PKG_BUILD_DIR)/.built $(PKG_BUILD_DIR)/.no_autorebuild \
+	$(PKG_BUILD_DIR)/.configured $(PKG_BUILD_DIR)/.prepared* \
+	$(PKG_BUILD_DIR)/.patchset_*)
+endif
 endif
 
 PKG_KCONFIG:= \
@@ -437,6 +453,7 @@ define Build/Compile
 		KBUILD_EXTRA_SYMBOLS="$(wildcard $(PKG_SYMVERS_DIR)/*.symvers)" \
 		modules
 	touch $(PKG_BUILD_DIR)/.no_autorebuild
+	touch $(MT7_PATCHSET_STAMP)
 endef
 
 define KernelPackage/mt_wifi7/install

@@ -12,11 +12,24 @@ which decodes encoded_page and drops the pagecnt_bias reference count
 itself.  Call it on v6.13 and later, and keep the open-coded
 virt_to_page()/__page_frag_cache_drain() path for older kernels.
 
+The declaration lives in <linux/page_frag_cache.h>, which only newer
+trees provide, so pull it in under the same version check.
+
 Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
 ---
 --- a/wlan_hwifi/bus/mtk_pci_dma.c
 +++ b/wlan_hwifi/bus/mtk_pci_dma.c
-@@ -843,6 +843,14 @@
+@@ -30,6 +30,9 @@
+ 
+ #include <linux/interrupt.h>
+ #include <linux/version.h>
++#if (KERNEL_VERSION(6, 13, 0) <= LINUX_VERSION_CODE)
++#include <linux/page_frag_cache.h>
++#endif
+ #include "mac_ops.h"
+ #include "bus.h"
+ #include "mtk_pci_dma.h"
+@@ -843,6 +846,14 @@
  static void
  pci_rx_queue_page_drain(struct pci_rx_queue *rq)
  {
@@ -31,7 +44,7 @@ Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
  	if (rq->rx_page.va) {
  		struct page *page;
  
-@@ -854,6 +862,7 @@
+@@ -854,6 +865,7 @@
  				rq->rx_page.pagecnt_bias);
  #endif
  	}
