@@ -409,13 +409,22 @@ define collect_module_symvers
 	mv $(PKG_BUILD_DIR)/mt_wifi_ap/Module.symvers $(PKG_SYMVERS_DIR)/$(PKG_NAME).symvers
 endef
 
+# mt_wifi_ap/Makefile 用 obj-$(CONFIG_MT_WIFI) 决定编入内核还是编成模块。OpenWrt
+# 的 CONFIG_MTK_WIFI7_MT_WIFI=y 会被原样透传成 CONFIG_MT_WIFI=y，于是变成 obj-y；
+# 而这是一次 M= 外部模块构建，scripts/Makefile.build 里 built-in.a 只在
+# KBUILD_BUILTIN 非空时才构建，顶层 Makefile 在 KBUILD_EXTMOD 分支里把它清空了
+# （"We are always building only modules"）。结果是整个目录一个 .o 都不编、
+# modules.order 为空、modpost 无事可做，最后报 mt_wifi.ko is missing。
+# 该符号在源码里只用于 obj- 和 -DMT_WIFI_MODULE（后者已被 CONFIG_SUPPORT_OPENWRT
+# 覆盖），所以这里固定传 m。
 define Build/Compile
 	+$(MAKE) $(PKG_JOBS) -C "$(LINUX_DIR)" V=1 \
 		CROSS_COMPILE="$(TARGET_CROSS)" \
 		ARCH="$(LINUX_KARCH)" \
 		M="$(PKG_BUILD_DIR)/mt_wifi_ap" \
 		LINUX_DIR="$(KERNEL_BUILD_DIR)" \
-		$(foreach c, $(PKG_KCONFIG),$(if $(CONFIG_MTK_WIFI7_$c),CONFIG_$(c)=$(CONFIG_MTK_WIFI7_$(c)))) \
+		$(foreach c, $(filter-out MT_WIFI,$(PKG_KCONFIG)),$(if $(CONFIG_MTK_WIFI7_$c),CONFIG_$(c)=$(CONFIG_MTK_WIFI7_$(c)))) \
+		$(if $(CONFIG_MTK_WIFI7_MT_WIFI),CONFIG_MT_WIFI=m) \
 		NOSTDINC_FLAGS="$(NOSTDINC_FLAGS)" \
 	 	KCFLAGS="$(KCFLAGS)" \
 		CFLAGS_MODULE="$(PKG_EXTRA_MODULE_CFLAGS)" \
