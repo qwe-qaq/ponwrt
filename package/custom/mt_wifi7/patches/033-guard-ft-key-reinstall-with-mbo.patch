@@ -1,0 +1,41 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi: require MBO_SUPPORT for the FT key re-install path
+
+The block that re-installs PTK/GTK/IGTK on an FT reassociation is guarded by
+DOT11R_FT_SUPPORT, but its runtime condition calls IS_MBO_ENABLE(), which only
+exists when MBO_SUPPORT is set: rt_config.h includes mbo.h under #ifdef
+MBO_SUPPORT, and mbo.h itself is compiled only for MBO_SUPPORT || OCE_SUPPORT.
+
+MBO_SUPPORT is an independent Kconfig option with default n, so enabling MAP
+(which selects DOT11R_FT but not MBO) produced
+
+    fsm_assoc.c:3111: implicit declaration of function 'IS_MBO_ENABLE'
+
+Every other user of IS_MBO_ENABLE in the tree sits inside an
+#ifdef MBO_SUPPORT block, so MBO-disabled is a supported configuration and
+this one spot is simply missing the extra condition.  Guard the block with
+both macros: the runtime test already required IS_MBO_ENABLE(), hence the
+code could never execute without MBO and behaviour stays identical.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/mt_wifi/common/fsm/fsm_assoc.c
++++ b/mt_wifi/common/fsm/fsm_assoc.c
+@@ -3106,7 +3106,16 @@
+ 		}
+ 	}
+ #endif
+-#ifdef DOT11R_FT_SUPPORT
++/*
++ * This key re-install path is gated on IS_MBO_ENABLE() at runtime, but the
++ * surrounding guard only asked for DOT11R_FT_SUPPORT.  MBO_SUPPORT is an
++ * independent option (Kconfig default n) and rt_config.h only pulls in mbo.h
++ * when it is set, so an FT-enabled / MBO-disabled build failed with
++ * "implicit declaration of function 'IS_MBO_ENABLE'".  Request both here;
++ * without MBO the condition could never be true anyway, so behaviour is
++ * unchanged.
++ */
++#if defined(DOT11R_FT_SUPPORT) && defined(MBO_SUPPORT)
+ 	if ((pFtCfg != NULL) && (pFtCfg->FtCapFlag.Dot11rFtEnable) && isReassoc
+ 		 && IS_MBO_ENABLE(wdev)) {
+ 		struct _ASIC_SEC_INFO *info = NULL;
