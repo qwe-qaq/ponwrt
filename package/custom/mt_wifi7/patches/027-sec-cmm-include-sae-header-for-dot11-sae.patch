@@ -1,0 +1,29 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi: include the SAE header for plain DOT11_SAE_SUPPORT builds
+
+SEC_CONFIG carries struct pwd_id_list and struct sae_capability whenever
+DOT11_SAE_SUPPORT is set, but sec_cmm.h only included sae_cmm.h for
+SUPP_SAE_SUPPORT, which is restricted to APCLI_SUPPLICANT builds. Compiling
+the AP driver with WPA3 enabled and APCLI supplicant disabled therefore
+failed with "field 'pwd_id_list_head' has incomplete type". Include the
+header for both cases, matching the guards used by the members themselves.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/mt_wifi/include/common/security/sec_cmm.h
++++ b/mt_wifi/include/common/security/sec_cmm.h
+@@ -12,7 +12,13 @@
+ 
+ #include "security/owe_cmm.h"
+ 
+-#ifdef SUPP_SAE_SUPPORT
++/*
++ * struct pwd_id_list / struct sae_capability are members of SEC_CONFIG when
++ * DOT11_SAE_SUPPORT is set, so the header has to be pulled in for that case
++ * too.  SUPP_SAE_SUPPORT is only defined for APCLI_SUPPLICANT builds, which
++ * left the plain cfg80211 AP build with incomplete types.
++ */
++#if defined(SUPP_SAE_SUPPORT) || defined(DOT11_SAE_SUPPORT)
+ #include "security/sae_cmm.h"
+ #endif
+ 
