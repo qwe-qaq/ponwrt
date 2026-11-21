@@ -1,0 +1,31 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi: move AKM_SUITE_SAE out of the APCLI guard
+
+AKM_SUITE_SAE was defined inside #ifdef APCLI_CFG80211_SUPPORT, but
+CFG80211OS_MloExternalAuthRequest() is built for every DOT11_EHT_BE target and
+uses the constant, so an AP-only build without the APCLI supplicant failed with
+"'AKM_SUITE_SAE' undeclared". Hoist the definition above both guards.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/mt_wifi/os/linux/cfg80211/cfg80211_util.c
++++ b/mt_wifi/os/linux/cfg80211/cfg80211_util.c
+@@ -921,8 +921,17 @@
+ 	return pChCtrl->ChListNum;
+ }
+ 
+-#ifdef APCLI_CFG80211_SUPPORT
++/*
++ * 0x08ac0f00 is the byte-swapped OUI/type pair hostapd expects here.  The
++ * define used to live inside the APCLI_CFG80211_SUPPORT block, but
++ * CFG80211OS_MloExternalAuthRequest() is built for every DOT11_EHT_BE target
++ * and needs it too, so keep it outside of both feature guards.
++ */
++#ifndef AKM_SUITE_SAE
+ #define AKM_SUITE_SAE 0x08ac0f00
++#endif
++
++#ifdef APCLI_CFG80211_SUPPORT
+ int CFG80211OS_ExternalAuthRequest(PSTA_ADMIN_CONFIG pStaCfg)
+ {
+ 	int ret, len;
