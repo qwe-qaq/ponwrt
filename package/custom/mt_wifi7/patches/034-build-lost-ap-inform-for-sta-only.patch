@@ -15,25 +15,48 @@ outside the APCLI guard.  Close the file-wide guard just for this function
 and re-open it afterwards, which keeps the APCLI code paths unchanged and
 also keeps the function available when APCLI support is enabled.
 
+The include of rt_config.h sits inside that guard as well, so it has to
+move above it; otherwise the unguarded function is parsed without any RTMP
+type and gcc reports
+
+    cfg80211_apcli.c:102:1: error: unknown type name 'VOID'
+
 Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
 ---
 --- a/mt_wifi/os/linux/cfg80211/cfg80211_apcli.c
 +++ b/mt_wifi/os/linux/cfg80211/cfg80211_apcli.c
-@@ -92,6 +92,13 @@
+@@ -21,9 +21,15 @@
+ 	History:
+ 
+ ***************************************************************************/
+-#ifdef APCLI_CFG80211_SUPPORT
++/*
++ * ponwrt: rt_config.h has to be included before the APCLI guard. A STA-only
++ * build compiles CFG80211_LostApInform() from this file, and without the
++ * include the RTMP types (VOID, PRTMP_ADAPTER, ...) are not defined.
++ */
+ #include "rt_config.h"
+ 
++#ifdef APCLI_CFG80211_SUPPORT
++
+ INT CFG80211_FindStaIdxByNetDevice(RTMP_ADAPTER *pAd, PNET_DEV pNetDev)
+ {
+ 	USHORT index = 0;
+@@ -92,6 +98,13 @@
  }
  
  
 +#endif /* APCLI_CFG80211_SUPPORT */
 +
 +/*
-+ * ponwrt: this is the STA-mode half of the lost-AP notification. The caller
-+ * (RT_CFG80211_LOST_AP_INFORM) is enabled by CONFIG_STA_SUPPORT as well, so
-+ * the definition must be available without APCLI_CFG80211_SUPPORT.
++ * ponwrt: the STA half of the lost-AP notification. RT_CFG80211_LOST_AP_INFORM()
++ * is also enabled by CONFIG_STA_SUPPORT, so the definition must be visible
++ * without APCLI_CFG80211_SUPPORT.
 + */
  VOID CFG80211_LostApInform(VOID *pAdOrg)
  {
  	PRTMP_ADAPTER pAd = (PRTMP_ADAPTER)pAdOrg;
-@@ -122,6 +129,8 @@
+@@ -122,6 +135,8 @@
  	}
  }
  
