@@ -1,0 +1,269 @@
+From: FTTR maintainers
+Subject: [PATCH] net: airoha: ppe: support 802.1ad outer VLAN and FTTR VLAN bridge offload
+
+AN4475-G2 uses standard Linux 802.1ad (0x88a8) VLAN subinterfaces
+(fttr1..fttr16) over fttr0 (GDM4 NBQ0) to map per-ONU GEM ports.
+
+1. Accept an outer ETH_P_8021AD FLOW_ACTION_VLAN_PUSH in airoha_ppe and
+   program AIROHA_FOE_IB1_BIND_VPM according to the outer TPID
+   (0=none/SP, 1=0x8100, 2=0x88a8) instead of vlan.num. Keep inner
+   802.1ad and DSA/WLAN/PON 802.1ad rejected with -EOPNOTSUPP.
+2. Recognize 802.1ad VLAN subinterfaces of fttr0 in
+   airoha_fttr_direction_allowed(), unwrap redirected fttr0 802.1ad VLAN
+   egress into fttr0 + outer 802.1ad push (validating same non-VLAN
+   bridge for ONU-pair flows), and register an indirect TC flowtable
+   block callback so bridge flowtables containing fttr1..fttr16 bind to
+   the PPE.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -16,6 +16,8 @@
+ #include <net/route.h>
+ #include <net/netfilter/nf_flow_table.h>
+ #include <linux/rtnetlink.h>
++#include <linux/if_vlan.h>
++#include <linux/if_bridge.h>
+ 
+ #include "airoha_regs.h"
+ #include "airoha_eth.h"
+@@ -106,6 +108,14 @@ static bool airoha_fttr_bridge_alias(struct net_device *dev)
+ 	return alias;
+ }
+ 
++static bool airoha_fttr_vlan_dev(struct net_device *dev,
++				 struct net_device *lower)
++{
++	return dev && lower && is_vlan_dev(dev) &&
++	       vlan_dev_real_dev(dev) == lower &&
++	       vlan_dev_vlan_proto(dev) == htons(ETH_P_8021AD);
++}
++
+ static bool airoha_fttr_direction_allowed(struct airoha_eth *eth,
+                                          struct flow_cls_offload *f)
+ {
+@@ -133,18 +143,18 @@ static bool airoha_fttr_direction_allowed(struct airoha_eth *eth,
+ 		dev_put(lower);
+ 		return false;
+ 	}
++	in = ingress == lower || airoha_fttr_vlan_dev(ingress, lower);
+ 	if (ingress)
+ 		dev_put(ingress);
+-	in = meta.mask->ingress_ifindex == U32_MAX &&
+-	     meta.key->ingress_ifindex == lower->ifindex;
+ 	flow_action_for_each(i, act, &rule->action) {
+ 		if (act->id != FLOW_ACTION_REDIRECT)
+ 			continue;
+ 		if (airoha_fttr_bridge_alias(act->dev)) {
+ 			dev_put(lower);
+ 			return false;
+ 		}
+-		out |= act->dev == lower;
++		out |= act->dev == lower ||
++		       airoha_fttr_vlan_dev(act->dev, lower);
+ 	}
+ 	dev_put(lower);
+ 	if (!in && !out)
+@@ -574,16 +585,19 @@ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
+ 	u32 pon_tag = 0;
+ 	int wlan_etype = -EINVAL, dsa_port = airoha_get_dsa_port(&netdev);
+ 	struct airoha_foe_mac_info_common *l2;
+-	u8 smac_id = 0xf;
++	u8 smac_id = 0xf, vpm = 0;
+ 
+ 	memset(hwe, 0, sizeof(*hwe));
+ 	*egress_dev = NULL;
+ 
++	if (data->vlan.num)
++		vpm = data->vlan.hdr[0].proto == htons(ETH_P_8021AD) ? 2 : 1;
++
+ 	val = FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_BIND) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_PACKET_TYPE, type) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_UDP, l4proto == IPPROTO_UDP) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_VLAN_LAYER, data->vlan.num) |
+-	      FIELD_PREP(AIROHA_FOE_IB1_BIND_VPM, data->vlan.num) |
++	      FIELD_PREP(AIROHA_FOE_IB1_BIND_VPM, vpm) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_PPPOE, data->pppoe.num) |
+ 	      AIROHA_FOE_IB1_BIND_TTL;
+ 	hwe->ib1 = val;
+@@ -664,6 +678,10 @@ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
+ 		}
+ 	}
+ 
++	if (vpm == 2 && (wlan_etype >= 0 || dsa_port >= 0 ||
++			 (pon_tag & AIROHA_PON_QDMA_VALID)))
++		return -EOPNOTSUPP;
++
+ 	if (is_multicast_ether_addr(data->eth.h_dest))
+ 		val |= AIROHA_FOE_IB2_MULTICAST;
+ 
+@@ -1528,8 +1546,10 @@ static int airoha_ppe_flow_offload_replace_impl(struct airoha_eth *eth,
+ 		case FLOW_ACTION_CSUM:
+ 			break;
+ 		case FLOW_ACTION_VLAN_PUSH:
+-			if (data.vlan.num == 2 ||
+-			    act->vlan.proto != htons(ETH_P_8021Q))
++			if (data.vlan.num == 2)
++				return -EOPNOTSUPP;
++			if (act->vlan.proto != htons(ETH_P_8021Q) &&
++			    !(data.vlan.num == 0 && act->vlan.proto == htons(ETH_P_8021AD)))
+ 				return -EOPNOTSUPP;
+ 
+ 			data.vlan.hdr[data.vlan.num].id = act->vlan.vid;
+@@ -1550,6 +1570,50 @@ static int airoha_ppe_flow_offload_replace_impl(struct airoha_eth *eth,
+ 		}
+ 	}
+ 
++	if (odev && is_vlan_dev(odev) &&
++	    vlan_dev_vlan_proto(odev) == htons(ETH_P_8021AD)) {
++		struct net_device *lower = vlan_dev_real_dev(odev);
++
++		if (lower && !strcmp(lower->name, "fttr0") &&
++		    airoha_is_valid_gdm_dev(eth, netdev_priv(lower))) {
++			struct flow_match_meta meta;
++			struct net_device *ingress;
++
++			flow_rule_match_meta(rule, &meta);
++			ingress = dev_get_by_index(dev_net(lower),
++						   meta.key->ingress_ifindex);
++			if (ingress && airoha_fttr_vlan_dev(ingress, lower)) {
++				struct net_device *in_br, *out_br;
++				bool invalid;
++
++				rcu_read_lock();
++				in_br = netdev_master_upper_dev_get_rcu(ingress);
++				out_br = netdev_master_upper_dev_get_rcu(odev);
++				invalid = ingress == odev || !in_br ||
++					  !netif_is_bridge_master(in_br) ||
++					  in_br != out_br ||
++					  br_vlan_enabled(in_br);
++				rcu_read_unlock();
++				dev_put(ingress);
++				if (invalid)
++					return -EOPNOTSUPP;
++			} else if (ingress) {
++				dev_put(ingress);
++			}
++			if (data.vlan.num >= 2)
++				return -EOPNOTSUPP;
++			if (data.vlan.num == 1) {
++				if (data.vlan.hdr[0].proto != htons(ETH_P_8021Q))
++					return -EOPNOTSUPP;
++				data.vlan.hdr[1] = data.vlan.hdr[0];
++			}
++			data.vlan.hdr[0].id = vlan_dev_vlan_id(odev);
++			data.vlan.hdr[0].proto = htons(ETH_P_8021AD);
++			data.vlan.num++;
++			odev = lower;
++		}
++	}
++
+ 	*stage = "ether-address";
+ 	if (!is_valid_ether_addr(data.eth.h_source) ||
+ 	    !is_valid_ether_addr(data.eth.h_dest))
+@@ -2005,6 +2070,81 @@ void airoha_ppe_put_dev(struct airoha_ppe_dev *dev)
+ }
+ EXPORT_SYMBOL_GPL(airoha_ppe_put_dev);
+ 
++static LIST_HEAD(airoha_ppe_indr_block_cb_list);
++
++static void airoha_ppe_indr_release(void *cb_priv)
++{
++}
++
++static int airoha_ppe_indr_block_cb(enum tc_setup_type type, void *type_data,
++				    void *cb_priv)
++{
++	struct airoha_eth *eth = cb_priv;
++
++	if (type != TC_SETUP_CLSFLOWER)
++		return -EOPNOTSUPP;
++
++	return airoha_ppe_setup_tc_block_cb(&eth->ppe->dev, type_data);
++}
++
++static int airoha_ppe_indr_setup_cb(struct net_device *dev, struct Qdisc *sch,
++				    void *cb_priv, enum tc_setup_type type,
++				    void *type_data, void *data,
++				    void (*cleanup)(struct flow_block_cb *block_cb))
++{
++	struct flow_block_offload *bo = type_data;
++	struct airoha_eth *eth = cb_priv;
++	struct flow_block_cb *block_cb;
++	struct net_device *lower;
++
++	if (type != TC_SETUP_FT ||
++	    bo->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++		return -EOPNOTSUPP;
++	if (!is_vlan_dev(dev) ||
++	    vlan_dev_vlan_proto(dev) != htons(ETH_P_8021AD))
++		return -EOPNOTSUPP;
++	lower = vlan_dev_real_dev(dev);
++	if (!lower || strcmp(lower->name, "fttr0") ||
++	    !airoha_is_valid_gdm_dev(eth, netdev_priv(lower)) ||
++	    !tc_can_offload(lower))
++		return -EOPNOTSUPP;
++
++	bo->driver_block_list = &airoha_ppe_indr_block_cb_list;
++	switch (bo->command) {
++	case FLOW_BLOCK_BIND:
++		block_cb = flow_block_cb_lookup(bo->block,
++						airoha_ppe_indr_block_cb, eth);
++		if (block_cb) {
++			flow_block_cb_incref(block_cb);
++			return 0;
++		}
++		block_cb = flow_indr_block_cb_alloc(airoha_ppe_indr_block_cb,
++						    eth, eth,
++						    airoha_ppe_indr_release,
++						    bo, lower, sch, data, eth,
++						    cleanup);
++		if (IS_ERR(block_cb))
++			return PTR_ERR(block_cb);
++		flow_block_cb_incref(block_cb);
++		flow_block_cb_add(block_cb, bo);
++		list_add_tail(&block_cb->driver_list,
++			      &airoha_ppe_indr_block_cb_list);
++		return 0;
++	case FLOW_BLOCK_UNBIND:
++		block_cb = flow_block_cb_lookup(bo->block,
++						airoha_ppe_indr_block_cb, eth);
++		if (!block_cb)
++			return -ENOENT;
++		if (!flow_block_cb_decref(block_cb)) {
++			flow_indr_block_cb_remove(block_cb, bo);
++			list_del(&block_cb->driver_list);
++		}
++		return 0;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
+ int airoha_ppe_init(struct airoha_eth *eth)
+ {
+ 	int foe_size, err, ppe_num_stats_entries;
+@@ -2066,8 +2208,14 @@ int airoha_ppe_init(struct airoha_eth *eth)
+ 	if (err)
+ 		goto error_l2_flow_table_destroy;
+ 
++	err = flow_indr_dev_register(airoha_ppe_indr_setup_cb, eth);
++	if (err)
++		goto error_debugfs_remove;
++
+ 	return 0;
+ 
++error_debugfs_remove:
++	debugfs_remove(ppe->debugfs_dir);
+ error_l2_flow_table_destroy:
+ 	rhashtable_destroy(&ppe->l2_flows);
+ error_flow_table_destroy:
+@@ -2080,6 +2228,9 @@ void airoha_ppe_deinit(struct airoha_eth *eth)
+ {
+ 	struct airoha_npu *npu;
+ 
++	flow_indr_dev_unregister(airoha_ppe_indr_setup_cb, eth,
++				 airoha_ppe_indr_release);
++
+ 	mutex_lock(&flow_offload_mutex);
+ 
+ 	npu = rcu_replace_pointer(eth->npu, NULL,
