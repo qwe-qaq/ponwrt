@@ -1,0 +1,46 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi: pass a wireless_dev to cfg80211_new_sta()/cfg80211_del_sta()
+
+The 7.1 cfg80211 update changed the first argument of cfg80211_new_sta() and
+cfg80211_del_sta() from struct net_device to struct wireless_dev, matching the
+cfg80211_ops callback changes already handled in mt_wifi_osal. pNetDev is the
+AP netdev, so hand over its ieee80211_ptr; that pointer is already dereferenced
+two lines above in the same function.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/mt_wifi/os/linux/cfg80211/cfg80211_util.c
++++ b/mt_wifi/os/linux/cfg80211/cfg80211_util.c
+@@ -633,7 +633,11 @@
+ #endif
+ 	}
+ 
++#if defined(CFG_CFG80211_VERSION) && (KERNEL_VERSION(7, 1, 0) <= CFG_CFG80211_VERSION)
++	cfg80211_new_sta(pNetDev->ieee80211_ptr, mac_addr, sinfo, GFP_ATOMIC);
++#else
+ 	cfg80211_new_sta(pNetDev, mac_addr, sinfo, GFP_ATOMIC);
++#endif
+ 	os_free_mem(sinfo);
+ }
+ 
+@@ -659,12 +663,20 @@
+ 				MTWF_DBG(pAd, DBG_CAT_CFG80211, CATCFG80211_CMM, DBG_LVL_INFO,
+ 						"pAd: setuplink("MACSTR") to mld mac"MACSTR".\n",
+ 						MAC2STR(mac_addr), MAC2STR(pEntry->mlo.mld_addr));
++#if defined(CFG_CFG80211_VERSION) && (KERNEL_VERSION(7, 1, 0) <= CFG_CFG80211_VERSION)
++				return cfg80211_del_sta(pNetDev->ieee80211_ptr, pEntry->mlo.mld_addr, GFP_ATOMIC);
++#else
+ 				return cfg80211_del_sta(pNetDev, pEntry->mlo.mld_addr, GFP_ATOMIC);
++#endif
+ 			}
+ 		}
+ 	}
+ #endif
++#if defined(CFG_CFG80211_VERSION) && (KERNEL_VERSION(7, 1, 0) <= CFG_CFG80211_VERSION)
++	return cfg80211_del_sta(pNetDev->ieee80211_ptr, mac_addr, GFP_ATOMIC);
++#else
+ 	return cfg80211_del_sta(pNetDev, mac_addr, GFP_ATOMIC);
++#endif
+ }
+ 
+ 
