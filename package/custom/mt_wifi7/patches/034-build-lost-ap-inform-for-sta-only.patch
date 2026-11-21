@@ -1,0 +1,44 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi: build CFG80211_LostApInform for STA-only builds
+
+RT_CFG80211_LOST_AP_INFORM() is defined when CONFIG_STA_SUPPORT is set,
+either alone or together with APCLI_CFG80211_SUPPORT, and it is used from
+sta_mgmt_cntl.c.  The definition of the target function lives in
+cfg80211_apcli.c, which is wrapped as a whole in #ifdef
+APCLI_CFG80211_SUPPORT, so a build with STA support but without APCLI
+support compiled the two callers and no definition:
+
+    ERROR: modpost: "CFG80211_LostApInform" [mt_wifi.ko] undefined!
+
+The body only touches StaCfg[0] and the cfg80211 STA state, so it is valid
+outside the APCLI guard.  Close the file-wide guard just for this function
+and re-open it afterwards, which keeps the APCLI code paths unchanged and
+also keeps the function available when APCLI support is enabled.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/mt_wifi/os/linux/cfg80211/cfg80211_apcli.c
++++ b/mt_wifi/os/linux/cfg80211/cfg80211_apcli.c
+@@ -92,6 +92,13 @@
+ }
+ 
+ 
++#endif /* APCLI_CFG80211_SUPPORT */
++
++/*
++ * ponwrt: this is the STA-mode half of the lost-AP notification. The caller
++ * (RT_CFG80211_LOST_AP_INFORM) is enabled by CONFIG_STA_SUPPORT as well, so
++ * the definition must be available without APCLI_CFG80211_SUPPORT.
++ */
+ VOID CFG80211_LostApInform(VOID *pAdOrg)
+ {
+ 	PRTMP_ADAPTER pAd = (PRTMP_ADAPTER)pAdOrg;
+@@ -122,6 +129,8 @@
+ 	}
+ }
+ 
++#ifdef APCLI_CFG80211_SUPPORT
++
+ VOID CFG80211DRV_ApClientKeyAdd(VOID *pAdOrg, VOID *pData)
+ {
+ 	PRTMP_ADAPTER pAd = (PRTMP_ADAPTER)pAdOrg;

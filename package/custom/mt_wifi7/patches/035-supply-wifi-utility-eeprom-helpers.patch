@@ -1,0 +1,74 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi: supply the wifi_utility EEPROM and MAC helpers
+
+ee_flash.c and eeprom.c expect three helpers from MediaTek's wifi_utility
+driver: mt_eeprom_read_wifi(), mt_eeprom_write_wifi() and
+mt_mac_address_read_wifi().  That driver is not part of this tree, so the
+first modpost run of the MT7993 build stopped with
+
+    ERROR: modpost: "mt_eeprom_read_wifi" [mt_wifi.ko] undefined!
+    ERROR: modpost: "mt_mac_address_read_wifi" [mt_wifi.ko] undefined!
+    ERROR: modpost: "mt_eeprom_write_wifi" [mt_wifi.ko] undefined!
+
+Provide the three functions locally:
+
+- The reference board has no dedicated factory partition (the device tree
+  exposes bl2 plus a single ubi volume) and the MT7993 EEPROM image is
+  installed as /lib/firmware/MT7993_EEPROM.bin, which
+  rtmp_ee_flash_init() loads when the flash ID does not validate.  Report
+  the flash access as unavailable instead of inventing a partition name;
+  the caller ignores the return value and the BIN fallback takes over.
+- Flash writes are not supported on this platform (the vendor driver
+  delegates them to ated), so return -EOPNOTSUPP.
+- mt_mac_address_read_wifi() returns -ENOENT: there is no device tree or
+  NVMEM per-band MAC address, and -ENOENT is the documented "no entry"
+  result that leaves the EEPROM address in place without a warning.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/mt_wifi/hw_ctrl/ee_flash.c
++++ b/mt_wifi/hw_ctrl/ee_flash.c
+@@ -30,6 +30,23 @@
+ int mt_eeprom_read_wifi(loff_t from, size_t len, u_char *buf);
+ int mt_eeprom_write_wifi(loff_t to, size_t len, const u_char *buf);
+ 
++/*
++ * ponwrt: these two helpers are normally exported by the MediaTek
++ * "wifi_utility" module, which is not part of this tree. The board has no
++ * dedicated factory partition - the whole flash is UBI - so the EEPROM image
++ * comes from /lib/firmware/MT7993_EEPROM.bin instead. Fail the access and let
++ * rtmp_ee_flash_init() fall back to the BIN image.
++ */
++int mt_eeprom_read_wifi(loff_t from, size_t len, u_char *buf)
++{
++	return -ENODEV;
++}
++
++int mt_eeprom_write_wifi(loff_t to, size_t len, const u_char *buf)
++{
++	return -EOPNOTSUPP;
++}
++
+ #define flash_read(_ctrl, _ptr, _offset, _len) mt_eeprom_read_wifi(_offset, (size_t)_len, _ptr)
+ #define flash_write(_ctrl, _ptr, _offset, _len) mt_eeprom_write_wifi(_offset, (size_t)_len, _ptr)
+ 
+--- a/mt_wifi/hw_ctrl/eeprom.c
++++ b/mt_wifi/hw_ctrl/eeprom.c
+@@ -28,6 +28,17 @@
+ 
+ #ifdef HWIFI_SUPPORT
+ extern int mt_mac_address_read_wifi(struct device *dev, u32 band_idx, u8 *addr);
++
++/*
++ * ponwrt: the MediaTek "wifi_utility" module that used to provide this
++ * helper is not part of this tree, and the board device tree exports no
++ * per-band MAC address. Report "no such entry" so the caller keeps the
++ * address taken from the EEPROM image, as documented for a failed lookup.
++ */
++int mt_mac_address_read_wifi(struct device *dev, u32 band_idx, u8 *addr)
++{
++	return -ENOENT;
++}
+ #endif
+ 
+ struct chip_map {
