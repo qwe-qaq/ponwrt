@@ -426,12 +426,11 @@ ifneq ($(CONFIG_PACKAGE_kmod-blackhawk_a0_pcie1),y)
 	MTK_HWIFI_C_FLAGS+=CONFIG_HWIFI_CHIP_BLACKHAWK_A0_PCIE1=n
 endif
 
+# 同 mt_wifi7：整份拷贝，不做路径过滤。wlan_hwifi/Makefile 也从别处拉源码，
+# 按目录名过滤同样会得到空文件。
 define collect_module_symvers
-	realdir=$$$$(readlink -f $(PKG_BUILD_DIR))/wlan_hwifi; \
-	grep -F $$$$realdir $(PKG_BUILD_DIR)/wlan_hwifi/Module.symvers >> $(PKG_BUILD_DIR)/wlan_hwifi/Module.symvers.tmp; \
-	sort -u $(PKG_BUILD_DIR)/wlan_hwifi/Module.symvers.tmp > $(PKG_BUILD_DIR)/wlan_hwifi/Module.symvers; \
 	mkdir -p $(PKG_SYMVERS_DIR); \
-	mv $(PKG_BUILD_DIR)/wlan_hwifi/Module.symvers $(PKG_SYMVERS_DIR)/$(PKG_NAME).symvers
+	sort -u $(PKG_BUILD_DIR)/wlan_hwifi/Module.symvers > $(PKG_SYMVERS_DIR)/$(PKG_NAME).symvers
 endef
 
 define Build/Compile

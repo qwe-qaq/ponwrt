@@ -45,6 +45,13 @@ else ifeq ($(wildcard $(MT7_PATCHSET_STAMP)),)
 	$(PKG_BUILD_DIR)/.configured $(PKG_BUILD_DIR)/.prepared* \
 	$(PKG_BUILD_DIR)/.patchset_*)
 endif
+
+# 导出符号表缺失/为空时（缓存里可能存着上一轮生成的 0 字节文件，或者上一轮在
+# 收集之前就失败了），只把 .built 摘掉让 kbuild 重跑一次 modpost：.o 都在，
+# 几秒钟就能重新写出 Module.symvers 并触发 Compile/Post 的收集。
+ifneq ($(shell [ -s $(PKG_SYMVERS_DIR)/$(PKG_NAME).symvers ] && echo yes),yes)
+  $(shell rm -f $(PKG_BUILD_DIR)/.built)
+endif
 endif
 
 PKG_KCONFIG:= \
@@ -417,12 +424,19 @@ PKG_EXTRA_MODULE_CFLAGS := -Wno-error -Wno-missing-prototypes -Wno-missing-decla
 	$(addprefix -I,$(MTK_NL80211_INC_DIR))
 KCFLAGS += $(if $(CONFIG_MTK_WIFI7_OSAL_SUPPORT), -DMT_WIFI_COMMON_SUPPORT -DMT_WIFI_OSAL_SUPPORT -I$(STAGING_DIR)/usr/include/mt_wifi -I$(STAGING_DIR)/usr/include/mt_wifi/os)
 
+# 本包的导出符号表要交给后面的 mt_hwifi 用（mtk_hwifi.ko / connac_if.ko 调
+# mt_wifi.ko 里的 mtk_mac_* / is_amsdu_capable），走的是 OpenWrt 的
+# Hooks/Compile/Post += collect_module_symvers（kernel.mk 里注册），结果落到
+# $(PKG_SYMVERS_DIR)/$(PKG_NAME).symvers，被依赖方通过 KBUILD_EXTRA_SYMBOLS 读。
+#
+# 原来这里是按 "路径里含 mt_wifi_ap/" 过滤 Module.symvers 的，但 mt_wifi_ap/Makefile
+# 把 TOP_DIR 指到 ../mt_wifi，所有 .o 的路径其实是 .../mt_wifi7/mt_wifi/...，
+# 过滤结果为空 —— mt_wifi7.symvers 是个 0 字节文件，于是 mt_hwifi 的 modpost
+# 报 "mtk_mac_rx [mtk_hwifi.ko] undefined!" 一片。Module.symvers 本来就只含本次
+# 外部模块构建导出的符号，直接整份拷过去即可，也不要把源文件 mv 走（重编时还要用）。
 define collect_module_symvers
-	realdir=$$$$(readlink -f $(PKG_BUILD_DIR))/mt_wifi_ap; \
-	grep -F $$$$realdir $(PKG_BUILD_DIR)/mt_wifi_ap/Module.symvers >> $(PKG_BUILD_DIR)/mt_wifi_ap/Module.symvers.tmp; \
-	sort -u $(PKG_BUILD_DIR)/mt_wifi_ap/Module.symvers.tmp > $(PKG_BUILD_DIR)/mt_wifi_ap/Module.symvers; \
 	mkdir -p $(PKG_SYMVERS_DIR); \
-	mv $(PKG_BUILD_DIR)/mt_wifi_ap/Module.symvers $(PKG_SYMVERS_DIR)/$(PKG_NAME).symvers
+	sort -u $(PKG_BUILD_DIR)/mt_wifi_ap/Module.symvers > $(PKG_SYMVERS_DIR)/$(PKG_NAME).symvers
 endef
 
 # mt_wifi_ap/Makefile 用 obj-$(CONFIG_MT_WIFI) 决定编入内核还是编成模块。OpenWrt
