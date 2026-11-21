@@ -417,8 +417,13 @@ endef
 # modules.order 为空、modpost 无事可做，最后报 mt_wifi.ko is missing。
 # 该符号在源码里只用于 obj- 和 -DMT_WIFI_MODULE（后者已被 CONFIG_SUPPORT_OPENWRT
 # 覆盖），所以这里固定传 m。
+#
+# -k：这棵 vendor 树的头文件自包含性不好，一个头文件缺东西会让上百个翻译单元
+# 同时报错；不加 -k 时 make 只走第一条失败路径，一轮只能暴露一两个问题。
+# 带 -k 继续编译完剩余文件，一次拿到完整错误清单。失败仍会让 make 返回非零，
+# 不会掩盖错误。
 define Build/Compile
-	+$(MAKE) $(PKG_JOBS) -C "$(LINUX_DIR)" V=1 \
+	+$(MAKE) -k $(PKG_JOBS) -C "$(LINUX_DIR)" V=1 \
 		CROSS_COMPILE="$(TARGET_CROSS)" \
 		ARCH="$(LINUX_KARCH)" \
 		M="$(PKG_BUILD_DIR)/mt_wifi_ap" \
