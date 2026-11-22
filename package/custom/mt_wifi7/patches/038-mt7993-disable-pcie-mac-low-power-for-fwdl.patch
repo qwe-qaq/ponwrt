@@ -1,0 +1,77 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt7993: keep the PCIe MAC out of L0s/L1.x during firmware download
+
+The WM ROM patch download dies at the very last step on AN7581:
+
+  mt7993 0000:01:00.0: mt7993_check_fwdl_state(): check target stat=1, cur state=1
+  mt7993 0000:01:00.0: HW/SW Version: 0x8a108a10, Build Time: 20250623123248
+  pcieport 0000:00:00.0: AER: Correctable error, Physical Layer (RxErr)
+  pcieport 0000:00:00.0: AER: Uncorrectable (Fatal), Data Link Layer (SDES)
+  mt7993 0000:01:00.0: Failed to start patch
+
+i.e. the endpoint leaves the bus about 20 ms after MCU_CMD_PATCH_FINISH_REQ.
+The ROM itself is healthy: the state readback and the 12 KB scatter download
+both succeed, and the failure reproduces identically at Gen1 and Gen2, so it
+is not signal integrity on the link.
+
+MT7993 uses the same MediaTek PCIe MAC IP as MT7921, and MediaTek documented
+this exact failure mode for it ("wifi: mt76: mt7921e: fix random fw download
+fail", Deren Wu, 2022): once the MAC enters L0s while the patch payload is
+being pulled in, the payload is corrupted, the CPU jumps into garbage and the
+device falls off the bus.  The cure there was to force the MAC's own low power
+state machine off, not to touch LNKCTL.
+
+PCIE_LOW_POWER_CTRL_0 (chip 0x74030194, BAR0 + 0x10194) reports
+force_dis_lowpwr[11:8] = 0 on this board, so L0s is allowed.  Set all four
+bits before the first MCU transaction, which is exactly where the vendor's own
+mt7993_pci_l1ss() puts them.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/wlan_hwifi/chips/mt7993/mt7993.c
++++ b/wlan_hwifi/chips/mt7993/mt7993.c
+@@ -954,6 +954,14 @@ static void mt7993_dbg_exit(struct pci_trans *ptrans)
+ #endif
+ }
+ 
++/*
++ * PCIE_LOW_POWER_CTRL_0 lives in the PCIe MAC block: chip address
++ * 0x74030194, i.e. BAR0 + 0x10194 (see the 0x1_xxxx -> 0x7403_xxxx
++ * window documented in mt_wifi/chip/mt7993/mt7993.c).
++ */
++#define MT7993_PCIE_LOW_POWER_CTRL_0	0x10194
++#define MT7993_FORCE_DIS_LOWPWR		0x00000f00
++
+ static int
+ mt7993_driver_own(struct mtk_hw_dev *dev, struct mtk_bus_trans *trans, bool drv_own)
+ {
+@@ -962,6 +970,29 @@ mt7993_driver_own(struct mtk_hw_dev *dev, struct mtk_bus_trans *trans, bool drv_
+ 	u32 target_state = (drv_own ? 0 : 1)
+ 			<< CONN_HOST_CSR_TOP_WF_BAND0_LPCTL_WF_B0_AP_HOST_OWNER_STATE_SYNC_SHFT;
+ 
++	/*
++	 * MT7993 shares the MediaTek PCIe MAC IP with MT7921, and MediaTek
++	 * documented this exact failure for that block: the ROM patch payload
++	 * is corrupted once the MAC enters L0s while it is being downloaded,
++	 * the WM CPU then jumps into garbage and the endpoint falls off the
++	 * bus.  Observed here as AER RxErr + SDES a few milliseconds after
++	 * MCU_CMD_PATCH_FINISH_REQ, followed by "Failed to start patch".
++	 *
++	 * force_dis_lowpwr[11:8] = 0xf keeps L0s, L1, L1.1 and L1.2 disabled
++	 * for the download and for the MCU exchange that follows it.
++	 * The vendor does the same from mt7993_pci_l1ss().
++	 */
++	if (drv_own) {
++		u32 lp;
++
++		lp = bus_read(trans, MT7993_PCIE_LOW_POWER_CTRL_0);
++		bus_write(trans, MT7993_PCIE_LOW_POWER_CTRL_0,
++			  lp | MT7993_FORCE_DIS_LOWPWR);
++		dev_info(trans->pdev,
++			 "pcie low power ctrl 0x%08x -> 0x%08x\n", lp,
++			 bus_read(trans, MT7993_PCIE_LOW_POWER_CTRL_0));
++	}
++
+ 	if (drv_own)
+ 		bus_write(trans, reg,
+ 		CONN_HOST_CSR_TOP_WF_BAND0_LPCTL_WF_B0_AP_HOST_CLR_FW_OWN_HS_PULSE_MASK);
