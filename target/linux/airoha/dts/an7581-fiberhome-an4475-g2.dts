@@ -753,28 +753,24 @@
 	pinctrl-0 = <&pcie0_rst_pins>;
 
 	/*
-	 * 暂时锁 Gen1（2.5GT/s）。
+	 * 不要在这里写 max-link-speed。
 	 *
-	 * 现象：Gen2 下 mt7993 的 patch（1 段 12KB，addr 0x00900000）能正常
-	 * 下发 —— init_download / send_firmware 都没报错，只有 start_patch
-	 * 发 MCU_CMD_PATCH_FINISH_REQ 之后立刻：
+	 * 曾经为了排查 mt7993 固件下载失败锁过 Gen1，结论是无效：运行期把
+	 * RC 的 LnkCtl2 目标速率改成 Gen1 并置 Retrain Link，链路确实降到
+	 * 2.5GT/s x1（LinkSta=0x3011），但 start_patch 发
+	 * MCU_CMD_PATCH_FINISH_REQ 之后照样 20ms 内 RxErr + SDES，端点从
+	 * 总线上消失。所以链路速率/信号完整性不是原因，锁 Gen1 只会白丢
+	 * 一半带宽。真正的原因见 mt_wifi7 补丁 038（PCIe MAC 的 L0s/L1.x
+	 * 会把下载中的 patch 弄坏）。
 	 *
-	 *   pcieport: AER Correctable  Physical Layer (RxErr)
-	 *   pcieport: AER Uncorrectable Fatal, Data Link Layer (SDES)
-	 *   Root Port link has been reset (0) / device recovery failed
-	 *
-	 * 也就是 WM CPU 跳进 patch 的瞬间端点从总线上消失。Gen2 5.0GT/s 下
-	 * 的突发 DMA 与 SI 余量有关，先用 Gen1 排除链路本身，把变量减少到
-	 * 一个：如果 Gen1 能把固件跑起来，就是 Gen2 信号完整性/PHY 预加重
-	 * 的问题，后面再调 EQ preset；如果 Gen1 一样崩，那就是芯片执行
-	 * patch 时自己复位 PCIe PHY，方向要转到供电/PERST 时序。
+	 * 另外 mtk-pcie-gen3 里那段 max-link-speed 判断写反了
+	 * （max_speed <= err 才赋值，控制器比请求快时直接跳过），所以这个
+	 * 属性在本平台上本来也不会生效。
 	 *
 	 * 注意：运行期写 LnkCtl2 + Link Disable/Enable 硬降速会把这颗芯片
 	 * 的 ROM 状态机带到 DRV_FW_STAT_SYNC=6（未文档化状态），之后连
-	 * patch semaphore 都拿不到（-110），必须断电+PERST 才能恢复。所以
-	 * 降速只能在 DTS 里做，不能运行期做。
+	 * patch semaphore 都拿不到（-110），必须断电+PERST 才能恢复。
 	 */
-	max-link-speed = <1>;
 
 	status = "okay";
 
