@@ -616,6 +616,10 @@ ifeq ($(CONFIG_MTK_WIFI7_FW_CASAN_SUPPORT),y)
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/bin/mt7993/rebb/WIFI_MT7993_PATCH_MCU_1_1_hdr_casan.bin $(1)/lib/firmware/WIFI_MT7993_PATCH_MCU_1_1_hdr.bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/bin/mt7993/rebb/WIFI_RAM_CODE_MT7993_1_1_casan.bin $(1)/lib/firmware/WIFI_RAM_CODE_MT7993_1_1.bin
 endif
+	# keep the casan build available under its own name so diag_patch_file /
+	# diag_ram_file can switch to it on a live device
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/bin/mt7993/rebb/WIFI_MT7993_PATCH_MCU_1_1_hdr_casan.bin $(1)/lib/firmware/WIFI_MT7993_PATCH_MCU_1_1_hdr_casan.bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/bin/mt7993/rebb/WIFI_RAM_CODE_MT7993_1_1_casan.bin $(1)/lib/firmware/WIFI_RAM_CODE_MT7993_1_1_casan.bin
 endif
 
 ifeq ($(CONFIG_MTK_HWIFI_BLACKHAWK_A0),y)

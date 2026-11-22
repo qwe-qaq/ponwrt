@@ -1,0 +1,144 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt7993: drop the SRAM probe and make the firmware choice switchable
+
+042 read the download back at 0x00900000 and the device reset a few seconds
+later.  That address is outside the endpoint's memory BAR: BAR 0 is 2 MiB and
+only decodes the low 21 bits, so offset 0x900000 walks off the mapping and the
+root complex takes a fatal error.  Everything the driver can reach sits in the
+first 2 MiB (SWDEF_MODE 0x009143C, CONN_HOST_CSR_TOP 0xE0000), and the ROM
+patch region is not exposed there at all: the 64 KiB window at 0x090000 reads
+back a small block of counters, not the 256 KiB ULM1 SRAM.  Drop the probe
+rather than keep guessing at a window the host cannot see.
+
+Two switches replace it, because the remaining candidates cannot be told apart
+by reading memory:
+
+  diag_patch_file=  load a different ROM patch than the chip table names, so
+                    the plain and _casan builds the package ships can be
+                    compared on one image.  The firmware is requested from
+                    /lib/firmware at run time (the module is 170 KB, it does
+                    not embed the 12 KiB patch or the 1.1 MB RAM code), so
+                    this needs no rebuild to try.
+
+  diag_skip_patch=1 skip the ROM patch entirely and let the unpatched ROM take
+                    the RAM code.  The endpoint only leaves the bus after
+                    PATCH_FINISH_REQ, so this is the one branch that tests
+                    whether the patch image is the whole problem.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -307,12 +307,31 @@
+ MODULE_PARM_DESC(diag_skip_start,
+ 		 "skip PATCH_FINISH_REQ so the ROM never jumps into the patch");
+ 
+-static u32
+-mcu_diag_word(const u8 *p)
+-{
+-	return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) |
+-	       ((u32)p[3] << 24);
+-}
++/*
++ * The firmware is loaded from /lib/firmware at run time, so the variant in
++ * use can be swapped on a live device.  These two let the caller pick a
++ * different file than the one the chip table names, which is the only way
++ * to compare the two MT7993 ROM patch builds the package ships.
++ */
++static char *diag_patch_file;
++module_param(diag_patch_file, charp, 0644);
++MODULE_PARM_DESC(diag_patch_file, "override the ROM patch firmware file");
++
++static char *diag_ram_file;
++module_param(diag_ram_file, charp, 0644);
++MODULE_PARM_DESC(diag_ram_file, "override the WM RAM code firmware file");
++
++/*
++ * The ROM patch is what makes the ROM jump into the downloaded image and
++ * what makes the endpoint leave the bus.  Skipping it loads the RAM code
++ * straight into an unpatched ROM, which either works or fails in a very
++ * different way - either answer is more informative than another crash at
++ * the same instruction.
++ */
++static bool diag_skip_patch;
++module_param(diag_skip_patch, bool, 0644);
++MODULE_PARM_DESC(diag_skip_patch, "skip the ROM patch, load the RAM code only");
++
+ 
+ static int
+ mcu_wm_load_patch(struct mtk_hw_dev *dev, struct mtk_mcu_entry *mcu_entry)
+@@ -338,7 +357,10 @@
+ 	}
+ 
+ 	if (mcu_entry->applied_method == BIN_METHOD) {
+-		ret = request_firmware(&fw, mcu_entry->fw_patch, dev->dev);
++		const char *patch_name = (diag_patch_file && diag_patch_file[0]) ?
++					diag_patch_file : mcu_entry->fw_patch;
++
++		ret = request_firmware(&fw, patch_name, dev->dev);
+ 		if (ret)
+ 			goto out;
+ 
+@@ -411,39 +433,6 @@
+ 		if (ret) {
+ 			dev_err(dev->dev, "Failed to send patch\n");
+ 			goto out;
+-		}
+-
+-		{
+-			int k;
+-
+-			/*
+-			 * The bus offset is the MCU address itself: the BAR only
+-			 * window-decodes the upper address bits (MCU 0x009143C is
+-			 * reached as bus 0x009143C and lands on 0x1849_143C), it
+-			 * never shifts the address down.  041 divided by 16 and
+-			 * sampled MCU 0x00090000, a different SRAM block, which is
+-			 * why the payload looked absent.
+-			 */
+-			for (k = 0; k < 8; k++) {
+-				u32 off = k * 4;
+-
+-				dev_err(dev->dev,
+-					"diag sram 0x%08x +0x%02x: rd=0x%08x exp=0x%08x\n",
+-					addr, off,
+-					bus_read(dev->bus_trans, addr + off),
+-					(off + 4 <= len) ?
+-						mcu_diag_word(dl + off) : 0);
+-			}
+-
+-			/* keep the 041 address as a control: it must not match */
+-			for (k = 0; k < 2; k++) {
+-				u32 off = k * 4;
+-
+-				dev_err(dev->dev,
+-					"diag ctrl 0x%06x +0x%02x: rd=0x%08x\n",
+-					(addr >> 4) + off, off,
+-					bus_read(dev->bus_trans, (addr >> 4) + off));
+-			}
+ 		}
+ 	}
+ 
+@@ -622,7 +611,11 @@
+ 	const char *data_ptr = NULL;
+ 
+ 	if (mcu_entry->applied_method == BIN_METHOD) {
+-		ret = request_firmware(&fw, mcu_entry->fw_ram[mcu_entry->fw_mode], dev->dev);
++		const char *ram_name = (diag_ram_file && diag_ram_file[0]) ?
++				diag_ram_file :
++				mcu_entry->fw_ram[mcu_entry->fw_mode];
++
++		ret = request_firmware(&fw, ram_name, dev->dev);
+ 		if (ret)
+ 			goto end;
+ 
+@@ -917,7 +910,8 @@
+ {
+ 	struct mtk_chip_drv *drv = dev->chip_drv;
+ 
+-	mcu_entry->need_patch = (mcu_entry->option & BIT(WM_OPT_PATCH_DL)) ? true : false;
++	mcu_entry->need_patch = ((mcu_entry->option & BIT(WM_OPT_PATCH_DL)) &&
++				 !diag_skip_patch) ? true : false;
+ 	mcu_entry->mcu_rxd_sz = sizeof(struct mcu_rxd);
+ 	mcu_entry->rx_ignore_sz = drv->hw_caps->mac_rxd_grp_0_sz;
+ 	return 0;
