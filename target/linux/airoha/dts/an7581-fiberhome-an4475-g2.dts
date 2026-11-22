@@ -751,6 +751,31 @@
 	 * GPIO38 在本板是 PON BOSA 的 tx-disable（见 &xpon_mac），不是 PERST。
 	 */
 	pinctrl-0 = <&pcie0_rst_pins>;
+
+	/*
+	 * 暂时锁 Gen1（2.5GT/s）。
+	 *
+	 * 现象：Gen2 下 mt7993 的 patch（1 段 12KB，addr 0x00900000）能正常
+	 * 下发 —— init_download / send_firmware 都没报错，只有 start_patch
+	 * 发 MCU_CMD_PATCH_FINISH_REQ 之后立刻：
+	 *
+	 *   pcieport: AER Correctable  Physical Layer (RxErr)
+	 *   pcieport: AER Uncorrectable Fatal, Data Link Layer (SDES)
+	 *   Root Port link has been reset (0) / device recovery failed
+	 *
+	 * 也就是 WM CPU 跳进 patch 的瞬间端点从总线上消失。Gen2 5.0GT/s 下
+	 * 的突发 DMA 与 SI 余量有关，先用 Gen1 排除链路本身，把变量减少到
+	 * 一个：如果 Gen1 能把固件跑起来，就是 Gen2 信号完整性/PHY 预加重
+	 * 的问题，后面再调 EQ preset；如果 Gen1 一样崩，那就是芯片执行
+	 * patch 时自己复位 PCIe PHY，方向要转到供电/PERST 时序。
+	 *
+	 * 注意：运行期写 LnkCtl2 + Link Disable/Enable 硬降速会把这颗芯片
+	 * 的 ROM 状态机带到 DRV_FW_STAT_SYNC=6（未文档化状态），之后连
+	 * patch semaphore 都拿不到（-110），必须断电+PERST 才能恢复。所以
+	 * 降速只能在 DTS 里做，不能运行期做。
+	 */
+	max-link-speed = <1>;
+
 	status = "okay";
 
 	pcie@0,0 {
