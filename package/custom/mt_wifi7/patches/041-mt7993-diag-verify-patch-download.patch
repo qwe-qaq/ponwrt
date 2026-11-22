@@ -1,0 +1,123 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt7993: verify the ROM patch download without letting the ROM jump
+
+The patch download now shows the full picture on AN7581:
+
+  diag mcu resp cmd=0x05 seq=2 len=0        ROM ACKed PATCH_START_REQ
+  diag fwdl push: len=4032 didx=0 dw1=0x4fc00000
+  diag fwdl done: tail=1 head=1 didx=1      all four chunks consumed
+  diag fwdl done: tail=4 head=4 didx=4
+  diag[start] issuing PATCH_FINISH_REQ
+  AER RxErr -> AER SDES -> link gone
+
+Two things still cannot be told apart, and they need opposite fixes:
+
+  * the scatter really reached MCU address 0x00900000 and the ROM dies
+    jumping into it (bad or mismatched patch image), or
+  * the scatter never reached SRAM and the ROM dies because it jumps into
+    whatever 0x00900000 happened to contain before the download.
+
+The WF_MCU_SYSRAM window is readable through the same bus offset the
+driver already uses for SWDEF_MODE (0x009143c), i.e. MCU address >> 4, so
+read the first eight words back right after the scatter, while the ROM is
+still alive, and print the region table that was sent to the ROM.
+
+diag_skip_start=1 additionally drops PATCH_FINISH_REQ.  The ROM then never
+jumps, the endpoint stays on the bus, and the readback can be repeated as
+often as needed on a live device.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -30,6 +30,7 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/firmware.h>
++#include <linux/module.h>
+ #include "mcu.h"
+ #include "hw_ops.h"
+ #include "mac_if.h"
+@@ -284,6 +285,24 @@
+ 	return mode;
+ }
+ 
++/*
++ * Bring-up switch: PATCH_FINISH_REQ is the command that makes the ROM jump
++ * into the patched image, and on AN7581 the endpoint leaves the bus a few
++ * milliseconds later, which makes everything after that point unreadable.
++ * Skipping it keeps the ROM alive so the download itself can be verified.
++ */
++static bool diag_skip_start;
++module_param(diag_skip_start, bool, 0644);
++MODULE_PARM_DESC(diag_skip_start,
++		 "skip PATCH_FINISH_REQ so the ROM never jumps into the patch");
++
++static u32
++mcu_diag_word(const u8 *p)
++{
++	return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) |
++	       ((u32)p[3] << 24);
++}
++
+ static int
+ mcu_wm_load_patch(struct mtk_hw_dev *dev, struct mtk_mcu_entry *mcu_entry)
+ {
+@@ -295,6 +314,7 @@
+ 	u32 n_region = 0;
+ 
+ 	sem = mcu_wm_patch_sem_ctrl(dev, 1);
++	dev_err(dev->dev, "diag: patch sem get -> %d\n", sem);
+ 
+ 	switch (sem) {
+ 	case PATCH_IS_DL:
+@@ -363,6 +383,11 @@
+ 		sec_info = be32_to_cpu(sec->info.sec_info);
+ 		dl = data_ptr + be32_to_cpu(sec->offs);
+ 
++		dev_err(dev->dev,
++			"diag region%d: addr=0x%08x len=%u offs=%u sec_info=0x%08x mode=0x%08x\n",
++			i, addr, len, be32_to_cpu(sec->offs), sec_info,
++			mcu_wm_gen_patch_dl_mode(sec_info));
++
+ 		ret = mcu_wm_init_download(dev, addr, len,
+ 			mcu_wm_gen_patch_dl_mode(sec_info),
+ 			MCU_FWDL_TYPE_ROM_PATCH);
+@@ -376,6 +401,37 @@
+ 			dev_err(dev->dev, "Failed to send patch\n");
+ 			goto out;
+ 		}
++
++		{
++			int k;
++
++			u32 base = addr >> 4;
++
++			for (k = 0; k < 8; k++) {
++				u32 off = k * 4;
++
++				dev_err(dev->dev,
++					"diag sram 0x%06x (=0x%08x>>4) +0x%02x: rd=0x%08x exp=0x%08x\n",
++					base + off, addr, off,
++					bus_read(dev->bus_trans, base + off),
++					(off + 4 <= len) ?
++						mcu_diag_word(dl + off) : 0);
++			}
++		}
++	}
++
++	if (diag_skip_start) {
++		/*
++		 * Abort the whole bring-up instead of continuing with the RAM
++		 * code download: the ROM has not jumped, so it would only
++		 * receive a second scatter into an unknown state.  Leaving the
++		 * semaphore held is fine, the chip gets a power cycle anyway.
++		 */
++		dev_err(dev->dev,
++			"diag: PATCH_FINISH_REQ skipped, aborting bring-up\n");
++		if (mcu_entry->applied_method == BIN_METHOD)
++			release_firmware(fw);
++		return -EOPNOTSUPP;
+ 	}
+ 
+ 	ret = mcu_wm_start_patch(dev);
