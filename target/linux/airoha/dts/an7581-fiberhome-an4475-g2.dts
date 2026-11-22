@@ -743,8 +743,14 @@
 
 &pcie0 {
 	pinctrl-names = "default";
-	pinctrl-0 = <&pcie0_pins>;
-	reset-gpios = <&pio 38 GPIO_ACTIVE_HIGH>;
+	/*
+	 * pcie_reset0 / pcie_reset1 由 pinmux 以 open-drain 方式驱动（与 evb /
+	 * h3c / hg5585f 一致），标签是 pcie0_rst_pins —— 以前写成不存在的
+	 * pcie0_pins，dtc 直接 abort。
+	 * 这里没有 reset-gpios：SoC 侧复位走 dtsi 的 resets = <&scuclk ...>；
+	 * GPIO38 在本板是 PON BOSA 的 tx-disable（见 &xpon_mac），不是 PERST。
+	 */
+	pinctrl-0 = <&pcie0_rst_pins>;
 	status = "okay";
 
 	pcie@0,0 {
