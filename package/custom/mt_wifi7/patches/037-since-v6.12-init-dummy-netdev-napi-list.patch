@@ -1,0 +1,70 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mtk_hwifi: INIT_LIST_HEAD the dummy netdev's napi_list
+
+The first netif_napi_add() on trans->napi_dev panics on 6.18:
+
+  Unable to handle kernel paging request at virtual address ffffffffffffffffc
+  pc : netif_napi_add_weight_locked+0xe4/0x2f4
+  Call trace:
+   netif_napi_add_weight_locked
+   pci_dma_init_device+0xcc/0x530 [mtk_pci]
+   mtk_bus_init_device [mtk_hwifi]
+   connac_if_start [connac_if]
+   hwifi_start [mt_wifi]
+   mt_wifi_open
+   ...
+
+netif_napi_add_weight_locked() calls netif_napi_dev_list_add(), which
+walks dev->napi_list with list_for_each_entry() before inserting the new
+napi.  dev->napi_list is only INIT_LIST_HEAD()ed by alloc_netdev_mqs();
+init_dummy_netdev() sets reg_state and the link state bits and nothing
+else.  Because napi_dev is an embedded struct net_device inside the
+kzalloc()ed pci_trans, the list head stays all-zero, so
+list_for_each_entry() computes
+
+  container_of(NULL, struct napi_struct, dev_list)
+
+i.e. -offsetof(struct napi_struct, dev_list).  In 6.18 the layout is
+
+  u32              napi_id;
+  struct list_head dev_list;
+
+so the bogus node sits at -0x180 and reading pos->napi_id faults at
+0xfffffffc -- exactly the address in the oops.  netif_napi_del() would
+walk the same broken list on the teardown path.
+
+Older kernels never touched dev->napi_list in netif_napi_add(), which is
+why this only shows up now.  Initialising the list head is version
+independent and harmless on the old ones.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/wlan_hwifi/bus/mtk_pci_dma.c
++++ b/wlan_hwifi/bus/mtk_pci_dma.c
+@@ -2197,6 +2197,26 @@
+ 
+ 	mt_init_dummy_netdev(&trans->napi_dev);
+ 
++	/*
++	 * v6.12+ keeps a per-net_device NAPI list: netif_napi_add() walks it
++	 * with list_for_each_entry() before inserting, netif_napi_del() unlinks
++	 * from it.  init_dummy_netdev() only sets reg_state/state and never
++	 * INIT_LIST_HEAD()s dev->napi_list -- the kernel expects the device to
++	 * have come through alloc_netdev().  Ours is an embedded
++	 * struct net_device in a kzalloc()ed pci_trans, so napi_list.next stays
++	 * NULL and the first netif_napi_add() does
++	 *
++	 *   container_of(NULL, struct napi_struct, dev_list)
++	 *
++	 * which lands at -offsetof(dev_list) and reads napi_id (the u32 right
++	 * before dev_list) at 0xfffffffc:
++	 *
++	 *   Unable to handle kernel paging request at ffffffffffffffffc
++	 *   pc : netif_napi_add_weight_locked+0xe4/0x2f4
++	 *   pci_dma_init_device+0xcc/0x530 [mtk_pci]
++	 */
++	INIT_LIST_HEAD(&trans->napi_dev.napi_list);
++
+ 	ret = pci_dma_sw_init_tx_queue(trans);
+ 	if (ret) {
+ 		dev_err(to_device(trans), "%s(): TXQ init failed, ret = %d\n",
