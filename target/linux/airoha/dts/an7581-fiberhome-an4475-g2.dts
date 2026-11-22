@@ -265,12 +265,19 @@
 		};
 	};
 
-	/* pcie0 owns both lanes (pcie-mac + sec-pcie-mac) and drives both
-	 * PERST outputs, so both reset pins belong to one open-drain state.
-	 * The old pcie1_rst_pins became dead code once pcie1 was folded in. */
+	/* 每颗 WiFi 芯片各占一条 lane，各自一条 PERST。原厂 DTB 里就是
+	 * pcie0-rst-pins / pcie1-rst-pins 两组、各自只列一根脚；并成一组
+	 * 会让 pcie1 没有自己的复位脚，第二颗芯片永远枚举不出来。 */
 	pcie0_rst_pins: pcie0-rst-pins {
 		conf {
-			pins = "pcie_reset0", "pcie_reset1";
+			pins = "pcie_reset0";
+			drive-open-drain = <1>;
+		};
+	};
+
+	pcie1_rst_pins: pcie1-rst-pins {
+		conf {
+			pins = "pcie_reset1";
 			drive-open-drain = <1>;
 		};
 	};
@@ -786,5 +793,25 @@
 		 * driver owns EEPROM/MAC/calibration via wifi-profile + l1profile,
 		 * and a stale mt76 node would only claim the endpoint first.
 		 */
+	};
+};
+
+/*
+ * 第二颗 WiFi 芯片（14c3:799b，由 mt799b.ko 接管）挂在这条总线上，
+ * 窗口在 0x24000000。原厂 DTB 里 pcie@1fc00000 和 pcie@1fc20000 都是
+ * okay；只开 pcie0 的话，option_type=1 描述的 "2PCIE 2/5" 拓扑就少了
+ * 一半，而驱动是按两颗芯片来配 ROM patch 下载的。
+ */
+&pcie1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pcie1_rst_pins>;
+
+	status = "okay";
+
+	pcie@0,0 {
+		reg = <0x0000 0 0 0 0>;
+		device_type = "pci";
+		#address-cells = <3>;
+		#size-cells = <2>;
 	};
 };
