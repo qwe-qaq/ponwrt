@@ -1,0 +1,260 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt7993: show what the ROM says and whether the ring still runs
+
+PATCH_FINISH_REQ now comes back instead of timing out once check_crc is set,
+but nothing follows it: the semaphore release (0x10) and the RAM code's
+TARGET_ADDRESS_LEN_REQ (0x01) both time out after exactly 20 s, and a second
+"ra0 up" cannot even get driver own any more - LPCTL never reports the owner
+state back, so the chip has to be power cycled between attempts.  Swapping in
+the patch and RAM code from the vendor image changes nothing, and both patch
+files carry crc = 0xffff, so the ROM is not actually verifying anything when
+it acknowledges 0x07.
+
+Three different failures give this same trace, so add the missing visibility
+and the switches that separate them, all settable at insmod time:
+
+  diag[tag]        LPCTL, CONN_ON_MISC and SWDEF_MODE before the patch, right
+                   after 0x07 and after the semaphore release.  If the jump
+                   resets the chip these stop looking like the state the
+                   download started in.
+
+  diag rxd         every WM rx header: len, pkt_type, eid, seq, option,
+                   ext_eid, s2d.  The old trace reduced the 0x07 reply to
+                   "len=0", which throws away the eid and the option byte -
+                   the only two places a ROM failure code could hide.
+
+  diag cmd         the MCU command ring on every push and every completion.
+                   DDONE on such a descriptor is set by the device, so a
+                   "cmd done" line proves the chip fetched the command and
+                   simply refused to answer, while its absence proves the
+                   ring stopped being serviced at all.
+
+  diag ram         the RAM code region table, which was never printed before.
+
+diag_skip_sem_rel drops the semaphore release, in case the jump leaves the
+MCU alive and 0x10 itself is what wedges it.  diag_skip_ram_req pushes the
+payload straight into the FWDL ring without asking the MCU first, so didx
+answers the same question for the download path on its own.  diag_own_retry
+re-asserts driver own after the jump and logs the handshake result.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -332,6 +332,55 @@
+ module_param(diag_skip_patch, bool, 0644);
+ MODULE_PARM_DESC(diag_skip_patch, "skip the ROM patch, load the RAM code only");
+ 
++/*
++ * 046 bring-up switches.  The ROM answers PATCH_FINISH_REQ and then goes
++ * completely silent: the semaphore release times out and so does the RAM
++ * code's TARGET_ADDRESS_LEN_REQ, both after exactly 20 s.  These knobs let
++ * the next boot narrow down which of the two links died without another
++ * rebuild: the semaphore command can be skipped, the RAM request can be
++ * skipped (leaving only the FWDL scatter, whose didx proves whether the
++ * device still fetches descriptors), and driver own can be re-asserted.
++ */
++static bool diag_skip_sem_rel;
++module_param(diag_skip_sem_rel, bool, 0644);
++MODULE_PARM_DESC(diag_skip_sem_rel,
++		 "do not release the ROM patch semaphore after PATCH_FINISH_REQ");
++
++static bool diag_skip_ram_req;
++module_param(diag_skip_ram_req, bool, 0644);
++MODULE_PARM_DESC(diag_skip_ram_req,
++		 "skip TARGET_ADDRESS_LEN_REQ and scatter the RAM code directly");
++
++static bool diag_own_retry;
++module_param(diag_own_retry, bool, 0644);
++MODULE_PARM_DESC(diag_own_retry,
++		 "re-assert driver own once the ROM patch has been started");
++
++static bool diag_rxd;
++module_param(diag_rxd, bool, 0644);
++MODULE_PARM_DESC(diag_rxd, "log every WM rx event header");
++
++#define DIAG_LPCTL_ADDR		0x000E0010
++#define DIAG_ON_MISC_ADDR	0x000E00F0
++#define DIAG_SWDEF_MODE_ADDR	0x009143C
++
++/*
++ * The three registers that tell whether the chip is still there: LPCTL holds
++ * the firmware-own handshake, CONN_ON_MISC the fwdl state, and SWDEF_MODE the
++ * mode the driver asked for before the download started.
++ */
++static void
++mcu_diag_chip(struct mtk_hw_dev *dev, const char *tag)
++{
++	struct mtk_bus_trans *trans = dev->bus_trans;
++
++	dev_err(dev->dev,
++		"diag[%s]: lpctl=0x%08x on_misc=0x%08x swdef=0x%08x\n",
++		tag, bus_read(trans, DIAG_LPCTL_ADDR),
++		bus_read(trans, DIAG_ON_MISC_ADDR),
++		bus_read(trans, DIAG_SWDEF_MODE_ADDR));
++}
++
+ 
+ static int
+ mcu_wm_load_patch(struct mtk_hw_dev *dev, struct mtk_mcu_entry *mcu_entry)
+@@ -345,6 +394,7 @@
+ 
+ 	sem = mcu_wm_patch_sem_ctrl(dev, 1);
+ 	dev_err(dev->dev, "diag: patch sem get -> %d\n", sem);
++	mcu_diag_chip(dev, "pre");
+ 
+ 	switch (sem) {
+ 	case PATCH_IS_DL:
+@@ -455,20 +505,36 @@
+ 		dev_err(dev->dev, "Failed to start patch\n");
+ 
+ out:
+-	sem = mcu_wm_patch_sem_ctrl(dev, 0);
+-	switch (sem) {
+-	case PATCH_REL_SEM_SUCCESS:
+-		break;
+-	default:
+-		/*
+-		 * The patch owns the MCU once the ROM has jumped into it, and it
+-		 * stops answering the ROM's semaphore command: 0x07 comes back as
+-		 * an ACK and the very next command times out.  Treating that as
+-		 * fatal throws away a patch that is already running, so only warn
+-		 * here and let the RAM code download decide whether it is alive.
+-		 */
+-		dev_warn(dev->dev,
+-			 "patch sem release failed (sem=%d), continuing\n", sem);
++	mcu_diag_chip(dev, "post-07");
++
++	if (diag_skip_sem_rel) {
++		dev_warn(dev->dev, "diag: patch sem release skipped\n");
++	} else {
++		sem = mcu_wm_patch_sem_ctrl(dev, 0);
++		switch (sem) {
++		case PATCH_REL_SEM_SUCCESS:
++			break;
++		default:
++			/*
++			 * The patch owns the MCU once the ROM has jumped into it,
++			 * and it stops answering the ROM's semaphore command: 0x07
++			 * comes back as an ACK and the very next command times
++			 * out.  Treating that as fatal throws away a patch that is
++			 * already running, so only warn here and let the RAM code
++			 * download decide whether it is alive.
++			 */
++			dev_warn(dev->dev,
++				 "patch sem release failed (sem=%d), continuing\n",
++				 sem);
++		}
++		mcu_diag_chip(dev, "post-rel");
++	}
++
++	if (diag_own_retry) {
++		int own = mtk_hw_set_driver_own(dev, dev->bus_trans, true);
++
++		dev_err(dev->dev, "diag: driver own retry -> %d\n", own);
++		mcu_diag_chip(dev, "post-own");
+ 	}
+ 	if (mcu_entry->applied_method == BIN_METHOD)
+ 		release_firmware(fw);
+@@ -542,6 +608,10 @@
+ 		if (region->feature_set & FW_FEATURE_OVERRIDE_ADDR)
+ 			override = addr;
+ 
++		dev_err(dev->dev,
++			"diag ram region%d: addr=0x%08x len=%u feature=0x%02x mode=0x%08x\n",
++			i, addr, len, (u8)region->feature_set, mode);
++
+ 		if (region->feature_set & DL_MODE_ENCRY_MODE_EMI) {
+ 
+ 			reg_start = addr + len_cnt;
+@@ -582,10 +652,23 @@
+ 			}
+ 
+ 		} else {
+-			err = mcu_wm_init_download(dev, addr, len, mode, MCU_FWDL_TYPE_RAM);
+-			if (err) {
+-				dev_err(dev->dev, "Download request failed\n");
+-				return err;
++			/*
++			 * diag_skip_ram_req: push the RAM code into the FWDL ring
++			 * without asking the MCU first.  If didx still does not
++			 * move the device stopped fetching descriptors altogether,
++			 * which is a different failure from an MCU that is alive
++			 * but refuses to answer commands.
++			 */
++			if (diag_skip_ram_req) {
++				dev_warn(dev->dev,
++					 "diag: TARGET_ADDRESS_LEN_REQ skipped\n");
++			} else {
++				err = mcu_wm_init_download(dev, addr, len, mode,
++							   MCU_FWDL_TYPE_RAM);
++				if (err) {
++					dev_err(dev->dev, "Download request failed\n");
++					return err;
++				}
+ 			}
+ 
+ 			err = mcu_wm_send_firmware(dev, data + offset, len);
+@@ -603,6 +686,8 @@
+ 	if (is_wa)
+ 		option |= FW_START_WORKING_PDA_CR4;
+ 
++	mcu_diag_chip(dev, "pre-start");
++
+ 	return mcu_wm_start_firmware(dev, override, option);
+ }
+ 
+@@ -896,6 +981,19 @@
+ 
+ 	rx_info->seq = rxd->seq;
+ 
++	/*
++	 * The patch commands only ever showed up as "len=0" in the old trace,
++	 * which hides the eid and the option byte.  Between them they carry
++	 * whatever the ROM wants to say about PATCH_FINISH_REQ, and any event
++	 * the chip emits after the jump shows up here too.
++	 */
++	if (diag_rxd)
++		dev_err(dev->dev,
++			"diag rxd: len=%u type=0x%04x eid=0x%02x seq=%u option=0x%02x ext=0x%02x s2d=%u\n",
++			le16_to_cpu(rxd->len), le16_to_cpu(rxd->pkt_type_id),
++			rxd->eid, rxd->seq, rxd->option, rxd->ext_eid,
++			rxd->s2d_index);
++
+ 	/*special case, patch sem using mcu_rxd as data*/
+ 	switch (rxd->eid) {
+ 	case MCU_EVENT_MT_PATCH_SEM:
+--- a/wlan_hwifi/bus/mtk_pci_dma.c
++++ b/wlan_hwifi/bus/mtk_pci_dma.c
+@@ -1163,6 +1163,18 @@
+ 				q->tail, q->head,
+ 				bus_read(to_bus_trans(trans),
+ 					 q->hw_didx_addr));
++
++		/*
++		 * Same thing for the MCU command ring: DDONE here can only be
++		 * set by the device, so this line proves that the chip really
++		 * picked the command up instead of just going quiet.
++		 */
++		if (q->q_attr == Q_TX_CMD_WM)
++			dev_err(to_device(trans),
++				"diag cmd done: tail=%u head=%u didx=%u\n",
++				q->tail, q->head,
++				bus_read(to_bus_trans(trans),
++					 q->hw_didx_addr));
+ 	}
+ 
+ 	return done;
+@@ -2506,6 +2518,12 @@
+ 			bus_read(to_bus_trans(trans), q->hw_didx_addr),
+ 			le32_to_cpu(d->dw1));
+ 	}
++
++	if (q->q_attr == Q_TX_CMD_WM)
++		dev_err(to_device(trans),
++			"diag cmd push: len=%d head=%u tail=%u didx=%u\n",
++			skb->len, q->head, q->tail,
++			bus_read(to_bus_trans(trans), q->hw_didx_addr));
+ 	return 0;
+ err:
+ 	return -ENOMEM;
