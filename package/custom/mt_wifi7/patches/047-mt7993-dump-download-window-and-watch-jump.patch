@@ -1,0 +1,146 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt7993: dump the ROM download window and watch the jump
+
+The chip survives a download that never jumps.  With diag_skip_start=1 the
+whole 12 KB patch goes through the FWDL ring - sem 2, 0x01 answered with
+0x05, four descriptors taken, didx 1 to 4 - and afterwards the endpoint
+still reads command=0x0006 and BAR0=0x20000000.
+
+PATCH_FINISH_REQ is what ends that: the endpoint resets itself, and both
+functions come back with command=0x0000 and a cleared BAR0.  That is why
+every later command times out after exactly 20 s, why diag[post-07] prints
+noise instead of register values, and why a second bring-up cannot get
+driver own.  The scatter is innocent; the image that runs after the jump is
+not.
+
+Two readings are still open: the bytes never reached 0x00900000, in which
+case the jump runs into whatever was there before, or they did and the patch
+faults on entry.  The ROM cannot tell us - both patch files carry crc=0xffff
+and check_crc=0 makes it jump without looking - but the window itself can,
+because the switch that keeps the chip alive also keeps the window readable.
+
+diag_sram_dump dumps 32 bytes at 0x00900000, the tail of the region the
+header names, and the RAM code window at 0x00912c00, once before the
+semaphore request and again after the last scatter.
+
+diag_jump_poll reads CONN_ON_MISC and the PCI COMMAND word every 20 ms for
+400 ms after PATCH_FINISH_REQ, so the moment the endpoint leaves the bus is
+visible instead of being inferred from a 20 s timeout.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -31,6 +31,8 @@
+ #include <linux/kernel.h>
+ #include <linux/firmware.h>
+ #include <linux/module.h>
++#include <linux/delay.h>
++#include <linux/pci.h>
+ #include "mcu.h"
+ #include "hw_ops.h"
+ #include "mac_if.h"
+@@ -365,6 +367,60 @@
+ #define DIAG_SWDEF_MODE_ADDR	0x009143C
+ 
+ /*
++ * 047 switches.  The chip survives a download that never jumps: with
++ * diag_skip_start=1 the config space still reads command=0x0006 and
++ * BAR0=0x20000000 afterwards, so the scatter itself is harmless and the
++ * reset happens the moment the ROM jumps.  Either the bytes never reached
++ * the download window, in which case the jump runs into whatever was there
++ * before, or they did and the image faults on its own.  Dumping the window
++ * around the scatter separates the two without another SRAM probe, and the
++ * poll records how long the endpoint stays on the bus after 0x07.
++ */
++static bool diag_sram_dump;
++module_param(diag_sram_dump, bool, 0644);
++MODULE_PARM_DESC(diag_sram_dump,
++		 "dump the ROM download window before and after the scatter");
++
++static bool diag_jump_poll;
++module_param(diag_jump_poll, bool, 0644);
++MODULE_PARM_DESC(diag_jump_poll,
++		 "poll CONN_ON_MISC and the PCI COMMAND word after PATCH_FINISH_REQ");
++
++#define DIAG_PATCH_WIN_ADDR	0x00900000
++#define DIAG_RAM_WIN_ADDR	0x00912C00
++
++static void
++mcu_diag_window(struct mtk_hw_dev *dev, const char *tag, u32 addr)
++{
++	struct mtk_bus_trans *trans = dev->bus_trans;
++
++	dev_err(dev->dev,
++		"diag %s 0x%08x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		tag, addr,
++		bus_read(trans, addr + 0x00), bus_read(trans, addr + 0x04),
++		bus_read(trans, addr + 0x08), bus_read(trans, addr + 0x0c),
++		bus_read(trans, addr + 0x10), bus_read(trans, addr + 0x14),
++		bus_read(trans, addr + 0x18), bus_read(trans, addr + 0x1c));
++}
++
++static void
++mcu_diag_jump_poll(struct mtk_hw_dev *dev)
++{
++	struct mtk_bus_trans *trans = dev->bus_trans;
++	struct pci_dev *pdev = to_pci_dev(dev->dev);
++	int i;
++
++	for (i = 0; i < 20; i++) {
++		u16 cmd = 0xffff;
++
++		pci_read_config_word(pdev, PCI_COMMAND, &cmd);
++		dev_err(dev->dev, "diag jump[%02d]: on_misc=0x%08x cmd=0x%04x\n",
++			i, bus_read(trans, DIAG_ON_MISC_ADDR), cmd);
++		msleep(20);
++	}
++}
++
++/*
+  * The three registers that tell whether the chip is still there: LPCTL holds
+  * the firmware-own handshake, CONN_ON_MISC the fwdl state, and SWDEF_MODE the
+  * mode the driver asked for before the download started.
+@@ -391,11 +447,17 @@
+ 	int ret = 0;
+ 	const char *data_ptr = NULL;
+ 	u32 n_region = 0;
++	u32 win_tail = DIAG_PATCH_WIN_ADDR;
+ 
+ 	sem = mcu_wm_patch_sem_ctrl(dev, 1);
+ 	dev_err(dev->dev, "diag: patch sem get -> %d\n", sem);
+ 	mcu_diag_chip(dev, "pre");
+ 
++	if (diag_sram_dump) {
++		mcu_diag_window(dev, "pre-patch", DIAG_PATCH_WIN_ADDR);
++		mcu_diag_window(dev, "pre-ram", DIAG_RAM_WIN_ADDR);
++	}
++
+ 	switch (sem) {
+ 	case PATCH_IS_DL:
+ 		return 0;
+@@ -484,6 +546,14 @@
+ 			dev_err(dev->dev, "Failed to send patch\n");
+ 			goto out;
+ 		}
++
++		win_tail = (len > 0x20) ? addr + len - 0x20 : addr;
++	}
++
++	if (diag_sram_dump) {
++		mcu_diag_window(dev, "post-dl", DIAG_PATCH_WIN_ADDR);
++		mcu_diag_window(dev, "post-dl-tail", win_tail);
++		mcu_diag_window(dev, "post-ram", DIAG_RAM_WIN_ADDR);
+ 	}
+ 
+ 	if (diag_skip_start) {
+@@ -504,6 +574,9 @@
+ 	if (ret)
+ 		dev_err(dev->dev, "Failed to start patch\n");
+ 
++	if (diag_jump_poll)
++		mcu_diag_jump_poll(dev);
++
+ out:
+ 	mcu_diag_chip(dev, "post-07");
+ 
