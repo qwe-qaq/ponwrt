@@ -28,7 +28,13 @@
 
 	chosen {
 		rootdisk = <&ubi_fit>;
-		bootargs = "console=ttyS0,115200 earlycon";
+		/* AER off: the ROM patch jumps at PATCH_FINISH_REQ and the endpoint
+		 * drops its own link for ~100 ms while the PHY retrains.  With AER
+		 * armed the root port treats SDES as fatal, resets the link and
+		 * kills the endpoint before it can answer, so the download always
+		 * times out at the same place.  There are no pciehp slots here, so
+		 * the link comes back on its own and nobody removes the device. */
+		bootargs = "console=ttyS0,115200 earlycon pci=noaer";
 		stdout-path = "serial0:115200n8";
 	};
 
