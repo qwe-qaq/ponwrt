@@ -1,0 +1,30 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt7993: stop the patch semaphore release from spinning forever
+
+When the endpoint leaves the bus right after PATCH_FINISH_REQ,
+mcu_wm_patch_sem_ctrl(dev, 0) cannot reach the chip either, so it returns -110
+and the default arm jumps back to the out: label - which retries the very same
+failing write.  The loop never ends, it holds rtnl for the whole time, and the
+only way out is cutting power: sysrq is not enabled on this image and the
+watchdog is not armed, so the last few hardware attempts had to be power
+cycled instead of rebooted.
+
+Log the error code and fall through.  The semaphore is gone either way, and
+the caller needs to see the failure rather than a console that repeats the
+same line every twenty seconds until the board is unplugged.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -378,8 +378,8 @@
+ 		break;
+ 	default:
+ 		ret = -EAGAIN;
+-		dev_err(dev->dev, "Failed to release patch semaphore\n");
+-		goto out;
++		dev_err(dev->dev,
++			"Failed to release patch semaphore, sem=%d\n", sem);
+ 	}
+ 	if (mcu_entry->applied_method == BIN_METHOD)
+ 		release_firmware(fw);
