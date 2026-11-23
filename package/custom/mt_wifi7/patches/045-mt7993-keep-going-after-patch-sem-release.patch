@@ -1,0 +1,47 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt7993: do not discard a patch that already answered 0x07
+
+With check_crc set, the ROM now answers PATCH_FINISH_REQ before it jumps:
+
+  diag fwdl done: tail=4 head=4 didx=4
+  diag mcu resp cmd=0x07 seq=7 len=0     <- CRC accepted, jumping
+  Failed to release patch semaphore, sem=-110
+
+so the image did reach MCU address 0x00900000 intact and the CRC in its
+header matches.  What fails next is the semaphore release, and that is
+expected rather than broken: PATCH_SEM_CONTROL is a ROM command, and once the
+ROM has jumped into the patch the MCU belongs to the patch, which has no
+reason to keep answering it.  The driver currently treats that timeout as
+fatal and returns -EAGAIN, throwing away a patch that is already running, so
+the RAM code download never even starts.
+
+Warn and keep going.  If the patch really is dead the scatter that follows
+fails immediately - its didx stays at 0 - which is a much clearer signal than
+a semaphore timeout on a command the patch was never going to serve.
+
+This supersedes 044: that one only removed the goto that retried the failing
+write forever, this one removes the failure itself.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -377,9 +377,15 @@
+ 	case PATCH_REL_SEM_SUCCESS:
+ 		break;
+ 	default:
+-		ret = -EAGAIN;
+-		dev_err(dev->dev, "Failed to release patch semaphore\n");
+-		goto out;
++		/*
++		 * The patch owns the MCU once the ROM has jumped into it, and it
++		 * stops answering the ROM's semaphore command: 0x07 comes back as
++		 * an ACK and the very next command times out.  Treating that as
++		 * fatal throws away a patch that is already running, so only warn
++		 * here and let the RAM code download decide whether it is alive.
++		 */
++		dev_warn(dev->dev,
++			 "patch sem release failed (sem=%d), continuing\n", sem);
+ 	}
+ 	if (mcu_entry->applied_method == BIN_METHOD)
+ 		release_firmware(fw);
