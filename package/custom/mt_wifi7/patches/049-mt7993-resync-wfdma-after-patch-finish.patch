@@ -1,0 +1,106 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt7993: rebuild the WFDMA rings after PATCH_FINISH_REQ
+
+Reading the endpoint's config space live shows the whole story: PCI_COMMAND
+is already 0x0000 at the first sample after 0x07 is fetched, so the chip
+clears its own PCIe configuration the moment it accepts the patch.  The BARs
+come back by hand, and then LPCTL reads 0x00000004 - BIT(2), FW_OWN_STAT, the
+same value the vendor firmware leaves behind - so the MCU is alive and the
+patch is running.  What stays dead is the WFDMA: the hardware write index is
+back at zero while the software head/tail are still at 4/3, so the chip waits
+for descriptor zero and never looks at the semaphore release that was just
+queued.  That is the 20 s timeout, not a watchdog.
+
+Rebuild the rings instead of giving up: drop the software indices to zero,
+rewrite base/count/cidx/didx through the normal queue init path, and let the
+chip start fetching again from a state both sides agree on.  Only the
+diagnostics call this, buffers keep their DMA addresses, and the 0x07 path
+still returns fire-and-forget.
+
+With the rings back the semaphore release becomes the first command that has
+to be answered, so the next boot either shows sem=3 and a firmware download
+that continues into RAM code, or it shows the release timing out on a channel
+that is genuinely dead.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/wlan_hwifi/bus/mtk_pci_dma.c
++++ b/wlan_hwifi/bus/mtk_pci_dma.c
+@@ -1038,6 +1038,51 @@
+ 	}
+ }
+ 
++/**
++ * mtk_pci_dma_diag_resync - rebuild the WFDMA rings after PATCH_FINISH_REQ
++ *
++ * The ROM clears its own PCIe configuration the moment it accepts 0x07, and
++ * the WFDMA goes back to index zero together with it.  The BARs can be put
++ * back by hand from the host, but the rings stay dead: the hardware reads
++ * descriptor zero next while the software pointers are sitting in the middle
++ * of the ring, so nothing is ever fetched again and every following command
++ * times out on a chip that is still running (LPCTL reports FW_OWN_STAT).
++ *
++ * Put the software indices back to zero and rewrite base/count/cidx/didx so
++ * both sides agree on where the ring starts.  Buffers are deliberately not
++ * remapped - the descriptors still carry valid DMA addresses and this path is
++ * only reachable from the bring-up diagnostics.
++ */
++void mtk_pci_dma_diag_resync(struct mtk_bus_trans *btrans)
++{
++	struct pci_trans *trans = to_pci_trans(btrans);
++	int i;
++
++	for (i = 0; i < trans->txq_num; i++) {
++		if (trans->txq[i].q.disable)
++			continue;
++
++		trans->txq[i].q.head = 0;
++		trans->txq[i].q.tail = 0;
++	}
++
++	for (i = 0; i < trans->rxq_num; i++) {
++		if (trans->rxq[i].q.disable)
++			continue;
++
++		trans->rxq[i].q.head = 0;
++		trans->rxq[i].q.tail = 0;
++	}
++
++	pci_chip_dma_init(trans);
++	pci_dma_hw_init_queues(trans);
++	pci_chip_dma_enable(trans);
++
++	dev_err(to_device(trans),
++		"diag: WFDMA resynced, %d txq / %d rxq back to index 0\n",
++		trans->txq_num, trans->rxq_num);
++}
++
+ static void
+ pci_dma_hw_exit_queues(struct pci_trans *trans)
+ {
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -231,6 +231,9 @@
+ 	return ret;
+ }
+ 
++/* bus layer helper, only used by the PATCH_FINISH_REQ diagnostics */
++void mtk_pci_dma_diag_resync(struct mtk_bus_trans *btrans);
++
+ /*
+  * PATCH_FINISH_REQ carries a check_crc flag.  With it set the ROM verifies
+  * what it received against the CRC in the patch header, so a rejection
+@@ -318,6 +321,13 @@
+ 		(unsigned long long)bar0,
+ 		bus_read(dev->bus_trans, DIAG48_LPCTL_ADDR),
+ 		bus_read(dev->bus_trans, DIAG48_ON_MISC_ADDR));
++
++	/*
++	 * The BARs alone are not enough: the WFDMA came back at index zero
++	 * while our head/tail are still pointing into the middle of the ring,
++	 * so the chip never sees another descriptor.  Rebuild the rings.
++	 */
++	mtk_pci_dma_diag_resync(dev->bus_trans);
+ }
+ 
+ static int
