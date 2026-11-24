@@ -1,21 +1,28 @@
 From: chasey-dev <ellenyoung0912@gmail.com>
-Subject: [PATCH] mt7993: rebuild the WFDMA rings after PATCH_FINISH_REQ
+Subject: [PATCH] mt7993: put BAR0 and the WFDMA rings back after PATCH_FINISH_REQ
 
 Reading the endpoint's config space live shows the whole story: PCI_COMMAND
 is already 0x0000 at the first sample after 0x07 is fetched, so the chip
 clears its own PCIe configuration the moment it accepts the patch.  The BARs
 come back by hand, and then LPCTL reads 0x00000004 - BIT(2), FW_OWN_STAT, the
-same value the vendor firmware leaves behind - so the MCU is alive and the
-patch is running.  What stays dead is the WFDMA: the hardware write index is
-back at zero while the software head/tail are still at 4/3, so the chip waits
-for descriptor zero and never looks at the semaphore release that was just
+value the vendor firmware leaves behind - so the MCU is alive and the patch
+is running.  What stays dead is the WFDMA: the hardware write index is back
+at zero while the software head/tail are still at 4/3, so the chip waits for
+descriptor zero and never looks at the semaphore release that was just
 queued.  That is the 20 s timeout, not a watchdog.
 
-Rebuild the rings instead of giving up: drop the software indices to zero,
-rewrite base/count/cidx/didx through the normal queue init path, and let the
-chip start fetching again from a state both sides agree on.  Only the
-diagnostics call this, buffers keep their DMA addresses, and the 0x07 path
-still returns fire-and-forget.
+Do the recovery on the command path itself.  The first MCU command after
+0x07 has to be answered, so pci_dma_tx_queue_skb_raw() checks PCI_COMMAND
+before queueing anything on Q_TX_CMD_WM and, if the chip cleared it, writes
+BAR0 and PCI_COMMAND back, drops every ring's head/tail to zero and rebuilds
+base/count/cidx/didx through the normal queue init.  Only that one queue is
+inspected, it carries firmware commands and never a data packet, and the
+whole thing sits behind a diag_resync parameter so it can be switched off.
+
+This has to live in the bus layer.  mtk_pci.ko already imports symbols from
+mtk_hwifi.ko, so the MCU side calling back into the bus would make the two
+modules depend on each other and modpost refuses to resolve it - the first
+version of this patch failed exactly there.
 
 With the rings back the semaphore release becomes the first command that has
 to be answered, so the next boot either shows sem=3 and a firmware download
@@ -26,12 +33,38 @@ Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
 ---
 --- a/wlan_hwifi/bus/mtk_pci_dma.c
 +++ b/wlan_hwifi/bus/mtk_pci_dma.c
-@@ -1038,6 +1038,51 @@
+@@ -29,12 +29,25 @@
+  */
+ 
+ #include <linux/interrupt.h>
++#include <linux/moduleparam.h>
+ #include <linux/version.h>
+ #include "mac_ops.h"
+ #include "bus.h"
+ #include "mtk_pci_dma.h"
+ #include "mtk_rro.h"
+ 
++/*
++ * PATCH_FINISH_REQ makes the ROM clear its own PCIe configuration and reset
++ * the WFDMA.  Nothing on the host side notices until the next command times
++ * out 20 s later, so check the MCU command path and put both back before the
++ * next descriptor is queued.  Only Q_TX_CMD_WM is inspected, which carries
++ * firmware commands and never a data packet.
++ */
++static bool diag_resync = true;
++module_param(diag_resync, bool, 0644);
++MODULE_PARM_DESC(diag_resync,
++	"restore BAR0 and rebuild the WFDMA rings when the ROM clears them");
++
+ 
+ static u32
+ pci_io_read(void *hw, u32 offset)
+@@ -1038,6 +1051,56 @@
  	}
  }
  
 +/**
-+ * mtk_pci_dma_diag_resync - rebuild the WFDMA rings after PATCH_FINISH_REQ
++ * pci_dma_diag_resync - rebuild BAR0 and the WFDMA rings after PATCH_FINISH_REQ
 + *
 + * The ROM clears its own PCIe configuration the moment it accepts 0x07, and
 + * the WFDMA goes back to index zero together with it.  The BARs can be put
@@ -40,15 +73,20 @@ Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
 + * of the ring, so nothing is ever fetched again and every following command
 + * times out on a chip that is still running (LPCTL reports FW_OWN_STAT).
 + *
-+ * Put the software indices back to zero and rewrite base/count/cidx/didx so
-+ * both sides agree on where the ring starts.  Buffers are deliberately not
-+ * remapped - the descriptors still carry valid DMA addresses and this path is
-+ * only reachable from the bring-up diagnostics.
++ * Put the BARs back, drop the software indices to zero and rewrite
++ * base/count/cidx/didx so both sides agree on where the ring starts.  Buffers
++ * are deliberately not remapped - the descriptors still carry valid DMA
++ * addresses and this path only runs for the bring-up diagnostics.
 + */
-+void mtk_pci_dma_diag_resync(struct mtk_bus_trans *btrans)
++static void
++pci_dma_diag_resync(struct pci_trans *trans)
 +{
-+	struct pci_trans *trans = to_pci_trans(btrans);
 +	int i;
++
++	pci_write_config_dword(trans->pdev, PCI_BASE_ADDRESS_0,
++			       lower_32_bits(pci_resource_start(trans->pdev, 0)));
++	pci_write_config_word(trans->pdev, PCI_COMMAND,
++			      PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
 +
 +	for (i = 0; i < trans->txq_num; i++) {
 +		if (trans->txq[i].q.disable)
@@ -71,36 +109,73 @@ Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
 +	pci_chip_dma_enable(trans);
 +
 +	dev_err(to_device(trans),
-+		"diag: WFDMA resynced, %d txq / %d rxq back to index 0\n",
++		"diag: BAR0 and WFDMA resynced, %d txq / %d rxq back to index 0\n",
 +		trans->txq_num, trans->rxq_num);
 +}
 +
  static void
  pci_dma_hw_exit_queues(struct pci_trans *trans)
  {
+@@ -2476,6 +2539,24 @@
+ 	struct pci_queue_buf buf;
+ 	dma_addr_t addr;
+ 
++	/*
++	 * The MCU command that follows PATCH_FINISH_REQ is the first one that
++	 * has to be answered, so this is where a chip that cleared its own
++	 * PCIe config gets noticed.  Rebuild everything before queueing, or
++	 * the descriptor lands at an index the hardware will never read.
++	 */
++	if (diag_resync && q->q_attr == Q_TX_CMD_WM) {
++		u16 cmd = 0;
++
++		pci_read_config_word(trans->pdev, PCI_COMMAND, &cmd);
++		if (cmd != (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) {
++			dev_err(to_device(trans),
++				"diag: PCI_COMMAND=0x%04x on MCU cmd, recovering\n",
++				cmd);
++			pci_dma_diag_resync(trans);
++		}
++	}
++
+ 	if (((q->head + 1) % q->q_size) == q->tail)
+ 		goto err;
+ 
 --- a/wlan_hwifi/mcu/mcu_wm.c
 +++ b/wlan_hwifi/mcu/mcu_wm.c
-@@ -231,6 +231,9 @@
- 	return ret;
+@@ -302,24 +302,6 @@
+ 	return false;
  }
  
-+/* bus layer helper, only used by the PATCH_FINISH_REQ diagnostics */
-+void mtk_pci_dma_diag_resync(struct mtk_bus_trans *btrans);
-+
- /*
-  * PATCH_FINISH_REQ carries a check_crc flag.  With it set the ROM verifies
-  * what it received against the CRC in the patch header, so a rejection
-@@ -318,6 +321,13 @@
- 		(unsigned long long)bar0,
- 		bus_read(dev->bus_trans, DIAG48_LPCTL_ADDR),
- 		bus_read(dev->bus_trans, DIAG48_ON_MISC_ADDR));
-+
-+	/*
-+	 * The BARs alone are not enough: the WFDMA came back at index zero
-+	 * while our head/tail are still pointing into the middle of the ring,
-+	 * so the chip never sees another descriptor.  Rebuild the rings.
-+	 */
-+	mtk_pci_dma_diag_resync(dev->bus_trans);
- }
- 
+-static void
+-mcu_diag_restore_pci(struct mtk_hw_dev *dev)
+-{
+-	struct pci_dev *pdev = to_pci_dev(dev->dev);
+-	resource_size_t bar0 = pci_resource_start(pdev, 0);
+-
+-	pci_write_config_dword(pdev, PCI_BASE_ADDRESS_0,
+-			       lower_32_bits(bar0));
+-	pci_write_config_word(pdev, PCI_COMMAND,
+-			      PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+-
+-	dev_err(dev->dev,
+-		"diag: BAR0 back to 0x%llx, lpctl=0x%08x on_misc=0x%08x\n",
+-		(unsigned long long)bar0,
+-		bus_read(dev->bus_trans, DIAG48_LPCTL_ADDR),
+-		bus_read(dev->bus_trans, DIAG48_ON_MISC_ADDR));
+-}
+-
  static int
+ mcu_wm_start_patch(struct mtk_hw_dev *dev)
+ {
+@@ -347,8 +329,8 @@
+ 		return -EIO;
+ 	}
+ 
+-	if (diag_jump_trace && mcu_diag_jump_trace(dev))
+-		mcu_diag_restore_pci(dev);
++	if (diag_jump_trace)
++		mcu_diag_jump_trace(dev);
+ 
+ 	return 0;
+ }
