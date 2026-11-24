@@ -1,0 +1,144 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt7993: fire PATCH_FINISH_REQ without waiting for a reply
+
+The 20 s wait on 0x07 is the whole failure.  Reading the endpoint's config
+space live, not through the cached resource file, shows both functions coming
+out of PATCH_FINISH_REQ with command=0x0000 and BAR0=0x00000004: the chip
+cleared its own PCIe configuration, so every MMIO read after that walks off a
+mapping nobody decodes any more and returns noise.  That is why diag[post-07]
+prints 0xcd0c1375 instead of a register, why the semaphore release times out
+again, and why a second bring-up cannot get driver own.
+
+The chip is not dead.  Writing BAR0 back from the shell and setting
+PCI_COMMAND to memory plus bus master made it answer again: the next ifup
+immediately picked up a reply that had been sitting in the RX ring the whole
+time, read sem=2, pushed 0x05, took all four scatter descriptors and reached
+0x07 again.  So the download is intact and the endpoint reset is not a jump
+into a faulting image - it is what the ROM does when the host stops talking.
+
+Nothing else in the flow waits like this.  The scatter is fire and forget,
+mt_wifi sends PATCH_FINISH_REQ with RSP_WAIT_MS_TIME(0) and lets
+CmdPatchFinishRsp run whenever the answer turns up, and upstream mt76 follows
+start_patch straight away with the semaphore release.  Do the same: send 0x07,
+do not wait, and let the semaphore release be the first thing that has to be
+read back.  diag_jump_trace keeps the 400 ms after the send readable, sampling
+PCI_COMMAND and the two ROM state registers every 10 ms and stopping at the
+first sample where the endpoint dropped, so the next boot either shows the
+flow running past 0x07 or names the millisecond the chip went away.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -240,6 +240,86 @@
+ module_param(diag_crc_check, bool, 0644);
+ MODULE_PARM_DESC(diag_crc_check, "let the ROM verify the patch CRC");
+ 
++/*
++ * 048: PATCH_FINISH_REQ is fire and forget.
++ *
++ * Waiting for a reply to 0x07 is what kills the bring-up.  On the vendor board
++ * the answer comes back immediately; here the poll sits for the full 20 s, and
++ * by the time it gives up both PCI functions have command=0x0000 and BAR0=0,
++ * so every read afterwards walks off the mapping and returns noise.  The chip
++ * is not dead at that point: restoring BAR0 and PCI_COMMAND from the shell was
++ * enough to make it hand over a reply that had been queued all along, and a
++ * second ifup then read sem=2, pushed 0x05, took four scatter descriptors and
++ * reached 0x07 again - so the download itself is intact and only the wait is
++ * wrong.
++ *
++ * mt_wifi does not wait either: MtCmdPatchFinishReq sets RSP_WAIT_MS_TIME(0)
++ * and lets CmdPatchFinishRsp run whenever the answer shows up.  That is the
++ * model used here.  The scatter is fire and forget, 0x07 is fire and forget,
++ * and the ROM's own semaphore reply after the release is the first thing that
++ * has to be read back, exactly like upstream mt76 where start_patch is
++ * followed straight away by the semaphore release.
++ *
++ * diag_jump_trace keeps the 400 ms window readable: it samples PCI_COMMAND
++ * and the two ROM state registers every 10 ms and stops at the first sample
++ * where the endpoint dropped, which is the difference between "the patch runs
++ * and the host is simply not listening" and "the image faults on entry".
++ */
++static bool diag_jump_trace;
++module_param(diag_jump_trace, bool, 0644);
++MODULE_PARM_DESC(diag_jump_trace,
++		 "trace the endpoint for 400 ms after PATCH_FINISH_REQ");
++
++#define DIAG48_LPCTL_ADDR	0x000E0010
++#define DIAG48_ON_MISC_ADDR	0x000E00F0
++
++static bool
++mcu_diag_jump_trace(struct mtk_hw_dev *dev)
++{
++	struct mtk_bus_trans *trans = dev->bus_trans;
++	struct pci_dev *pdev = to_pci_dev(dev->dev);
++	int i;
++
++	for (i = 0; i < 40; i++) {
++		u16 cmd = 0xffff;
++
++		pci_read_config_word(pdev, PCI_COMMAND, &cmd);
++		dev_err(dev->dev,
++			"diag trace[%02d]: cmd=0x%04x lpctl=0x%08x on_misc=0x%08x\n",
++			i, cmd, bus_read(trans, DIAG48_LPCTL_ADDR),
++			bus_read(trans, DIAG48_ON_MISC_ADDR));
++
++		if (cmd != (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) {
++			dev_err(dev->dev,
++				"diag trace: endpoint dropped after %d ms\n",
++				i * 10);
++			return true;
++		}
++
++		msleep(10);
++	}
++
++	return false;
++}
++
++static void
++mcu_diag_restore_pci(struct mtk_hw_dev *dev)
++{
++	struct pci_dev *pdev = to_pci_dev(dev->dev);
++	resource_size_t bar0 = pci_resource_start(pdev, 0);
++
++	pci_write_config_dword(pdev, PCI_BASE_ADDRESS_0,
++			       lower_32_bits(bar0));
++	pci_write_config_word(pdev, PCI_COMMAND,
++			      PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
++
++	dev_err(dev->dev,
++		"diag: BAR0 back to 0x%llx, lpctl=0x%08x on_misc=0x%08x\n",
++		(unsigned long long)bar0,
++		bus_read(dev->bus_trans, DIAG48_LPCTL_ADDR),
++		bus_read(dev->bus_trans, DIAG48_ON_MISC_ADDR));
++}
++
+ static int
+ mcu_wm_start_patch(struct mtk_hw_dev *dev)
+ {
+@@ -255,14 +335,22 @@
+ 		.cmd = MCU_CMD_PATCH_FINISH_REQ,
+ 		.data = &req,
+ 		.len = sizeof(req),
+-		.wait_resp = true,
++		.wait_resp = false,
+ 		.dest = MCU_DEST_WM,
+ 		.resp = NULL,
+ 	};
+ 
+ 	req.check_crc = diag_crc_check ? 1 : 0;
+ 
+-	return mtk_mcu_tx_nocheck(dev, &mcu_txblk);
++	if (mtk_mcu_tx_nocheck(dev, &mcu_txblk)) {
++		dev_err(dev->dev, "Failed to send PATCH_FINISH_REQ\n");
++		return -EIO;
++	}
++
++	if (diag_jump_trace && mcu_diag_jump_trace(dev))
++		mcu_diag_restore_pci(dev);
++
++	return 0;
+ }
+ 
+ static u32 mcu_wm_gen_patch_dl_mode(u32 sec_info)
