@@ -1,0 +1,116 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt7993: take the chip back before rebuilding the rings
+
+The previous recovery put BAR0 and the WFDMA rings back, and the very first
+descriptor still sat there untouched for twenty seconds: the hardware write
+index stayed at zero and the semaphore release timed out.  The registers were
+readable the whole time, so the block was not dead.
+
+What the log shows is ownership.  LPCTL is 0x00000000 when the download
+starts - the host owns the chip - and by the time the release gives up it
+reads 0x00000004, OWNER_STATE_SYNC set, meaning the patch booted and the
+firmware took the chip over by itself.  While the firmware owns the host
+interface it stays parked, so nothing the host queues is ever fetched, no
+matter how correct the ring registers are.
+
+Wait for that hand-over, then request ownership back through the chip's own
+driver_own callback before touching the rings.  The callback is reached
+through the chip ops pointer, which keeps the direction of the module
+dependency intact: mtk_pci.ko already imports from mtk_hwifi.ko.
+
+The recovery now also reads the WFDMA global config and the four ring
+registers back after the rebuild, so the next log either shows TX_DMA_EN set
+with the base pointer we wrote and a moving didx, or it names the register
+that refuses to take the value.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/wlan_hwifi/bus/mtk_pci_dma.c
++++ b/wlan_hwifi/bus/mtk_pci_dma.c
+@@ -2479,12 +2479,15 @@
+  * memory bit, so a healthy device pays a single config read per command.
+  */
+ static bool
+-pci_dma_diag_resync(struct pci_trans *trans)
++pci_dma_diag_resync(struct pci_trans *trans, struct pci_queue *q)
+ {
++	struct mtk_bus_trans *btrans = to_bus_trans(trans);
++	struct mtk_hw_dev *dev = to_hw_dev(btrans);
+ 	struct pci_dev *pdev = trans->pdev;
+ 	resource_size_t bar0 = pci_resource_start(pdev, 0);
+ 	u16 cmd_before = 0, cmd_after = 0;
+-	int i;
++	u32 lpctl, glo;
++	int i, ret;
+ 
+ 	pci_read_config_word(pdev, PCI_COMMAND, &cmd_before);
+ 	if (cmd_before & PCI_COMMAND_MEMORY)
+@@ -2494,9 +2497,36 @@
+ 	pci_write_config_word(pdev, PCI_COMMAND,
+ 			      PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+ 
++	lpctl = bus_read(btrans, trans->lp_fw_own_reg_addr);
++	glo = bus_read(btrans, trans->tx_dma_glo_reg_addr);
+ 	dev_err(to_device(trans),
+-		"diag: PCI config was cleared (cmd=0x%04x), BAR0 back to 0x%llx\n",
+-		cmd_before, (unsigned long long)bar0);
++		"diag: config cleared (cmd=0x%04x), bar0=0x%llx lpctl=0x%08x glo=0x%08x\n",
++		cmd_before, (unsigned long long)bar0, lpctl, glo);
++
++	/*
++	 * The patch boots and takes the chip over: OWNER_STATE_SYNC (bit 2 of
++	 * LPCTL) turns on by itself.  While the firmware owns it the host
++	 * interface stays parked and not a single descriptor is fetched, so
++	 * wait for that hand-over and take the chip back before touching the
++	 * rings.
++	 */
++	for (i = 0; i < 200; i++) {
++		lpctl = bus_read(btrans, trans->lp_fw_own_reg_addr);
++		if (lpctl & 0x4)
++			break;
++		msleep(10);
++	}
++
++	dev_err(to_device(trans), "diag: fw owned after %d ms (lpctl=0x%08x)\n",
++		i * 10, lpctl);
++
++	if (dev->chip_drv->ctl_ops->driver_own)
++		ret = dev->chip_drv->ctl_ops->driver_own(dev, btrans, true);
++	else
++		ret = -EOPNOTSUPP;
++
++	dev_err(to_device(trans), "diag: driver own ret=%d lpctl=0x%08x\n",
++		ret, bus_read(btrans, trans->lp_fw_own_reg_addr));
+ 
+ 	/*
+ 	 * The WFDMA went back to index zero together with the config space
+@@ -2526,9 +2556,18 @@
+ 	pci_chip_dma_enable(trans);
+ 
+ 	pci_read_config_word(pdev, PCI_COMMAND, &cmd_after);
++	glo = bus_read(btrans, trans->tx_dma_glo_reg_addr);
++
++	/* Read the MCU ring back: a live block keeps what we wrote there. */
++	dev_err(to_device(trans),
++		"diag: rings rebuilt cmd=0x%04x glo=0x%08x irq=%d msi=%d\n",
++		cmd_after, glo, pdev->irq, pdev->msi_enabled);
+ 	dev_err(to_device(trans),
+-		"diag: rings rebuilt, cmd=0x%04x irq=%d msi_enabled=%d\n",
+-		cmd_after, pdev->irq, pdev->msi_enabled);
++		"diag: ring base=0x%08x cnt=0x%08x cidx=0x%08x didx=0x%08x\n",
++		bus_read(btrans, q->hw_desc_base),
++		bus_read(btrans, q->hw_cnt_addr),
++		bus_read(btrans, q->hw_cidx_addr),
++		bus_read(btrans, q->hw_didx_addr));
+ 
+ 	return true;
+ }
+@@ -2542,7 +2581,7 @@
+ 	dma_addr_t addr;
+ 
+ 	if (q->q_attr == Q_TX_CMD_WM)
+-		pci_dma_diag_resync(trans);
++		pci_dma_diag_resync(trans, q);
+ 
+ 	if (((q->head + 1) % q->q_size) == q->tail)
+ 		goto err;
