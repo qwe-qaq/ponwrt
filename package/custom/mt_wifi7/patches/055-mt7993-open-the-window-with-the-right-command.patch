@@ -1,0 +1,101 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt7993: open the download window with the command that opens it
+
+Skipping the ROM patch answers the question the last four rounds were asking
+around.  With no PATCH_FINISH_REQ, no endpoint reset, no recovery and nothing
+restored afterwards, the RAM code still goes into a ring the chip never
+fetches:
+
+  diag cmd push: len=76 head=1 tail=0 didx=0
+  diag cmd done: tail=1 head=1 didx=1        <- TARGET_ADDRESS_LEN_REQ answered
+  diag fwdl push: len=4032 head=1  didx=0 base=0x8d4f0000 cnt=0x300 cidx=0x01
+  diag fwdl push: len=2128 head=37 didx=0 ... cidx=0x25
+
+So the ring is not disabled, not paused, not short of credits - outside the
+ring the flow control bypass is already on, set by the chip itself when it
+enters download mode (GLO_CFG_EXT1 reads 0x9c800404 without anyone asking).
+The one thing that differs between the download that moves and the one that
+does not is the command in front of it: the patch is asked for with
+PATCH_START_REQ and its payload is fetched, the RAM code is asked for with
+TARGET_ADDRESS_LEN_REQ and its payload is not.
+
+In a flow where the endpoint survives the jump, the window the ROM opened for
+the patch simply stays open into the RAM download, which is why the vendor
+never has to think about it.  Here it does not survive, so the window has to
+be opened again - with the same command.
+
+  diag_ram_as_patch=1  send the RAM download with PATCH_START_REQ, carrying
+		       the region's own address, length and mode;
+
+  diag_ram_sem=1       the same idea one step earlier: take and release the
+		       patch semaphore around the RAM download, in case that
+		       is what the receiver waits for.
+
+Both default to off, so the untouched build behaves like 053.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -37,6 +37,28 @@
+ #include "hw_ops.h"
+ #include "mac_if.h"
+ 
++/*
++ * The download ring only ever moves for the first download of a boot, the one
++ * that follows PATCH_START_REQ - and skipping the patch proves that this has
++ * nothing to do with the endpoint leaving the bus: with the ROM left alone and
++ * no reset anywhere, the RAM code still goes into a ring the chip never
++ * fetches, while TARGET_ADDRESS_LEN_REQ is answered normally.
++ *
++ * So the ring is not short of credits and not disabled; the receiver simply
++ * only opens its window when PATCH_START_REQ arrives.  In a flow without the
++ * reset that window stays open from the patch download into the RAM download,
++ * which is why the vendor never notices.  Ask for the RAM code with the same
++ * command that opens it, and it should be able to close again afterwards.
++ */
++static bool diag_ram_as_patch;
++module_param(diag_ram_as_patch, bool, 0644);
++MODULE_PARM_DESC(diag_ram_as_patch, "open the download window with PATCH_START_REQ for the RAM code");
++
++/* Same idea, one step earlier: re-acquire the semaphore the ROM watched. */
++static bool diag_ram_sem;
++module_param(diag_ram_sem, bool, 0644);
++MODULE_PARM_DESC(diag_ram_sem, "acquire and release the patch semaphore around the RAM download");
++
+ static int
+ mcu_wm_patch_sem_ctrl(struct mtk_hw_dev *dev, bool get)
+ {
+@@ -192,7 +214,9 @@
+ 		mcu_txblk.cmd = MCU_CMD_PATCH_START_REQ;
+ 		break;
+ 	case MCU_FWDL_TYPE_RAM:
+-		mcu_txblk.cmd = MCU_CMD_TARGET_ADDRESS_LEN_REQ;
++		mcu_txblk.cmd = diag_ram_as_patch ?
++				MCU_CMD_PATCH_START_REQ :
++				MCU_CMD_TARGET_ADDRESS_LEN_REQ;
+ 		break;
+ 	default:
+ 		return -EINVAL;
+@@ -738,6 +762,10 @@
+ 
+ 	u32 reg_start, reg_end, len_cnt = 0;
+ 
++	if (diag_ram_sem)
++		dev_err(dev->dev, "diag: ram sem get -> %d\n",
++			mcu_wm_patch_sem_ctrl(dev, 1));
++
+ 	for (i = 0; i < hdr->n_region; i++) {
+ 		const struct mcu_fw_region *region;
+ 		u32 len = 0, addr = 0, mode = 0;
+@@ -829,6 +857,10 @@
+ 	if (is_wa)
+ 		option |= FW_START_WORKING_PDA_CR4;
+ 
++	if (diag_ram_sem)
++		dev_err(dev->dev, "diag: ram sem release -> %d\n",
++			mcu_wm_patch_sem_ctrl(dev, 0));
++
+ 	mcu_diag_chip(dev, "pre-start");
+ 
+ 	return mcu_wm_start_firmware(dev, override, option);
