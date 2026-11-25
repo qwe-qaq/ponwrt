@@ -1,0 +1,159 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt7993: give the download ring three ways to be re-armed
+
+052 did what it promised: the endpoint comes back on the bus, and this time
+the patch really runs.
+
+  diag: endpoint lost (cmd=0x0000 bar0=0x20000000 ...), recovering
+  diag: restore #0 -> 3 (cmd=0x0006 lpctl=0x00000004)
+  diag: rings rebuilt cmd=0x0006 glo=0x1410b85d irq=21 msi=0
+  diag[post-rel]: lpctl=0x00000000 on_misc=0x00000001
+  WM Firmware Version: ____000000, Build Time: 20250623123332
+
+The semaphore release is answered now instead of timing out, the firmware
+takes the chip over, and the driver walks on into the RAM code download.
+That is where it stops.  Region0 asks for 147280 bytes, 37 descriptors go
+into the download ring, and the hardware write index never moves:
+
+  diag fwdl push: len=4032 head=1  tail=0 didx=0
+  ...
+  diag fwdl push: len=2128 head=37 tail=0 didx=0
+
+while the command ring beside it is fetched and completed normally (didx
+1 -> 2 for the address request that starts the very same download), and
+that request is acknowledged.  So the WFDMA is alive, the firmware is
+alive, and one specific ring - the one that carries the payload - is never
+fetched.  Twenty seconds later the next request times out and the start
+fails.
+
+Nothing in the driver explains a ring going quiet in that particular way,
+so the patch makes the three remaining explanations testable from a module
+parameter, since each one costs a reload instead of a full rebuild:
+
+  diag_fwdl_flow_bypass=1  the download TX ring is flow controlled by the
+			   chip's own MCU RX ring, and that control is
+			   bypassable for exactly the case where the receiver
+			   side is polling instead of draining a ring;
+  diag_hif_sw_rst=1        reset the HIF side of the WFDMA before
+			   programming it, which also drops what the
+			   prefetch unit cached before the jump;
+  diag_glo_sw_rst=1        reset the whole DMA design the same way.
+
+All three default to off, so the untouched build behaves exactly like 052,
+and the report that comes with each push now carries the ring base, size,
+producer index and GLO_CFG - a base that does not hold what was programmed
+into it means the write went nowhere, which is a different problem from a
+chip that reads the descriptor and refuses it.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/wlan_hwifi/bus/mtk_pci_dma.c
++++ b/wlan_hwifi/bus/mtk_pci_dma.c
+@@ -2786,11 +2786,23 @@
+ 		struct pci_dma_desc *d =
+ 			q->cb[(q->head + q->q_size - 1) % q->q_size].alloc_va;
+ 
++		/*
++		 * The ring registers are part of the report: after the patch
++		 * boots this ring is never fetched while the command ring next
++		 * to it is, so the question is whether the block is even armed
++		 * - a base or a size that does not hold what was programmed
++		 * there says the write went nowhere, not that the chip refused
++		 * the descriptor.
++		 */
+ 		dev_err(to_device(trans),
+-			"diag fwdl push: len=%d head=%u tail=%u didx=%u dw1=0x%08x\n",
++			"diag fwdl push: len=%d head=%u tail=%u didx=%u dw1=0x%08x base=0x%08x cnt=0x%08x cidx=0x%08x glo=0x%08x\n",
+ 			skb->len, q->head, q->tail,
+ 			bus_read(to_bus_trans(trans), q->hw_didx_addr),
+-			le32_to_cpu(d->dw1));
++			le32_to_cpu(d->dw1),
++			bus_read(to_bus_trans(trans), q->hw_desc_base),
++			bus_read(to_bus_trans(trans), q->hw_cnt_addr),
++			bus_read(to_bus_trans(trans), q->hw_cidx_addr),
++			bus_read(to_bus_trans(trans), trans->tx_dma_glo_reg_addr));
+ 	}
+ 
+ 	if (q->q_attr == Q_TX_CMD_WM)
+
+--- a/wlan_hwifi/chips/mt7990/mt7990.c
++++ b/wlan_hwifi/chips/mt7990/mt7990.c
+@@ -61,6 +61,32 @@
+ module_param(rro_enable, bool, 0644);
+ MODULE_PARM_DESC(rro_enable, "RRO Enable");
+ 
++/*
++ * Bring-up knobs.  The patch boots once the endpoint has been put back on
++ * the bus, but the firmware download ring that carries the RAM code is never
++ * fetched afterwards, while the command ring right next to it is.  These
++ * three switches test the remaining explanations one at a time, and cost a
++ * module reload instead of a rebuild:
++ *
++ * fwdl_flow_bypass - the firmware download TX ring is flow controlled by the
++ *		      chip's own MCU RX ring; bypass that control.
++ * hif_sw_rst       - reset the HIF side of the WFDMA before programming it,
++ *		      which also drops whatever the prefetch unit kept from
++ *		      before the jump.
++ * glo_sw_rst       - reset the whole DMA design the same way.
++ */
++static bool diag_fwdl_flow_bypass;
++module_param(diag_fwdl_flow_bypass, bool, 0644);
++MODULE_PARM_DESC(diag_fwdl_flow_bypass, "Bypass FWDL TX flow control");
++
++static bool diag_hif_sw_rst;
++module_param(diag_hif_sw_rst, bool, 0644);
++MODULE_PARM_DESC(diag_hif_sw_rst, "Pulse HIF SW reset before WFDMA init");
++
++static bool diag_glo_sw_rst;
++module_param(diag_glo_sw_rst, bool, 0644);
++MODULE_PARM_DESC(diag_glo_sw_rst, "Pulse GLO_CFG SW reset before WFDMA init");
++
+ #define MT7990_CHIP_ID 0x7990
+ 
+ /**
+@@ -172,6 +198,25 @@
+ 		bus_set(trans, WF_WFDMA_EXT_WRAP_CSR_WFDMA_HOST_CONFIG_pdma_per_band_ADDR,
+ 			WF_WFDMA_EXT_WRAP_CSR_WFDMA_HOST_CONFIG_pdma_per_band_MASK);
+ 	}
++
++	/* Bring-up knobs, see the module parameters above. */
++	if (diag_glo_sw_rst) {
++		bus_set(trans, WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_ADDR,
++			WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_CSR_SW_RST_MASK);
++		msleep(20);
++		bus_clear(trans, WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_ADDR,
++			WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_CSR_SW_RST_MASK);
++	}
++
++	if (diag_fwdl_flow_bypass)
++		bus_set(trans, WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_EXT1_ADDR,
++			WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_EXT1_CSR_FWDL_FLOW_CTRL_BYASS_EN_MASK);
++
++	dev_err(to_device(trans),
++		"diag pdma: glo=0x%08x ext1=0x%08x bypass=%d hif_rst=%d glo_rst=%d\n",
++		bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_ADDR),
++		bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_EXT1_ADDR),
++		diag_fwdl_flow_bypass, diag_hif_sw_rst, diag_glo_sw_rst);
+ }
+ 
+ static void
+@@ -273,6 +318,19 @@
+ static void
+ _mt7990_pdma_init(struct pci_trans *pci_hw)
+ {
++	struct mtk_bus_trans *trans = to_bus_trans(pci_hw);
++
++	/*
++	 * Bring-up knob: put the HIF side of the DMA back into its power-on
++	 * state before programming anything.  Everything the prefetch unit
++	 * cached from before the patch jumped is dropped with it.
++	 */
++	if (diag_hif_sw_rst) {
++		bus_set(trans, WF_WFDMA_EXT_WRAP_CSR_WFDMA_SW_RST_ADDR,
++			WF_WFDMA_EXT_WRAP_CSR_WFDMA_SW_RST_HIF_SW_RST_MASK);
++		msleep(20);
++	}
++
+ 	_mt7990_pdma_config(pci_hw);
+ 	_mt7990_pdma_interrupt_select(pci_hw);
+ 	_mt7990_pdma_rx_threshold(pci_hw);
