@@ -1,0 +1,162 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt7993: ask the hardware why the download ring is frozen
+
+053 put its switches in mt7990.c, which this chip never compiles: the loaded
+driver is mt7993.ko, its dma_init is mt7993_pdma_init, and the parameters it
+reports are option_type, rro_mode and intr_option_set only.  Nothing of 053
+ever ran.
+
+The observation it was built on still holds, and is now known to be narrower
+than it looked:
+
+  diag ram region0: addr=0x00912c00 len=147280 ...
+  diag cmd push: len=76 ... done didx=2      <- the request is answered
+  diag fwdl push: len=4032 head=1  ... cidx=0x000001 didx=0 base=0x85184000
+  ...
+  diag fwdl push: len=2128 head=37 ... cidx=0x000025 didx=0
+
+The firmware acknowledges the download request, so it is sitting in download
+mode waiting for data.  The ring is armed - base and size read back exactly
+what was programmed - and the producer index is written and reads back.  What
+never happens is the fetch: the write index stays at zero and no descriptor
+ever comes back with DDONE.  So the payload ring is either short of credits
+from the chip side or not scheduled at all, and the host rings cannot tell the
+two apart because the driver programs them itself.
+
+This patch therefore does two things, both in the file that actually runs:
+
+  diag_fwdl_bypass=1  drops the download ring's TX flow control, which the
+		      hardware description reserves for exactly this case,
+		      on the recovery init only - the ROM needs the control
+		      for the first download and keeps it;
+
+  diag_fwdl_qsel=1    does the same for the MSB ring instead of the LSB one,
+		      in case the chip watches a different half of the pair;
+
+and it adds a snapshot of the other end, the MCU DMA that receives the
+download plus the flow-control configuration, taken when the DMA is programmed
+and again when the start gives up.  Two snapshots separate "never armed" from
+"armed and then cleared", which decides whether the next step is a host-side
+re-arm or a chip-side one.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/wlan_hwifi/chips/mt7993/mt7993.c
++++ b/wlan_hwifi/chips/mt7993/mt7993.c
+@@ -62,6 +62,26 @@
+ module_param(rro_mode, byte, 0644);
+ MODULE_PARM_DESC(rro_mode, "RRO Mode");
+ 
++/*
++ * Bring-up knobs.  The patch boots once the endpoint has been put back on
++ * the bus, but the firmware download ring that carries the RAM code is never
++ * fetched afterwards, while the command ring right next to it is fetched and
++ * answered.  That ring is the one the hardware description says may be flow
++ * controlled by the chip's own MCU RX path, so the first knob drops that
++ * control for the recovery init only - the original download still runs with
++ * it, because the ROM needs it there.
++ */
++static bool diag_fwdl_bypass;
++module_param(diag_fwdl_bypass, bool, 0644);
++MODULE_PARM_DESC(diag_fwdl_bypass, "Bypass FWDL TX flow control after recovery");
++
++static bool diag_fwdl_qsel;
++module_param(diag_fwdl_qsel, bool, 0644);
++MODULE_PARM_DESC(diag_fwdl_qsel, "Bypass the MSB download ring instead of the LSB one");
++
++/* Counts dma_init calls: 1 is the probe, 2 and up are recoveries. */
++static int diag_pdma_init_cnt;
++
+ #define MT7993_CHIP_ID 0x7993
+ 
+ static void
+@@ -399,14 +419,47 @@
+ 	bus_write(trans, WF_WFDMA_HOST_DMA0_WPDMA_RST_DRX_PTR_ADDR, 0xffffffff);
+ }
+ 
++/*
++ * One line of chip-side state for the download path.  The host rings are
++ * host memory and the driver programs them itself, so they say nothing about
++ * why the chip stopped fetching.  What matters is the other end: the MCU DMA
++ * that receives the download, and the flow-control configuration that decides
++ * whether the TX ring is allowed to hand descriptors over at all.  Two
++ * snapshots of those - one when the DMA is programmed, one when the start
++ * fails - separate "never armed" from "armed and then cleared".
++ */
++static void
++mt7993_diag_dump_dl(struct mtk_bus_trans *trans, const char *tag)
++{
++	dev_err(trans->pdev,
++		"diag dl[%s]: ext1=0x%08x mcuglo=0x%08x hostcfg=0x%08x\n",
++		tag,
++		bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_EXT1_ADDR),
++		bus_read(trans, WF_WFDMA_MCU_DMA0_WPDMA_GLO_CFG_ADDR),
++		bus_read(trans, WF_WFDMA_EXT_WRAP_CSR_WFDMA_HOST_CONFIG_ADDR));
++	dev_err(trans->pdev,
++		"diag dl[%s]: mcurx0=0x%08x/0x%08x mcurx1=0x%08x/0x%08x mcurx2=0x%08x/0x%08x\n",
++		tag,
++		bus_read(trans, WF_WFDMA_MCU_DMA0_WPDMA_RX_RING0_CTRL0_ADDR),
++		bus_read(trans, WF_WFDMA_MCU_DMA0_WPDMA_RX_RING0_CTRL1_ADDR),
++		bus_read(trans, WF_WFDMA_MCU_DMA0_WPDMA_RX_RING1_CTRL0_ADDR),
++		bus_read(trans, WF_WFDMA_MCU_DMA0_WPDMA_RX_RING1_CTRL1_ADDR),
++		bus_read(trans, WF_WFDMA_MCU_DMA0_WPDMA_RX_RING2_CTRL0_ADDR),
++		bus_read(trans, WF_WFDMA_MCU_DMA0_WPDMA_RX_RING2_CTRL1_ADDR));
++}
++
+ static void
+ _mt7993_pdma_init(struct pci_trans *pci_hw)
+ {
++	diag_pdma_init_cnt++;
++
+ 	_mt7993_pdma_config(pci_hw);
+ 	_mt7993_pdma_interrupt_select(pci_hw);
+ 	_mt7993_pdma_rx_threshold(pci_hw);
+ 	_mt7993_pdma_prefetch_config(pci_hw);
+ 	_mt7993_pdma_reset_didx(pci_hw);
++
++	mt7993_diag_dump_dl(to_bus_trans(pci_hw), "init");
+ }
+ 
+ static void
+@@ -450,6 +503,32 @@
+ 	bus_set(trans, WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_ADDR,
+ 		WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_TX_DMA_EN_MASK |
+ 		WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_RX_DMA_EN_MASK);
++
++	/*
++	 * Only on the recovery init: the first download runs against the ROM,
++	 * which polls the ring and needs the flow control the description
++	 * talks about, while afterwards the ring is frozen although the
++	 * firmware right next to it answers commands.  Dropping the control
++	 * there says whether the ring is short of credits or not scheduled at
++	 * all - if it is credits, the descriptor moves and DDONE comes back.
++	 */
++	if (diag_fwdl_bypass && diag_pdma_init_cnt > 1) {
++		u32 ext1, val;
++
++		ext1 = bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_EXT1_ADDR);
++		val = ext1 |
++		      WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_EXT1_CSR_FWDL_FLOW_CTRL_BYASS_EN_MASK;
++		if (diag_fwdl_qsel)
++			val |= WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_EXT1_CSR_FWDL_FLOW_CTRL_BYASS_LS_QSEL_EN_MASK;
++
++		bus_write(trans, WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_EXT1_ADDR, val);
++
++		dev_err(trans->pdev,
++			"diag fwdl bypass set: ext1 0x%08x -> 0x%08x qsel=%d\n",
++			ext1, bus_read(trans,
++				       WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_EXT1_ADDR),
++			diag_fwdl_qsel);
++	}
+ }
+ 
+ static void
+@@ -460,6 +539,8 @@
+ 	bus_clear(trans, WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_ADDR,
+ 			WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_TX_DMA_EN_MASK |
+ 			WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_RX_DMA_EN_MASK);
++
++	mt7993_diag_dump_dl(trans, "stop");
+ }
+ 
+ static int
