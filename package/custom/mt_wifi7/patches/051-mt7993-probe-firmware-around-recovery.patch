@@ -1,0 +1,153 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt7993: probe the firmware around the recovery path
+
+The recovery works: PCI_COMMAND is caught at 0x0000, BAR0 goes back, the
+rings are rebuilt and the firmware download continues.  This time the chip
+really takes the descriptors too - the WFDMA sets DDONE on the semaphore
+release we queue, which only the device can do.
+
+What is still missing is the answer.  Twenty seconds pass with the event ring
+untouched, so before guessing at the firmware state, ask it two questions
+that it has to answer directly.
+
+First, the event ring.  Its hardware write index only moves when the chip
+puts a packet there, and nothing on our side resets it between the
+PATCH_FINISH and the next command.  Sample it right after the BARs come back
+and before pci_chip_dma_init() clears every index, again after the rebuild,
+and once more before each MCU command push - the semaphore release times out
+twenty seconds before the next command is queued, so that last sample lands
+squarely on the window where a reply should have appeared.
+
+Second, ownership.  Handing the chip back to the firmware is a pulse that
+only completes when the owner state really flips, so a clean return proves
+something on the other side is still driving the handshake, while a timeout
+proves nobody is.  Then watch for a moment whether it gives the chip back on
+its own - which is what a finished patch does - and take it again either way,
+so the command queued next can still be fetched.
+
+Two outcomes, two directions: a firmware that never answers the pulse and an
+event ring that never moves mean the patch is not running and the image or
+the jump is the place to look.  A firmware that answers, or an event ring
+that already has a packet in it, mean the reply exists and the host side is
+dropping it, and the interrupt path is the next thing to check.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+--- a/wlan_hwifi/bus/mtk_pci_dma.c
++++ b/wlan_hwifi/bus/mtk_pci_dma.c
+@@ -2469,6 +2469,36 @@
+ }
+ 
+ /*
++ * Bring-up diagnostic: dump the MCU event ring.  Commands make it into the
++ * chip (the WFDMA sets DDONE on the descriptor we queued), yet no reply ever
++ * comes back, so the question is whether the firmware wrote anything at all.
++ * The hardware write index is the answer: it only moves when the chip puts a
++ * packet in the ring, and we never reset it here.
++ */
++static void
++pci_dma_diag_rx_snapshot(struct pci_trans *trans, const char *tag)
++{
++	struct mtk_bus_trans *btrans = to_bus_trans(trans);
++	int i;
++
++	for (i = 0; i < trans->rxq_num; i++) {
++		struct pci_rx_queue *rxq = &trans->rxq[i];
++
++		if (rxq->q.disable || rxq->q.q_attr != Q_RX_EVENT_WM)
++			continue;
++
++		dev_err(to_device(trans),
++			"diag rx[%s]: base=0x%08x cnt=0x%08x cidx=0x%08x didx=0x%08x sw=%u/%u\n",
++			tag,
++			bus_read(btrans, rxq->q.hw_desc_base),
++			bus_read(btrans, rxq->q.hw_cnt_addr),
++			bus_read(btrans, rxq->q.hw_cidx_addr),
++			bus_read(btrans, rxq->q.hw_didx_addr),
++			rxq->q.head, rxq->q.tail);
++	}
++}
++
++/*
+  * Bring-up diagnostic: the ROM clears its own PCIe configuration the moment
+  * it accepts PATCH_FINISH_REQ.  Nothing on the host side notices until the
+  * next command times out 20 s later, so check the MCU command queue and put
+@@ -2529,6 +2559,13 @@
+ 		ret, bus_read(btrans, trans->lp_fw_own_reg_addr));
+ 
+ 	/*
++	 * Snapshot the event ring before anything is rewritten: if the chip
++	 * wrote a reply while we were not looking, didx is already ahead of
++	 * zero here and the whole "no answer" story changes.
++	 */
++	pci_dma_diag_rx_snapshot(trans, "pre-rebuild");
++
++	/*
+ 	 * The WFDMA went back to index zero together with the config space
+ 	 * while our head/tail are sitting in the middle of the ring, so the
+ 	 * chip would wait for descriptor zero and never look at anything we
+@@ -2569,6 +2606,43 @@
+ 		bus_read(btrans, q->hw_cidx_addr),
+ 		bus_read(btrans, q->hw_didx_addr));
+ 
++	pci_dma_diag_rx_snapshot(trans, "post-rebuild");
++
++	/*
++	 * Ownership probe.  Handing the chip back asks the firmware a direct
++	 * question: the pulse only completes when the owner state really
++	 * flips, so a clean return means something on the other side is still
++	 * driving that handshake.  Then watch for a moment whether it gives
++	 * the chip back on its own, which is what a finished patch does, and
++	 * take it again either way so the command we are about to queue can
++	 * actually be fetched.
++	 */
++	if (dev->chip_drv->ctl_ops->driver_own) {
++		int took = 0;
++
++		ret = dev->chip_drv->ctl_ops->driver_own(dev, btrans, false);
++		took = (ret == 0);
++		dev_err(to_device(trans),
++			"diag: fw own ret=%d took=%d lpctl=0x%08x\n",
++			ret, took, bus_read(btrans, trans->lp_fw_own_reg_addr));
++
++		for (i = 0; i < 100; i++) {
++			if (!(bus_read(btrans, trans->lp_fw_own_reg_addr) & 0x4))
++				break;
++			msleep(10);
++		}
++
++		dev_err(to_device(trans),
++			"diag: fw handed back after %d ms (lpctl=0x%08x)\n",
++			took ? i * 10 : -1,
++			bus_read(btrans, trans->lp_fw_own_reg_addr));
++
++		ret = dev->chip_drv->ctl_ops->driver_own(dev, btrans, true);
++		dev_err(to_device(trans),
++			"diag: own taken again ret=%d lpctl=0x%08x\n",
++			ret, bus_read(btrans, trans->lp_fw_own_reg_addr));
++	}
++
+ 	return true;
+ }
+ 
+@@ -2580,8 +2654,18 @@
+ 	struct pci_queue_buf buf;
+ 	dma_addr_t addr;
+ 
+-	if (q->q_attr == Q_TX_CMD_WM)
+-		pci_dma_diag_resync(trans, q);
++	if (q->q_attr == Q_TX_CMD_WM) {
++		/*
++		 * Every MCU command goes through here, so the snapshot taken
++		 * before each push doubles as a "what did the chip write since
++		 * the last command" probe: the sem release times out 20 s
++		 * before the next command is queued, and its event ring
++		 * position at that point says whether a reply was ever
++		 * produced.
++		 */
++		if (!pci_dma_diag_resync(trans, q))
++			pci_dma_diag_rx_snapshot(trans, "cmd");
++	}
+ 
+ 	if (((q->head + 1) % q->q_size) == q->tail)
+ 		goto err;
