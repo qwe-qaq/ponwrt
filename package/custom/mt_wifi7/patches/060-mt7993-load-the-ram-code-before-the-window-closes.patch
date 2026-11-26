@@ -1,0 +1,79 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi7: 060 在关掉下载窗口之前把 RAM code 送进去
+
+The vendor picks the download command by address - PATCH_START_REQ when the
+address is the ROM patch offset, TARGET_ADDRESS_LEN_REQ otherwise
+(mt_cmd.c, MtCmdAddressLenReq) - so both images travel over the same ring.
+What differs is the order: the vendor loads both and only then asks the ROM
+to finish, while this driver sends PATCH_FINISH_REQ at the end of the patch
+download and only afterwards starts on the RAM code.
+
+Everything measured on the board points at that window:
+
+  0x05 @ 0x00900000, 12 KB, mode 0x80000009  -> didx 0->4, four descriptors
+  0x01 @ 0x00912c00, 12 KB, any mode         -> didx stays 0
+  0x05 @ 0x00912c00, 12 KB, any mode         -> didx stays 0
+  0x01 @ 0x00900000, 12 KB, any mode         -> didx stays 0
+
+The ring runs only for the patch request, and it does so even in the state
+the endpoint is left in after PATCH_FINISH_REQ, so the receiver is alive and
+the descriptors are fine; what the RAM request lacks is the window the patch
+request opens, which PATCH_FINISH_REQ closes.
+
+diag_late_patch_finish keeps the ROM in download state across the RAM code
+and sends PATCH_FINISH_REQ right before the start command, which is the order
+the vendor uses.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -320,6 +320,18 @@
+ 	return mode;
+ }
+ 
++/*
++ * 060: ROM answers TARGET_ADDRESS_LEN_REQ and then never fetches a descriptor,
++ * whatever the address, the size or the mode word, while the very same ring
++ * runs to the end for PATCH_START_REQ.  The vendor picks the command by
++ * address and loads both images before it asks the ROM to finish, so the RAM
++ * code has to go in while the download window the patch opened is still open.
++ */
++static bool diag_late_patch_finish;
++module_param(diag_late_patch_finish, bool, 0644);
++MODULE_PARM_DESC(diag_late_patch_finish,
++		 "send PATCH_FINISH_REQ after the RAM code instead of before it");
++
+ static int
+ mcu_wm_load_patch(struct mtk_hw_dev *dev, struct mtk_mcu_entry *mcu_entry)
+ {
+@@ -414,9 +426,11 @@
+ 		}
+ 	}
+ 
+-	ret = mcu_wm_start_patch(dev);
+-	if (ret)
+-		dev_err(dev->dev, "Failed to start patch\n");
++	if (!diag_late_patch_finish) {
++		ret = mcu_wm_start_patch(dev);
++		if (ret)
++			dev_err(dev->dev, "Failed to start patch\n");
++	}
+ 
+ out:
+ 	sem = mcu_wm_patch_sem_ctrl(dev, 0);
+@@ -630,6 +644,13 @@
+ 	if (is_wa)
+ 		option |= FW_START_WORKING_PDA_CR4;
+ 
++	if (diag_late_patch_finish) {
++		err = mcu_wm_start_patch(dev);
++		dev_err(dev->dev, "diag: late patch finish -> %d\n", err);
++		if (err)
++			return err;
++	}
++
+ 	return mcu_wm_start_firmware(dev, override, option);
+ }
+ 
