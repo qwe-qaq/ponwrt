@@ -1,0 +1,97 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi7: 056 把 RAM code 的下载请求切成已知能成功的尺寸
+
+The only firmware transfer that has ever completed on this board is the ROM
+patch: 12 KB, one PATCH_START_REQ, ring runs to the end.  The RAM code is
+144 KB and its ring never moves - and that is true in every state we can put
+the chip in:
+
+  - after the 0x07 jump and the endpoint recovery (default)
+  - with the RAM request sent as PATCH_START_REQ instead of
+    TARGET_ADDRESS_LEN_REQ (diag_ram_as_patch)
+  - with the patch semaphore held across the whole download (diag_ram_sem)
+  - with the patch skipped entirely, so nothing ever reset the endpoint and
+    the ROM is untouched (diag_skip_patch)
+
+In all four cases the MCU answers the request command and then never fetches
+a single descriptor, while the 12 KB download in the same boot fetches and
+completes normally.  The remaining variable is the size of the single
+request, so this splits each region into slices of a configurable size and
+asks for one slice at a time:
+
+  diag_ram_chunk_kb=12  -> 12 KB requests, the size that demonstrably works
+  diag_ram_chunk_kb=0   -> untouched behaviour, one request per region
+
+Every slice logs its address and length before it is queued, so the first
+slice that is refused pinpoints the limit instead of leaving us to guess.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -59,6 +59,18 @@
+ module_param(diag_ram_sem, bool, 0644);
+ MODULE_PARM_DESC(diag_ram_sem, "acquire and release the patch semaphore around the RAM download");
+ 
++/*
++ * 056: the one download that always completes is the 12 KB ROM patch, the one
++ * that never does is the 144 KB RAM code, and that stays true with the patch
++ * skipped, with 0x05 instead of 0x01 and with the patch semaphore held.  The
++ * only variable left is the size of the single request, so ask for a slice at
++ * a time the size that is known to work and watch the ring.
++ */
++static int diag_ram_chunk_kb;
++module_param(diag_ram_chunk_kb, int, 0644);
++MODULE_PARM_DESC(diag_ram_chunk_kb,
++		 "split each RAM region into chunks of this many KiB (0 = one request)");
++
+ static int
+ mcu_wm_patch_sem_ctrl(struct mtk_hw_dev *dev, bool get)
+ {
+@@ -822,6 +834,45 @@
+ 				len_cnt += sec_len;
+ 			}
+ 
++		} else if (diag_ram_chunk_kb > 0) {
++			u32 chunk = (u32)diag_ram_chunk_kb * 1024;
++			u32 done = 0;
++
++			if (diag_skip_ram_req)
++				dev_warn(dev->dev,
++					 "diag: chunked download without a request\n");
++
++			while (done < len) {
++				u32 part = min_t(u32, chunk, len - done);
++
++				dev_info(dev->dev,
++					 "diag ram chunk: addr=0x%08x len=%u of %u\n",
++					 addr + done, part, len);
++
++				if (!diag_skip_ram_req) {
++					err = mcu_wm_init_download(dev, addr + done,
++								   part, mode,
++								   MCU_FWDL_TYPE_RAM);
++					if (err) {
++						dev_err(dev->dev,
++							"Download request failed\n");
++						return err;
++					}
++				}
++
++				err = mcu_wm_send_firmware(dev,
++							   data + offset + done,
++							   part);
++				if (err) {
++					dev_err(dev->dev,
++						"WM Failed to send firmware\n");
++					return err;
++				}
++
++				done += part;
++			}
++
++			offset += len;
+ 		} else {
+ 			/*
+ 			 * diag_skip_ram_req: push the RAM code into the FWDL ring
