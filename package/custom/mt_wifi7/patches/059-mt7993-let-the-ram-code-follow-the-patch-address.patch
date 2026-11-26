@@ -1,0 +1,44 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi7: 059 允许把 RAM code 下到 patch 用过的那个地址
+
+Every download that ever moved the ring went to 0x00900000, the ROM patch
+window; every download that stalled went to 0x00912c00, where the RAM code
+header says it belongs.  Size is ruled out (12 KB stalls there too), so the
+target address is the next thing to separate from the mode word.
+
+diag_ram_addr_override downloads every RAM region to the given address
+instead of the one the header declares, and logs the substitution, so one
+boot can tell whether the receiver refuses the window or the request.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -443,6 +443,12 @@
+ MODULE_PARM_DESC(diag_ram_mode_and,
+ 		 "AND the RAM download mode word with this value");
+ 
++/* 059: the only address that has ever accepted a download is the patch one. */
++static unsigned int diag_ram_addr_override;
++module_param(diag_ram_addr_override, uint, 0644);
++MODULE_PARM_DESC(diag_ram_addr_override,
++		 "download every RAM region to this address instead (0 = as declared)");
++
+ static u32
+ mcu_wm_gen_dl_mode(u8 feature_set, bool is_wa)
+ {
+@@ -514,6 +520,13 @@
+ 		len = le32_to_cpu(region->len);
+ 		addr = le32_to_cpu(region->addr);
+ 
++		if (diag_ram_addr_override) {
++			dev_info(dev->dev,
++				 "diag ram addr: 0x%08x -> 0x%08x\n",
++				 addr, diag_ram_addr_override);
++			addr = diag_ram_addr_override;
++		}
++
+ 		if (region->feature_set & FW_FEATURE_OVERRIDE_ADDR)
+ 			override = addr;
+ 
