@@ -1,0 +1,63 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi7: 058 把 RAM 下载请求的 mode 字对齐到已经成功的那一次
+
+The RAM request carries 0x800000a9 and the ROM patch request that completes
+in the same boot carries 0x80000009.  The extra bits are
+DL_MODE_ENCRY_MODE_EMI (bit 7) and DL_MODE_VALID_RAM_ENTRY (bit 5), and bit 7
+is set for every RAM download no matter what the region asks for:
+
+	ret |= (feature_set | DL_MODE_ENCRY_MODE_EMI);
+
+That ORs the flag in instead of testing it.  With it set the receiver answers
+the request - the command ring advances, which is why the request looked
+accepted - and then waits for the EMI/AXI transfer the flag announces, which
+this driver never starts because the branch below tests feature_set and not
+the mode word, so the FWDL ring is never fetched again.
+
+Measurements from the board:
+
+  - 12,416 B at 0x00900000, mode 0x80000009: four descriptors, didx 0->4
+  - 147,280 B at 0x00912c00, mode 0x800000a9: 37 descriptors, didx stays 0
+  - 12,288 B at 0x00912c00, mode 0x800000a9: four descriptors, didx stays 0
+
+The size hypothesis is dead; a slice the size of the working patch stalls at
+the other address, so the remaining difference is the mode word itself.
+
+diag_ram_mode_and masks the word before it is queued (0xffffffff = unchanged),
+so one build can try both candidates from the boot arguments:
+
+  diag_ram_mode_and=0x8000002f  ->  0x80000029, EMI bit cleared
+  diag_ram_mode_and=0x8000000f  ->  0x80000009, identical to the patch request
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -433,6 +433,16 @@
+ 	return ret;
+ }
+ 
++/*
++ * 058: bit 7 of the RAM download mode word is set unconditionally, while the
++ * ROM patch request that completes does not carry it; mask it and watch the
++ * ring before changing the flow.
++ */
++static unsigned int diag_ram_mode_and = 0xffffffff;
++module_param(diag_ram_mode_and, uint, 0644);
++MODULE_PARM_DESC(diag_ram_mode_and,
++		 "AND the RAM download mode word with this value");
++
+ static u32
+ mcu_wm_gen_dl_mode(u8 feature_set, bool is_wa)
+ {
+@@ -448,6 +458,9 @@
+ 	ret |= DL_MODE_NEED_RSP;
+ 	ret |= is_wa ? DL_MODE_WORKING_PDA_CR4 : 0;
+ 
++	if (diag_ram_mode_and != 0xffffffff)
++		ret &= diag_ram_mode_and;
++
+ 	return ret;
+ }
+ 
