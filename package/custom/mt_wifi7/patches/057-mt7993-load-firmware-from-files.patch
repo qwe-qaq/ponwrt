@@ -1,0 +1,64 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi7: 057 允许从 /lib/firmware 加载 WM 固件
+
+Every image we can try today is compiled into the driver, so testing another
+patch or RAM code means another full build.  The packaged image already
+carries the casan variants next to the plain ones, and the plain ones are
+byte-identical to the built-in arrays, so the only thing missing is a way to
+point the MCU loader at a file.
+
+diag_use_fw_files=1 switches the WM firmware to BIN_METHOD with the stock
+names (WIFI_MT7993_PATCH_MCU_1_1_hdr.bin and WIFI_RAM_CODE_MT7993_1_1.bin),
+which is the same content as the built-in copy, and from there
+diag_patch_file / diag_ram_file select any file in /lib/firmware at boot
+time - the casan pair included.
+
+Default is off, so the untouched build keeps loading the built-in arrays.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+---
+--- a/wlan_hwifi/chips/mt7993/mt7993.c
++++ b/wlan_hwifi/chips/mt7993/mt7993.c
+@@ -58,6 +58,18 @@
+ module_param(intr_option_set, byte, 0644);
+ MODULE_PARM_DESC(intr_option_set, "Interrupt Option Set");
+ 
++/*
++ * 057: every image we can test so far is compiled into the driver, so trying
++ * another one costs a full build.  With this set the WM firmware is requested
++ * from /lib/firmware instead, which makes diag_patch_file/diag_ram_file - and
++ * therefore every variant shipped in the image, casan included - switchable
++ * from /etc/modules.d at boot time.
++ */
++static bool diag_use_fw_files;
++module_param(diag_use_fw_files, bool, 0644);
++MODULE_PARM_DESC(diag_use_fw_files,
++		 "load the WM patch and RAM code from /lib/firmware instead of the built-in header");
++
+ static u8 rro_mode = HW_RRO_V3_1;
+ module_param(rro_mode, byte, 0644);
+ MODULE_PARM_DESC(rro_mode, "RRO Mode");
+@@ -1737,6 +1749,22 @@
+ 	mcu_info->fw_hdr_len[MCU_FW_MODE_TESTMODE] = sizeof(mt7993_FirmwareImage_Testmode_1_1);
+ 	mcu_info->rom_patch_hdr = mt7993_rom_patch_1_1;
+ 	mcu_info->applied_method = HEADER_METHOD;
++
++	if (diag_use_fw_files) {
++		/*
++		 * BIN_METHOD makes mcu_wm load the two images with
++		 * request_firmware(); give it the stock names so a plain
++		 * diag_use_fw_files=1 behaves exactly like the built-in copy
++		 * and only diag_patch_file/diag_ram_file change it.
++		 */
++		mcu_info->fw_patch = MT7993_ROM_PATCH;
++		mcu_info->fw_ram[MCU_FW_MODE_NORMALMODE] = MT7993_FIRMWARE_WM;
++		mcu_info->fw_ram[MCU_FW_MODE_TESTMODE] =
++			MT7993_FIRMWARE_WM_TESTMODE;
++		mcu_info->applied_method = BIN_METHOD;
++		pr_err("diag: WM firmware from /lib/firmware (%s, %s)\n",
++		       MT7993_ROM_PATCH, MT7993_FIRMWARE_WM);
++	}
+ }
+ #endif /* CONFIG_HWIFI_FW_HDR_SUPPORT */
+ 
