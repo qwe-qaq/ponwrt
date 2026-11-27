@@ -1,0 +1,133 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi7: 062 在 patch 窗口里下完 RAM，启动交给重建之后
+
+With 060 the RAM code downloads fine and PATCH_FINISH_REQ is answered, but the
+start command never leaves the ring: the finish is what hands the chip to the
+firmware, and the firmware clears the PCIe config on its way up
+(cmd=0x0000, bar0 back to its reset value, lpctl=0), so the rings the start
+command is queued on are gone.
+
+Rebuilding them by calling the bus init from the MCU layer does not work - that
+entry point frees the resources first and registers the NAPI instances again,
+which the kernel rejects:
+
+  WARNING: CPU: 1 PID: 1401 at netif_napi_add_weight_locked
+  pci_dma_free_resource <- pci_dma_init_device <- mcu_wm_send_ram_firmware
+  Internal error: Oops - BUG: 00000000f2000800
+  Kernel panic - not syncing: Oops - BUG: Fatal exception
+
+The core already does exactly one such rebuild between the patch and the start
+phase, and that one works - it is where the endpoint gets recovered in the
+stock flow.  So do not add a second rebuild: download the RAM code while the
+patch window is still open, inside the patch phase, send the finish there, and
+let the phase that the core drives after the rebuild carry the start command.
+
+diag_ram_with_patch does that.  The override/option pair the start command
+needs is computed during the download and kept for the later phase, and the
+start phase skips its own download when the early pass already ran.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -332,6 +332,27 @@
+ MODULE_PARM_DESC(diag_late_patch_finish,
+ 		 "send PATCH_FINISH_REQ after the RAM code instead of before it");
+ 
++/*
++ * 062: the RAM code has to go in while the window PATCH_START_REQ opens is
++ * still open, but PATCH_FINISH_REQ is also what clears the PCIe config, so the
++ * rings have to be rebuilt after it.  The only rebuild that does not register
++ * the NAPI instances a second time is the one the core already runs between
++ * the patch and the start phase, so download the RAM code inside the patch
++ * phase and leave the start command to the phase that runs after that rebuild.
++ */
++static bool diag_ram_with_patch;
++module_param(diag_ram_with_patch, bool, 0644);
++MODULE_PARM_DESC(diag_ram_with_patch,
++		 "download the RAM code before PATCH_FINISH_REQ and start it later");
++
++static bool diag_ram_early;
++static bool diag_ram_early_done;
++static u32 diag_ram_start_addr;
++static u32 diag_ram_start_option;
++
++static int mcu_wm_load_ram(struct mtk_hw_dev *dev,
++			   struct mtk_mcu_entry *mcu_entry);
++
+ static int
+ mcu_wm_load_patch(struct mtk_hw_dev *dev, struct mtk_mcu_entry *mcu_entry)
+ {
+@@ -426,7 +447,13 @@
+ 		}
+ 	}
+ 
+-	if (!diag_late_patch_finish) {
++	if (diag_ram_with_patch) {
++		diag_ram_early = true;
++		ret = mcu_wm_load_ram(dev, mcu_entry);
++		diag_ram_early = false;
++		if (ret)
++			dev_err(dev->dev, "diag: early ram failed %d\n", ret);
++	} else if (!diag_late_patch_finish) {
+ 		ret = mcu_wm_start_patch(dev);
+ 		if (ret)
+ 			dev_err(dev->dev, "Failed to start patch\n");
+@@ -644,6 +671,17 @@
+ 	if (is_wa)
+ 		option |= FW_START_WORKING_PDA_CR4;
+ 
++	if (diag_ram_early) {
++		diag_ram_start_addr = override;
++		diag_ram_start_option = option;
++		diag_ram_early_done = true;
++
++		err = mcu_wm_start_patch(dev);
++		dev_err(dev->dev, "diag: ram early done, patch finish -> %d\n",
++			err);
++		return err;
++	}
++
+ 	if (diag_late_patch_finish) {
+ 		err = mcu_wm_start_patch(dev);
+ 		dev_err(dev->dev, "diag: late patch finish -> %d\n", err);
+@@ -812,6 +850,8 @@
+ {
+ 	int ret;
+ 
++	diag_ram_early_done = false;
++
+ 	if (!mcu_entry->need_patch)
+ 		goto end;
+ 
+@@ -835,15 +875,23 @@
+ {
+ 	int ret;
+ 
+-	if (!mcu_entry->need_patch) {
+-		ret = mtk_hw_check_fwdl_state(dev, FW_STATE_FW_DOWNLOAD);
++	if (diag_ram_early_done) {
++		ret = mcu_wm_start_firmware(dev, diag_ram_start_addr,
++					    diag_ram_start_option);
++		dev_err(dev->dev, "diag: start after early ram -> %d\n", ret);
+ 		if (ret)
+ 			goto err;
+-	}
++	} else {
++		if (!mcu_entry->need_patch) {
++			ret = mtk_hw_check_fwdl_state(dev, FW_STATE_FW_DOWNLOAD);
++			if (ret)
++				goto err;
++		}
+ 
+-	ret =  mcu_wm_load_ram(dev, mcu_entry);
+-	if (ret)
+-		goto err;
++		ret =  mcu_wm_load_ram(dev, mcu_entry);
++		if (ret)
++			goto err;
++	}
+ 
+ 	if (mcu_entry->option & BIT(WM_OPT_CK_FWDL_STA)) {
+ 		ret = mtk_hw_check_fwdl_state(dev, FW_STATE_NORMAL_TRX);
