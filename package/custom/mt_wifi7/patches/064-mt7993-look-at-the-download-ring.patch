@@ -1,0 +1,167 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi7: 064 把芯片留下的下载环状态打出来
+
+063 proved the ownership handshake is not the blocker: driver own returns 0,
+LPCTL reads 0, and the semaphore release still times out.  Rebooting that
+same image with three other module parameters pins the failure down further,
+without a rebuild:
+
+  diag_skip_ram_req=1     no TARGET_ADDRESS_LEN_REQ at all, only the scatter
+			  -> after the recovery every descriptor still reads
+			     didx=0, so it is not the request that kills the
+			     ring
+  diag_ram_as_patch=1     RAM asked for with PATCH_START_REQ, which is the
+			  command that opens the download window
+			  -> first chunk fetched, nothing after it
+  diag_fwdl_bypass=1      flow control bypass on the recovery init
+			  -> ext1 already reads 0x9c800404, bit 26 set, so the
+			     write is a no-op and the ring is not short of
+			     credits
+
+The command ring is fetched and answered at the same moment, so the WFDMA,
+the firmware and the bus are alive; only TX ring 16 is not.  Both rings are
+programmed by the same loop out of the same table, so what differs is the
+per-ring state the chip keeps across the endpoint reset.
+
+Dump the full programming of ring 16 and ring 17 - base, count, CPU index,
+DMA index, EXT_CTRL - plus GLO_CFG, the pending interrupt status, PAUSE0 and
+the MCU DMA receive ring, at every DMA enable.  The probe enable is the state
+that fetches, the recovery enable is the state that does not, and the two
+prints differ only in what the chip changed underneath us.
+
+Two knobs ride along so the next boots can test a fix without another build:
+diag_ring16_rearm pulses the ring 16 prefetch reset and puts the saved
+programming back, diag_int_clear writes off a pending WFDMA status that
+nobody acknowledged before the endpoint went away.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+---
+--- a/wlan_hwifi/chips/mt7993/mt7993.c
++++ b/wlan_hwifi/chips/mt7993/mt7993.c
+@@ -91,6 +91,32 @@
+ module_param(diag_fwdl_qsel, bool, 0644);
+ MODULE_PARM_DESC(diag_fwdl_qsel, "Bypass the MSB download ring instead of the LSB one");
+ 
++/*
++ * 064: the download ring stops being fetched the moment PATCH_FINISH_REQ
++ * takes the endpoint off the bus, and it stays that way after the recovery,
++ * while the command ring next to it keeps working.  Both rings are ordinary
++ * host TX rings, programmed by the same loop, so the difference has to be in
++ * the per-ring state the chip keeps.  Print the whole programming of ring 16
++ * and ring 17 at every DMA enable - the probe one is the state that works,
++ * the recovery one is the state that does not - and keep two ways of poking
++ * the ring from a module parameter, since each one costs a reboot instead of
++ * a rebuild.
++ */
++static bool diag_ring_dump = true;
++module_param(diag_ring_dump, bool, 0644);
++MODULE_PARM_DESC(diag_ring_dump,
++		 "dump the programming of TX ring 16 and 17 at every DMA enable");
++
++static bool diag_ring16_rearm;
++module_param(diag_ring16_rearm, bool, 0644);
++MODULE_PARM_DESC(diag_ring16_rearm,
++		 "pulse the ring 16 prefetch reset on the recovery init and restore it");
++
++static bool diag_int_clear;
++module_param(diag_int_clear, bool, 0644);
++MODULE_PARM_DESC(diag_int_clear,
++		 "clear the pending WFDMA interrupt status before enabling the DMA");
++
+ /* Counts dma_init calls: 1 is the probe, 2 and up are recoveries. */
+ static int diag_pdma_init_cnt;
+ 
+@@ -508,14 +534,92 @@
+ }
+ 
+ static void
++mt7993_diag_dump_rings(struct mtk_bus_trans *trans, const char *tag)
++{
++	dev_err(trans->pdev,
++		"diag ring[%s] 16: base=0x%08x cnt=0x%08x cidx=0x%08x didx=0x%08x ext=0x%08x\n",
++		tag,
++		bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING16_CTRL0_ADDR),
++		bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING16_CTRL1_ADDR),
++		bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING16_CTRL2_ADDR),
++		bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING16_CTRL3_ADDR),
++		bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING16_EXT_CTRL_ADDR));
++	dev_err(trans->pdev,
++		"diag ring[%s] 17: base=0x%08x cnt=0x%08x cidx=0x%08x didx=0x%08x ext=0x%08x\n",
++		tag,
++		bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING17_CTRL0_ADDR),
++		bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING17_CTRL1_ADDR),
++		bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING17_CTRL2_ADDR),
++		bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING17_CTRL3_ADDR),
++		bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING17_EXT_CTRL_ADDR));
++	dev_err(trans->pdev,
++		"diag ring[%s] glo=0x%08x int=0x%08x pause=0x%08x mcurx1=0x%08x/0x%08x\n",
++		tag,
++		bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_ADDR),
++		bus_read(trans, WF_WFDMA_HOST_DMA0_HOST_INT_STA_ADDR),
++		bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_PAUSE0_ADDR),
++		bus_read(trans, WF_WFDMA_MCU_DMA0_WPDMA_RX_RING1_CTRL0_ADDR),
++		bus_read(trans, WF_WFDMA_MCU_DMA0_WPDMA_RX_RING1_CTRL1_ADDR));
++}
++
++static void
+ _mt7993_pdma_enable(struct pci_trans *pci_hw)
+ {
+ 	struct mtk_bus_trans *trans = to_bus_trans(pci_hw);
+ 
++	if (diag_ring_dump)
++		mt7993_diag_dump_rings(trans,
++				       diag_pdma_init_cnt > 1 ? "pre2" : "pre1");
++
++	/*
++	 * A TX ring is armed by writing its base, count and CPU index while
++	 * the DMA is idle; a ring that was already in use when the endpoint
++	 * went away can keep a prefetch pointer pointing past the descriptors
++	 * the host just wrote.  Pulse that one ring's pointer reset and put
++	 * the programming back exactly as it was, so the only difference to
++	 * the working case is the pulse itself.
++	 */
++	if (diag_ring16_rearm && diag_pdma_init_cnt > 1) {
++		u32 r0, r1, r2, r3, didx;
++
++		r0 = bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING16_CTRL0_ADDR);
++		r1 = bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING16_CTRL1_ADDR);
++		r2 = bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING16_CTRL2_ADDR);
++		r3 = bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING16_CTRL3_ADDR);
++
++		bus_write(trans, WF_WFDMA_HOST_DMA0_WPDMA_RST_DTX_PTR_ADDR,
++			  BIT(16));
++		udelay(100);
++
++		bus_write(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING16_CTRL0_ADDR, r0);
++		bus_write(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING16_CTRL1_ADDR, r1);
++		bus_write(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING16_CTRL2_ADDR, r2);
++		bus_write(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING16_CTRL3_ADDR, r3);
++
++		didx = bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_TX_RING16_CTRL3_ADDR);
++		dev_err(trans->pdev,
++			"diag ring16 rearm: saved cidx=0x%08x didx now=0x%08x\n",
++			r2, didx);
++	}
++
++	/*
++	 * A TX-done status left over from before the endpoint went away is
++	 * never acknowledged by anybody, and the channel that owns it is not
++	 * scheduled again until it is.  Writing ones clears it.
++	 */
++	if (diag_int_clear && diag_pdma_init_cnt > 1) {
++		u32 sta = bus_read(trans, WF_WFDMA_HOST_DMA0_HOST_INT_STA_ADDR);
++
++		bus_write(trans, WF_WFDMA_HOST_DMA0_HOST_INT_STA_ADDR, 0xffffffff);
++		dev_err(trans->pdev, "diag int clear: 0x%08x -> 0x%08x\n", sta,
++			bus_read(trans, WF_WFDMA_HOST_DMA0_HOST_INT_STA_ADDR));
++	}
++
+ 	bus_set(trans, WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_ADDR,
+ 		WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_TX_DMA_EN_MASK |
+ 		WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_RX_DMA_EN_MASK);
+ 
++
+ 	/*
+ 	 * Only on the recovery init: the first download runs against the ROM,
+ 	 * which polls the ring and needs the flow control the description
