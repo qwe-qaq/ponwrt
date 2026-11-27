@@ -1,0 +1,139 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [PATCH] mt_wifi7: 063 0x07 之后先把总线拿回来再发启动命令
+
+With the RAM code downloaded inside the patch window the download runs to the
+end and PATCH_FINISH_REQ is fetched by the ring, but nothing follows: no
+firmware version event, no answer to the patch semaphore release, no answer to
+the start command.  The ring indexes show the commands were pulled:
+
+  diag cmd push: len=68 head=100 tail=99 didx=99
+  diag cmd done: tail=100 head=100 didx=100      <- semaphore release, no reply
+  diag cmd push: len=72 head=101 tail=100 didx=100
+  diag cmd done: tail=101 head=101 didx=101      <- start, no reply
+
+PATCH_FINISH_REQ hands the bus to the ROM patch.  While the chip owns the bus
+it does not look at host commands at all, so both are fetched by the WFDMA and
+dropped.  On the board right now, after that failure:
+
+  LPCTL   (0x200E0010) = 0x00000004   FW_OWN set, chip owns the bus
+  ON_MISC (0x200E00F0) = 0x00000001   still in the download state
+
+The recovery path already shows the way out - it pulses CLR_FW_OWN, polls the
+owner state back to host and only then talks to the chip (stock flow: "driver
+own ret=0 lpctl=0x00000000", then the semaphore release is answered and the
+firmware version event arrives).  That path only runs when the chip clears its
+PCIe config, which does not happen when the RAM code is already in place, so
+nothing took the bus back in this flow.
+
+diag_own_after_patch (on by default) waits diag_own_wait_ms, then pulses
+CLR_FW_OWN through mtk_hw_set_driver_own() and retries diag_own_retries times
+until the owner state comes back to host, so the semaphore release that
+follows is answered.  diag_start_retries re-takes the bus and repeats the start
+command if the first one is still lost.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -345,6 +345,32 @@
+ MODULE_PARM_DESC(diag_ram_with_patch,
+ 		 "download the RAM code before PATCH_FINISH_REQ and start it later");
+ 
++/*
++ * 063: PATCH_FINISH_REQ hands the bus to the ROM patch, which sets FW_OWN in
++ * LPCTL and runs from there; while it owns the bus the MCU ignores host
++ * commands, so the patch semaphore release and the start command are queued,
++ * fetched by the WFDMA and never looked at.  Take the bus back first.
++ */
++static bool diag_own_after_patch = true;
++module_param(diag_own_after_patch, bool, 0644);
++MODULE_PARM_DESC(diag_own_after_patch,
++		 "take driver ownership back after PATCH_FINISH_REQ");
++
++static unsigned int diag_own_wait_ms = 300;
++module_param(diag_own_wait_ms, uint, 0644);
++MODULE_PARM_DESC(diag_own_wait_ms,
++		 "wait this long after PATCH_FINISH_REQ before taking ownership");
++
++static unsigned int diag_own_retries = 20;
++module_param(diag_own_retries, uint, 0644);
++MODULE_PARM_DESC(diag_own_retries,
++		 "retry the driver own pulse this many times, 200 ms apart");
++
++static unsigned int diag_start_retries = 1;
++module_param(diag_start_retries, uint, 0644);
++MODULE_PARM_DESC(diag_start_retries,
++		 "retry the start command this many times, taking the bus back first");
++
+ static bool diag_ram_early;
+ static bool diag_ram_early_done;
+ static u32 diag_ram_start_addr;
+@@ -354,6 +380,25 @@
+ 			   struct mtk_mcu_entry *mcu_entry);
+ 
+ static int
++diag_take_driver_own(struct mtk_hw_dev *dev)
++{
++	unsigned int i;
++	int ret = -EOPNOTSUPP;
++
++	for (i = 0; i < diag_own_retries; i++) {
++		ret = mtk_hw_set_driver_own(dev, dev->bus_trans, true);
++		if (!ret)
++			break;
++		msleep(200);
++	}
++
++	dev_err(dev->dev, "diag: driver own after patch -> %d (try %u)\n",
++		ret, i + 1);
++
++	return ret;
++}
++
++static int
+ mcu_wm_load_patch(struct mtk_hw_dev *dev, struct mtk_mcu_entry *mcu_entry)
+ {
+ 	const struct mcu_patch_hdr *hdr;
+@@ -679,7 +724,16 @@
+ 		err = mcu_wm_start_patch(dev);
+ 		dev_err(dev->dev, "diag: ram early done, patch finish -> %d\n",
+ 			err);
+-		return err;
++		if (err)
++			return err;
++
++		if (diag_own_after_patch) {
++			if (diag_own_wait_ms)
++				msleep(diag_own_wait_ms);
++			diag_take_driver_own(dev);
++		}
++
++		return 0;
+ 	}
+ 
+ 	if (diag_late_patch_finish) {
+@@ -876,9 +930,20 @@
+ 	int ret;
+ 
+ 	if (diag_ram_early_done) {
+-		ret = mcu_wm_start_firmware(dev, diag_ram_start_addr,
+-					    diag_ram_start_option);
+-		dev_err(dev->dev, "diag: start after early ram -> %d\n", ret);
++		unsigned int try;
++
++		for (try = 0; try < diag_start_retries; try++) {
++			if (try && diag_own_after_patch)
++				diag_take_driver_own(dev);
++
++			ret = mcu_wm_start_firmware(dev, diag_ram_start_addr,
++						    diag_ram_start_option);
++			dev_err(dev->dev,
++				"diag: start after early ram -> %d (try %u)\n",
++				ret, try + 1);
++			if (!ret)
++				break;
++		}
+ 		if (ret)
+ 			goto err;
+ 	} else {
