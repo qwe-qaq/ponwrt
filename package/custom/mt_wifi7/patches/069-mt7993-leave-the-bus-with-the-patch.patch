@@ -28,7 +28,7 @@ Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
 ---
 --- a/wlan_hwifi/bus/mtk_pci_dma.c	2026-11-28 17:24:00.000000000 +0800
 +++ b/wlan_hwifi/bus/mtk_pci_dma.c	2026-11-28 17:24:00.000000000 +0800
-@@ -2468,6 +2468,33 @@
+@@ -2468,6 +2468,35 @@
  pci_dma_diag_rx_snapshot(struct pci_trans *trans, const char *tag)
  {
  }
@@ -42,6 +42,8 @@ Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
 + * is never fetched at all.  So make the hand-over optional, and make the wait
 + * long enough to tell "gives it back late" from "never gives it back".
 + */
++#include <linux/module.h>
++
 +static bool diag_keep_fw_own;
 +module_param(diag_keep_fw_own, bool, 0644);
 +MODULE_PARM_DESC(diag_keep_fw_own,
@@ -62,7 +64,7 @@ Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
  
  /*
   * Bring-up diagnostic: the endpoint drops its own PCIe configuration the
-@@ -2604,30 +2634,41 @@
+@@ -2604,31 +2634,42 @@
  		 * what a started patch does - and only force it when it never
  		 * comes, otherwise the command we queue next is never fetched.
  		 */
