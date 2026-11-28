@@ -1,0 +1,130 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [mt_wifi7] 069 patch 已经握住总线，就别再抢回来
+
+The 068 run changes the picture.  With the vendor order back in place the
+patch download goes through cleanly - four descriptors, the DMA index walks
+from one to four, PATCH_FINISH_REQ is fetched - and the endpoint drops ten
+milliseconds later, as before.  What is new is what the recovery finds when
+it comes back: three good config reads in a row and
+
+  diag: restore #0 -> 3 (cmd=0x0006 lpctl=0x00000004)
+
+LPCTL bit 2 is OWNER_STATE_SYNC, set by the firmware itself, so this is not
+noise from a shut memory window - the patch really did take the chip over.
+It then holds it: the wait in the recovery gives it two seconds and it never
+hands back, so the recovery takes the bus by force, and from that moment on
+the MCU serves nothing: the semaphore release is fetched by the command ring
+and never answered, and the RAM download ring is never touched again.
+
+So the code that was meant to rescue the download is what ends the patch.
+Leave the hand-over alone and let the side that is supposed to serve the RAM
+download keep the chip: diag_keep_fw_own=1 skips both the wait and the forced
+pulse, rebuilds the rings and queues the download as usual.
+diag_fw_own_ms stretches the wait instead, for the case where the patch just
+needs longer than two seconds to hand back on its own.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+---
+--- a/wlan_hwifi/bus/mtk_pci_dma.c	2026-11-28 17:24:00.000000000 +0800
++++ b/wlan_hwifi/bus/mtk_pci_dma.c	2026-11-28 17:24:00.000000000 +0800
+@@ -2468,6 +2468,33 @@
+ pci_dma_diag_rx_snapshot(struct pci_trans *trans, const char *tag)
+ {
+ }
++
++/*
++ * 069: everything above assumes the forced hand-over is harmless, and the
++ * 068 run shows it is not.  LPCTL reads back as 0x00000004 - the patch owns
++ * the chip - for as long as the wait below gives it, and the moment the
++ * forced pulse takes the bus back the MCU stops serving commands for good:
++ * the semaphore release is fetched and never answered, the RAM download ring
++ * is never fetched at all.  So make the hand-over optional, and make the wait
++ * long enough to tell "gives it back late" from "never gives it back".
++ */
++static bool diag_keep_fw_own;
++module_param(diag_keep_fw_own, bool, 0644);
++MODULE_PARM_DESC(diag_keep_fw_own,
++		 "leave FW_OWN alone after the patch takes the chip over");
++
++static unsigned int diag_fw_own_ms = 2000;
++module_param(diag_fw_own_ms, uint, 0644);
++MODULE_PARM_DESC(diag_fw_own_ms,
++		 "wait this long for the patch to hand the chip back");
++
++/*
++ * Same two registers the MCU side prints: CONN_ON_MISC tells whether the
++ * download state is still on, SWDEF_MODE is written by the firmware itself,
++ * so a change in either while FW_OWN is held means the patch is executing.
++ */
++#define DIAG_FW_OWN_ON_MISC	0x000E00F0
++#define DIAG_FW_OWN_SWDEF	0x009143C
+ 
+ /*
+  * Bring-up diagnostic: the endpoint drops its own PCIe configuration the
+@@ -2604,30 +2634,41 @@
+ 		 * what a started patch does - and only force it when it never
+ 		 * comes, otherwise the command we queue next is never fetched.
+ 		 */
+-		for (i = 0; i < 200; i++) {
+-			if (!(bus_read(btrans, trans->lp_fw_own_reg_addr) & 0x4))
+-				break;
+-			msleep(10);
++		if (diag_keep_fw_own) {
++			dev_err(to_device(trans),
++				"diag: keep fw own lpctl=0x%08x on_misc=0x%08x swdef=0x%08x\n",
++				bus_read(btrans, trans->lp_fw_own_reg_addr),
++				bus_read(btrans, DIAG_FW_OWN_ON_MISC),
++				bus_read(btrans, DIAG_FW_OWN_SWDEF));
++		} else {
++			for (i = 0; i < diag_fw_own_ms / 10; i++) {
++				if (!(bus_read(btrans,
++					       trans->lp_fw_own_reg_addr) &
++				      0x4))
++					break;
++				msleep(10);
++			}
++
++			lpctl = bus_read(btrans, trans->lp_fw_own_reg_addr);
++			dev_err(to_device(trans),
++				"diag: fw release after %d ms (lpctl=0x%08x)\n",
++				(lpctl & 0x4) ? -1 : i * 10, lpctl);
++
++			if (lpctl & 0x4) {
++				if (dev->chip_drv->ctl_ops->driver_own)
++					ret = dev->chip_drv->ctl_ops->driver_own(dev,
++										 btrans,
++										 true);
++				else
++					ret = -EOPNOTSUPP;
++
++				dev_err(to_device(trans),
++					"diag: driver own ret=%d lpctl=0x%08x\n",
++					ret,
++					bus_read(btrans,
++						 trans->lp_fw_own_reg_addr));
++			}
+ 		}
+ 
+-		lpctl = bus_read(btrans, trans->lp_fw_own_reg_addr);
+-		dev_err(to_device(trans),
+-			"diag: fw release after %d ms (lpctl=0x%08x)\n",
+-			(lpctl & 0x4) ? -1 : i * 10, lpctl);
+-
+-		if (lpctl & 0x4) {
+-			if (dev->chip_drv->ctl_ops->driver_own)
+-				ret = dev->chip_drv->ctl_ops->driver_own(dev,
+-									 btrans,
+-									 true);
+-			else
+-				ret = -EOPNOTSUPP;
+-
+-			dev_err(to_device(trans),
+-				"diag: driver own ret=%d lpctl=0x%08x\n",
+-				ret,
+-				bus_read(btrans, trans->lp_fw_own_reg_addr));
+-		}
+-
+ 		pci_dma_diag_rx_snapshot(trans, "pre-rebuild");
+ 
+*** End of file
