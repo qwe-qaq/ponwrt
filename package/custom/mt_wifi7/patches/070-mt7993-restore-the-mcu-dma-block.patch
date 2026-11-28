@@ -1,0 +1,102 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [mt_wifi7] 070 把 MCU 侧的 DMA 块恢复回去
+
+With diag_keep_fw_own the recovery leaves FW_OWN alone and the chip keeps
+running, but nothing is served either: the semaphore release is fetched by
+the ring and never answered, and the RAM download ring is not touched.  The
+dump that rides along on every init says why:
+
+  diag dl[init]: ext1=0x9c800404 mcuglo=0x10703875 hostcfg=0x00007d00   probe
+  diag dl[init]: ext1=0x9c800404 mcuglo=0x00000000 hostcfg=0x00007d00   after
+  diag dl[init]: mcurx0=0x00000000/0x200 mcurx1=0x02245c00/0x4 ...      probe
+  diag dl[init]: mcurx0=0x00000000/0x000 mcurx1=0x00000000/0x0 ...      after
+
+The MCU side of the WFDMA is gone.  GLO_CFG has lost its enables and the
+three host-to-MCU rings have lost their bases, so the engine that fetches
+the command ring out of MCU SRAM is not running at all - which is exactly
+the state a chip that nobody has initialised yet is in, and the patch that
+took over after the reset never programmed it because the ROM had done that
+before the jump.
+
+Nothing in the recovery writes those registers; it rebuilds the host rings
+and stops there.  The values are the ROM's own and the probe init sees them
+already in place, so snapshot the block there and put it back on every
+recovery init, rings first and GLO_CFG last.
+
+diag_mcu_dma_restore=0 turns it off.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+---
+--- a/wlan_hwifi/chips/mt7993/mt7993.c	2026-11-28 19:20:00.000000000 +0800
++++ b/wlan_hwifi/chips/mt7993/mt7993.c	2026-11-28 19:20:00.000000000 +0800
+@@ -495,3 +495,58 @@
++/*
++ * 070: the jump puts the chip through a reset of its own, and what comes back
++ * is the patch holding FW_OWN with the MCU side of the WFDMA wiped: GLO_CFG
++ * reads zero and the three host-to-MCU rings have no base left, although the
++ * probe init programmed them.  That is the side that fetches the command
++ * ring, so nothing is served after the hand-over - and taking the bus back
++ * cannot help, the MCU has no DMA to read anything with.  Snapshot the block
++ * on the probe init and put it back on every recovery.
++ */
++static bool diag_mcu_dma_restore = true;
++module_param(diag_mcu_dma_restore, bool, 0644);
++MODULE_PARM_DESC(diag_mcu_dma_restore,
++		 "restore the MCU DMA block after the endpoint comes back");
++
++/* Rings first, GLO_CFG last: it carries the enable. */
++static const u32 diag_mcu_dma_regs[] = {
++	WF_WFDMA_MCU_DMA0_WPDMA_RX_RING0_CTRL0_ADDR,
++	WF_WFDMA_MCU_DMA0_WPDMA_RX_RING0_CTRL1_ADDR,
++	WF_WFDMA_MCU_DMA0_WPDMA_RX_RING1_CTRL0_ADDR,
++	WF_WFDMA_MCU_DMA0_WPDMA_RX_RING1_CTRL1_ADDR,
++	WF_WFDMA_MCU_DMA0_WPDMA_RX_RING2_CTRL0_ADDR,
++	WF_WFDMA_MCU_DMA0_WPDMA_RX_RING2_CTRL1_ADDR,
++	WF_WFDMA_MCU_DMA0_WPDMA_GLO_CFG_ADDR,
++};
++
++static u32 diag_mcu_dma_snap[ARRAY_SIZE(diag_mcu_dma_regs)];
++
++static void
++mt7993_diag_mcu_dma(struct mtk_bus_trans *trans, bool restore)
++{
++	u32 now[ARRAY_SIZE(diag_mcu_dma_regs)];
++	int i, n = ARRAY_SIZE(diag_mcu_dma_regs);
++
++	for (i = 0; i < n; i++)
++		now[i] = bus_read(trans, diag_mcu_dma_regs[i]);
++
++	if (!restore) {
++		for (i = 0; i < n; i++)
++			diag_mcu_dma_snap[i] = now[i];
++	} else {
++		for (i = 0; i < n; i++)
++			if (now[i] != diag_mcu_dma_snap[i])
++				bus_write(trans, diag_mcu_dma_regs[i],
++					  diag_mcu_dma_snap[i]);
++	}
++
++	dev_err(trans->pdev,
++		"diag mcu dma %s: glo 0x%08x -> 0x%08x ring1 0x%08x -> 0x%08x\n",
++		restore ? "restore" : "save",
++		now[n - 1],
++		bus_read(trans, WF_WFDMA_MCU_DMA0_WPDMA_GLO_CFG_ADDR),
++		now[2],
++		bus_read(trans, WF_WFDMA_MCU_DMA0_WPDMA_RX_RING1_CTRL0_ADDR));
++}
++
+ static void
+ _mt7993_pdma_init(struct pci_trans *pci_hw)
+ {
+@@ -495,6 +495,10 @@
+ 	_mt7993_pdma_prefetch_config(pci_hw);
+ 	_mt7993_pdma_reset_didx(pci_hw);
+ 
++	if (diag_mcu_dma_restore)
++		mt7993_diag_mcu_dma(to_bus_trans(pci_hw),
++				    diag_pdma_init_cnt > 1);
++
+ 	mt7993_diag_dump_dl(to_bus_trans(pci_hw), "init");
+ }
+ 
