@@ -1,0 +1,223 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [mt_wifi7] 068 把 patch 重新铺一遍再让它跳
+
+The trace settles two things at once.  One millisecond after
+PATCH_FINISH_REQ the config word still reads 0x0006 and ON_MISC still reads
+one; the next sample, ten milliseconds later, comes back as 0x0000 with
+lpctl=0x05d5997d and on_misc=0xbedc7263, which are not register values at
+all.  So the chip does not fade out a hundred milliseconds after the jump:
+it resets the moment the ROM takes it, the read that reports the loss is
+simply the one that blocks for the next hundred.  Clearing FLR_EN does not
+stop it and the endpoint comes back into the firmware download state, so
+the reset is the chip's own, not the endpoint's.
+
+Coming back is not enough.  The download ring cannot be used again after
+that reset, and it takes the whole block with it: after reprogramming ring
+16 by hand, in the exact order the driver uses, the first descriptor never
+moves the DMA index and the next read of the configuration space returns
+zeros for every address in the BAR.  The command ring keeps answering, so
+it is that one ring's dispatch and not the bus.
+
+Which leaves the order that already worked: the RAM code goes in while the
+window PATCH_START_REQ opened is still open.  That download completes - 1.15
+MB, five regions, the DMA index ending at 380 - but PATCH_FINISH_REQ then
+comes back as an ACK and nothing happens, because by then the last window
+the ROM has seen is a RAM one.  Put the patch sections down again right
+before the finish request, 12 KB into the same address, and the ROM has the
+window it is supposed to finish.
+
+diag_repush_patch=1 turns it on.  With diag_ram_with_patch=1 the flow
+becomes patch, RAM, patch, finish, and the start command the core sends
+after the rebuild then lands on a chip that has the RAM code already in
+SRAM.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c	2026-11-28 11:10:41.492714600 +0800
++++ b/wlan_hwifi/mcu/mcu_wm.c	2026-11-28 11:09:13.060426700 +0800
+@@ -364,6 +364,20 @@
+ 		 "download the RAM code before PATCH_FINISH_REQ and start it later");
+ 
+ /*
++ * 068: with the RAM code already in SRAM, PATCH_FINISH_REQ comes back as an
++ * ACK and the ROM does not jump - the endpoint stays up, ON_MISC stays at
++ * one and SWDEF is never written.  The download window that
++ * PATCH_START_REQ opens is what the finish request applies, and by the time
++ * it is sent the last window the ROM has seen is a RAM one, so put the patch
++ * back down first: same sections, same addresses, 12 KB, and the finish
++ * request then has the window it is supposed to finish.
++ */
++static bool diag_repush_patch;
++module_param(diag_repush_patch, bool, 0644);
++MODULE_PARM_DESC(diag_repush_patch,
++		 "download the patch sections again right before PATCH_FINISH_REQ");
++
++/*
+  * 063: PATCH_FINISH_REQ hands the bus to the ROM patch, which sets FW_OWN in
+  * LPCTL and runs from there; while it owns the bus the MCU ignores host
+  * commands, so the patch semaphore release and the start command are queued,
+@@ -678,11 +692,65 @@
+ }
+ 
+ static int
++mcu_wm_push_patch(struct mtk_hw_dev *dev, const u8 *data_ptr,
++		  u32 n_region, u32 *win_tail)
++{
++	int i, ret;
++
++	for (i = 0; i < n_region; i++) {
++		struct mcu_patch_sec *sec;
++		const u8 *dl;
++		u32 len, addr, sec_info;
++
++		sec = (struct mcu_patch_sec *)(data_ptr +
++					       sizeof(struct mcu_patch_hdr) +
++					       i * sizeof(*sec));
++		if ((be32_to_cpu(sec->type) & PATCH_SEC_TYPE_MASK) !=
++		    PATCH_SEC_TYPE_INFO)
++			return -EINVAL;
++
++		addr = be32_to_cpu(sec->info.addr);
++		len = be32_to_cpu(sec->info.len);
++		if (len > PACH_MAX_LEN) {
++			dev_err(dev->dev, "len error\n");
++			return -EINVAL;
++		}
++
++		sec_info = be32_to_cpu(sec->info.sec_info);
++		dl = data_ptr + be32_to_cpu(sec->offs);
++
++		dev_err(dev->dev,
++			"diag region%d: addr=0x%08x len=%u offs=%u sec_info=0x%08x mode=0x%08x\n",
++			i, addr, len, be32_to_cpu(sec->offs), sec_info,
++			mcu_wm_gen_patch_dl_mode(sec_info));
++
++		ret = mcu_wm_init_download(dev, addr, len,
++			mcu_wm_gen_patch_dl_mode(sec_info),
++			MCU_FWDL_TYPE_ROM_PATCH);
++		if (ret) {
++			dev_err(dev->dev, "Download request failed\n");
++			return ret;
++		}
++
++		ret = mcu_wm_send_firmware(dev, dl, len);
++		if (ret) {
++			dev_err(dev->dev, "Failed to send patch\n");
++			return ret;
++		}
++
++		if (win_tail)
++			*win_tail = (len > 0x20) ? addr + len - 0x20 : addr;
++	}
++
++	return 0;
++}
++
++static int
+ mcu_wm_load_patch(struct mtk_hw_dev *dev, struct mtk_mcu_entry *mcu_entry)
+ {
+ 	const struct mcu_patch_hdr *hdr;
+ 	const struct firmware *fw = NULL;
+-	int i, sem;
++	int sem;
+ 	int ret = 0;
+ 	const char *data_ptr = NULL;
+ 	u32 n_region = 0;
+@@ -743,51 +811,9 @@
+ 		goto out;
+ 	}
+ 
+-	for (i = 0; i < n_region; i++) {
+-		struct mcu_patch_sec *sec;
+-		const u8 *dl;
+-		u32 len, addr, sec_info;
+-
+-		sec = (struct mcu_patch_sec *)(data_ptr + sizeof(*hdr) +
+-						  i * sizeof(*sec));
+-		if ((be32_to_cpu(sec->type) & PATCH_SEC_TYPE_MASK) !=
+-		    PATCH_SEC_TYPE_INFO) {
+-			ret = -EINVAL;
+-			goto out;
+-		}
+-
+-		addr = be32_to_cpu(sec->info.addr);
+-		len = be32_to_cpu(sec->info.len);
+-		if (len > PACH_MAX_LEN) {
+-			dev_err(dev->dev, "len error\n");
+-			ret = -EINVAL;
+-			goto out;
+-		}
+-
+-		sec_info = be32_to_cpu(sec->info.sec_info);
+-		dl = data_ptr + be32_to_cpu(sec->offs);
+-
+-		dev_err(dev->dev,
+-			"diag region%d: addr=0x%08x len=%u offs=%u sec_info=0x%08x mode=0x%08x\n",
+-			i, addr, len, be32_to_cpu(sec->offs), sec_info,
+-			mcu_wm_gen_patch_dl_mode(sec_info));
+-
+-		ret = mcu_wm_init_download(dev, addr, len,
+-			mcu_wm_gen_patch_dl_mode(sec_info),
+-			MCU_FWDL_TYPE_ROM_PATCH);
+-		if (ret) {
+-			dev_err(dev->dev, "Download request failed\n");
+-			goto out;
+-		}
+-
+-		ret = mcu_wm_send_firmware(dev, dl, len);
+-		if (ret) {
+-			dev_err(dev->dev, "Failed to send patch\n");
+-			goto out;
+-		}
+-
+-		win_tail = (len > 0x20) ? addr + len - 0x20 : addr;
+-	}
++	ret = mcu_wm_push_patch(dev, data_ptr, n_region, &win_tail);
++	if (ret)
++		goto out;
+ 
+ 	if (diag_sram_dump) {
+ 		mcu_diag_window(dev, "post-dl", DIAG_PATCH_WIN_ADDR);
+@@ -813,8 +839,27 @@
+ 		diag_ram_early = true;
+ 		ret = mcu_wm_load_ram(dev, mcu_entry);
+ 		diag_ram_early = false;
+-		if (ret)
++		if (ret) {
+ 			dev_err(dev->dev, "diag: early ram failed %d\n", ret);
++		} else if (diag_repush_patch) {
++			ret = mcu_wm_push_patch(dev, data_ptr, n_region,
++						&win_tail);
++			dev_err(dev->dev, "diag: patch repushed -> %d\n", ret);
++			if (!ret) {
++				if (diag_hold_flr)
++					mcu_diag_flr_ctl(dev, true);
++
++				ret = mcu_wm_start_patch(dev);
++				dev_err(dev->dev,
++					"diag: repush patch finish -> %d\n",
++					ret);
++			}
++			if (!ret && diag_own_after_patch) {
++				if (diag_own_wait_ms)
++					msleep(diag_own_wait_ms);
++				diag_take_driver_own(dev);
++			}
++		}
+ 	} else if (!diag_late_patch_finish) {
+ 		if (diag_hold_flr)
+ 			mcu_diag_flr_ctl(dev, true);
+@@ -1113,6 +1158,12 @@
+ 		diag_ram_start_option = option;
+ 		diag_ram_early_done = true;
+ 
++		if (diag_repush_patch) {
++			dev_err(dev->dev,
++				"diag: patch finish left to the repush\n");
++			return 0;
++		}
++
+ 		err = mcu_wm_start_patch(dev);
+ 		dev_err(dev->dev, "diag: ram early done, patch finish -> %d\n",
+ 			err);
