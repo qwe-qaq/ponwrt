@@ -1,0 +1,102 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [mt_wifi7] 065 恢复时把卡死的 HIF 侧复位
+
+The endpoint going away is not a clean reset: the WFDMA still had a
+transaction in flight, and its host side keeps waiting for it forever.
+TX_DMA_BUSY stays set, so no TX ring is ever dispatched again, and even the
+command ring only answers one or two descriptors before it wedges too.
+
+This was measured on the running chip, not inferred.  After a boot that
+reached the patch jump and then failed, ring 16 and ring 17 were programmed
+by hand through /dev/mem exactly the way the driver programs them, TX DMA
+was enabled, and the CPU index was advanced:
+
+  ring 16, cidx 1,8      dma index never moved off zero
+  ring 17, cidx 1        dma index moved to one, once, then nothing
+  ring 18, same setup    dma index never moved
+
+so it is not the download ring and not a per-ring setting - the whole TX
+dispatcher is gone.  GLO_CFG reads 0x1410b853: TX_DMA_EN clear after the
+driver turned it off, TX_DMA_BUSY still set.  Turning TX DMA off, setting
+GLO_CFG_EXT2 TX_HALT_MODE and TX_DROP_MODE, writing 0xffffffff to
+RST_DTX_PTR and swapping EXT_CTRL between the rings all leave it at 1.
+WFDMA_HIF_MISC.HIF_BUSY reads 1 at the same moment, and a single write of
+WFDMA_SW_RST.HIF_SW_RST clears HIF_BUSY and TX_DMA_BUSY together.
+
+So pulse that reset at the top of the recovery init, before anything is
+programmed, and wait for HIF_BUSY to drop.  The probe init is untouched -
+there is nothing stuck at that point - and diag_hif_rst=0 turns it off.
+The existing download dump now also carries HIF_MISC and SW_RST so the next
+boot shows whether the reset happened and what it cleared.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+---
+--- a/wlan_hwifi/chips/mt7993/mt7993.c
++++ b/wlan_hwifi/chips/mt7993/mt7993.c
+@@ -117,6 +117,11 @@
+ MODULE_PARM_DESC(diag_int_clear,
+ 		 "clear the pending WFDMA interrupt status before enabling the DMA");
+ 
++static bool diag_hif_rst = true;
++module_param(diag_hif_rst, bool, 0644);
++MODULE_PARM_DESC(diag_hif_rst,
++		 "pulse the WFDMA HIF reset on the recovery init");
++
+ /* Counts dma_init calls: 1 is the probe, 2 and up are recoveries. */
+ static int diag_pdma_init_cnt;
+ 
+@@ -475,6 +480,10 @@
+ 		bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_EXT1_ADDR),
+ 		bus_read(trans, WF_WFDMA_MCU_DMA0_WPDMA_GLO_CFG_ADDR),
+ 		bus_read(trans, WF_WFDMA_EXT_WRAP_CSR_WFDMA_HOST_CONFIG_ADDR));
++	dev_err(trans->pdev, "diag dl[%s]: hif_misc=0x%08x sw_rst=0x%08x\n",
++		tag,
++		bus_read(trans, WF_WFDMA_EXT_WRAP_CSR_WFDMA_HIF_MISC_ADDR),
++		bus_read(trans, WF_WFDMA_EXT_WRAP_CSR_WFDMA_SW_RST_ADDR));
+ 	dev_err(trans->pdev,
+ 		"diag dl[%s]: mcurx0=0x%08x/0x%08x mcurx1=0x%08x/0x%08x mcurx2=0x%08x/0x%08x\n",
+ 		tag,
+@@ -491,6 +500,42 @@
+ {
+ 	diag_pdma_init_cnt++;
+ 
++	/*
++	 * The patch jump takes the endpoint off the bus while the WFDMA still
++	 * has a transaction in flight, and the host side of the DMA never
++	 * comes back: TX_DMA_BUSY stays set, no TX ring is dispatched again,
++	 * and even the command ring stops answering after a descriptor or
++	 * two.  Nothing in the normal init clears it - TX_DMA_EN=0, the
++	 * GLO_CFG_EXT2 halt/drop bits and RST_DTX_PTR all leave TX_DMA_BUSY
++	 * at one, and HIF_MISC.HIF_BUSY stays set too.  Only the HIF reset
++	 * drops that outstanding transaction.  Everything after it is the
++	 * ordinary init, so the recovery starts from the state the probe
++	 * starts from.
++	 */
++	if (diag_hif_rst && diag_pdma_init_cnt > 1) {
++		struct mtk_bus_trans *trans = to_bus_trans(pci_hw);
++		u32 misc0, misc = 0, i;
++
++		misc0 = bus_read(trans, WF_WFDMA_EXT_WRAP_CSR_WFDMA_HIF_MISC_ADDR);
++
++		bus_write(trans, WF_WFDMA_EXT_WRAP_CSR_WFDMA_SW_RST_ADDR,
++			  WF_WFDMA_EXT_WRAP_CSR_WFDMA_SW_RST_HIF_SW_RST_MASK);
++
++		for (i = 0; i < 200; i++) {
++			misc = bus_read(trans,
++					WF_WFDMA_EXT_WRAP_CSR_WFDMA_HIF_MISC_ADDR);
++			if (!(misc & WF_WFDMA_EXT_WRAP_CSR_WFDMA_HIF_MISC_HIF_BUSY_MASK))
++				break;
++			udelay(100);
++		}
++
++		dev_err(trans->pdev,
++			"diag hif rst: misc 0x%08x -> 0x%08x glo=0x%08x (wait %u)\n",
++			misc0, misc,
++			bus_read(trans, WF_WFDMA_HOST_DMA0_WPDMA_GLO_CFG_ADDR),
++			i);
++	}
++
+ 	_mt7993_pdma_config(pci_hw);
+ 	_mt7993_pdma_interrupt_select(pci_hw);
+ 	_mt7993_pdma_rx_threshold(pci_hw);
