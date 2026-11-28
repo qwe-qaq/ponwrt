@@ -1,0 +1,87 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [mt_wifi7] 067 别让芯片在 patch 跳转时把自己复位掉
+
+Every boot so far loses the chip about 115 ms after PATCH_FINISH_REQ, and
+until now that was read as the patch crashing.  It is a reset, and the chip
+is the one doing it: the PCI COMMAND word reads back zero, BAR0 still holds
+0x20000000, and the block returns with every WFDMA ring register cleared -
+base, size and both indices - which is why the recovery has to reprogram all
+of them.  The reset unit has a register for exactly this, FLR_CTL at
+0x1f8620, and on a freshly booted chip it reads 0x00030001: FLR_EN set, a
+three cycle reset.
+
+Clearing FLR_EN before PATCH_FINISH_REQ keeps the function from resetting
+itself, so the rings the driver programmed stay valid across the jump and
+the RAM code can be downloaded into the patch that has just started - which
+is the order the vendor driver uses and the one that has never survived
+here.  The bit is put back once the semaphore exchange is over so a later
+real reset still works, and diag_hold_flr=0 restores the old behaviour.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -551,6 +551,42 @@
+ #define DIAG_SWDEF_MODE_ADDR	0x009143C
+ 
+ /*
++ * 067: the endpoint does not just go quiet after PATCH_FINISH_REQ, it is
++ * reset - the PCI COMMAND word reads zero, BAR0 keeps its address, and the
++ * block comes back 115 ms later with every WFDMA ring register at zero.  The
++ * chip owns an FLR controller in its reset unit and it is armed: FLR_CTL
++ * reads 0x00030001, FLR_EN set with a three cycle reset.  Clear that one bit
++ * across the jump and the function cannot reset itself, so the rings the
++ * driver programmed stay valid and the RAM code can go into the patch that
++ * has just started - which is the order the vendor flow needs and the one
++ * that has never survived here.
++ */
++static bool diag_hold_flr = true;
++module_param(diag_hold_flr, bool, 0644);
++MODULE_PARM_DESC(diag_hold_flr,
++		 "clear FLR_EN across PATCH_FINISH_REQ so the endpoint survives the jump");
++
++#define DIAG_FLR_CTL_ADDR	0x001F8620
++#define DIAG_FLR_CTL_EN		BIT(0)
++
++static void
++mcu_diag_flr_ctl(struct mtk_hw_dev *dev, bool hold)
++{
++	struct mtk_bus_trans *trans = dev->bus_trans;
++	u32 before, after;
++
++	before = bus_read(trans, DIAG_FLR_CTL_ADDR);
++	after = hold ? (before & ~DIAG_FLR_CTL_EN) :
++			(before | DIAG_FLR_CTL_EN);
++	if (after != before)
++		bus_write(trans, DIAG_FLR_CTL_ADDR, after);
++
++	dev_err(dev->dev, "diag: flr %s 0x%08x -> 0x%08x (now 0x%08x)\n",
++		hold ? "hold" : "release", before, after,
++		bus_read(trans, DIAG_FLR_CTL_ADDR));
++}
++
++/*
+  * 047 switches.  The chip survives a download that never jumps: with
+  * diag_skip_start=1 the config space still reads command=0x0006 and
+  * BAR0=0x20000000 afterwards, so the scatter itself is harmless and the
+@@ -780,6 +816,9 @@
+ 		if (ret)
+ 			dev_err(dev->dev, "diag: early ram failed %d\n", ret);
+ 	} else if (!diag_late_patch_finish) {
++		if (diag_hold_flr)
++			mcu_diag_flr_ctl(dev, true);
++
+ 		ret = mcu_wm_start_patch(dev);
+ 		if (ret)
+ 			dev_err(dev->dev, "Failed to start patch\n");
+@@ -814,6 +853,9 @@
+ 		mcu_diag_chip(dev, "post-rel");
+ 	}
+ 
++	if (diag_hold_flr)
++		mcu_diag_flr_ctl(dev, false);
++
+ 	if (diag_own_retry) {
+ 		int own = mtk_hw_set_driver_own(dev, dev->bus_trans, true);
+ 
