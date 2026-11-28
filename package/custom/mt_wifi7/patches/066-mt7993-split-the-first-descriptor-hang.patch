@@ -1,0 +1,100 @@
+From: chasey-dev <ellenyoung0912@gmail.com>
+Subject: [mt_wifi7] 066 把「0x01 之后第一个描述符就挂死」拆开看
+
+The HIF reset in 065 is necessary but, measured on the running chip, not
+enough: after pulsing it, HIF_BUSY and TX_DMA_BUSY both read zero, and the
+next descriptor presented to the download ring sets both again without the
+CPU index moving at all.  So the fetch starts and the chip side never takes
+the data - the destination is not draining, and because the TX dispatcher
+is in order, that one stuck descriptor also kills the command ring that had
+been answering seconds earlier.
+
+Two knobs to tell the two remaining explanations apart:
+
+  diag_ram_pre_ms    wait before the first TARGET_ADDRESS_LEN_REQ.  The
+		     patch has been running for about a hundred milliseconds
+		     by then in the failing boots; if its receiver needs
+		     longer, a delay alone moves the ring.
+
+  diag_ram_req_only  send the request and push no descriptor at all.  The
+		     next region's request then shows whether the MCU came
+		     through the request alive - if its index still advances
+		     the request is harmless and the descriptor is what
+		     hangs the bus.
+
+The 0x05 that downloads the patch in the same window still works, so this
+is specific to what runs after PATCH_FINISH_REQ.
+
+Signed-off-by: chasey-dev <ellenyoung0912@gmail.com>
+---
+---
+--- a/wlan_hwifi/mcu/mcu_wm.c
++++ b/wlan_hwifi/mcu/mcu_wm.c
+@@ -518,6 +518,25 @@
+ MODULE_PARM_DESC(diag_skip_ram_req,
+ 		 "skip TARGET_ADDRESS_LEN_REQ and scatter the RAM code directly");
+ 
++/*
++ * The first descriptor pushed after the patch has taken over never leaves
++ * the FWDL ring: the WFDMA starts the fetch, the chip side never takes the
++ * data, HIF_BUSY sets and from there every TX ring is stuck - the command
++ * ring that answered a moment ago stops as well.  Two ways to narrow it
++ * down without another build: wait longer before the first request, in case
++ * the patch is still bringing its receiver up, and send the request without
++ * any descriptor, which says whether the MCU survives the request itself.
++ */
++static int diag_ram_pre_ms;
++module_param(diag_ram_pre_ms, int, 0644);
++MODULE_PARM_DESC(diag_ram_pre_ms,
++		 "wait this long before the first RAM download request");
++
++static bool diag_ram_req_only;
++module_param(diag_ram_req_only, bool, 0644);
++MODULE_PARM_DESC(diag_ram_req_only,
++		 "send TARGET_ADDRESS_LEN_REQ but push no descriptor");
++
+ static bool diag_own_retry;
+ module_param(diag_own_retry, bool, 0644);
+ MODULE_PARM_DESC(diag_own_retry,
+@@ -883,6 +902,13 @@
+ 		dev_err(dev->dev, "diag: ram sem get -> %d\n",
+ 			mcu_wm_patch_sem_ctrl(dev, 1));
+ 
++	if (diag_ram_pre_ms > 0) {
++		dev_err(dev->dev,
++			"diag: waiting %d ms before the first RAM request\n",
++			diag_ram_pre_ms);
++		msleep(diag_ram_pre_ms);
++	}
++
+ 	for (i = 0; i < hdr->n_region; i++) {
+ 		const struct mcu_fw_region *region;
+ 		u32 len = 0, addr = 0, mode = 0;
+@@ -972,6 +998,13 @@
+ 					}
+ 				}
+ 
++				if (diag_ram_req_only) {
++					dev_warn(dev->dev,
++						 "diag: request only, no scatter pushed\n");
++					done += part;
++					continue;
++				}
++
+ 				err = mcu_wm_send_firmware(dev,
+ 							   data + offset + done,
+ 							   part);
+@@ -1005,6 +1038,13 @@
+ 				}
+ 			}
+ 
++			if (diag_ram_req_only) {
++				dev_warn(dev->dev,
++					 "diag: request only, no scatter pushed\n");
++				offset += len;
++				continue;
++			}
++
+ 			err = mcu_wm_send_firmware(dev, data + offset, len);
+ 			if (err) {
+ 				dev_err(dev->dev, "WM Failed to send firmware\n");
